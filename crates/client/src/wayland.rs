@@ -96,6 +96,12 @@ struct St {
     grabbed: bool,
     /// fractional accumulator for wl_fixed relative deltas
     grab_acc: (f64, f64),
+    /// grab diagnostics: raw wire values + per-2s aggregates (count,
+    /// Σunaccel counts) — settles where motion attenuation comes from
+    dbg_left: u32,
+    dbg_n: u64,
+    dbg_sum: (f64, f64),
+    dbg_window: std::time::Instant,
     /// Ctrl+Alt both held (from wl_keyboard.modifiers) — grab hotkey chord
     mods_ctrl_alt: bool,
     /// the hotkey's M key release must not be forwarded after a toggle
@@ -245,6 +251,10 @@ impl Presenter {
                 locked_obj: None,
                 grabbed: false,
                 grab_acc: (0.0, 0.0),
+                dbg_left: 0,
+                dbg_n: 0,
+                dbg_sum: (0.0, 0.0),
+                dbg_window: Instant::now(),
                 mods_ctrl_alt: false,
                 swallow_m_release: false,
                 decoration_mgr,
@@ -399,6 +409,10 @@ impl St {
             self.locked_obj = Some(locked);
             self.grabbed = true;
             self.grab_acc = (0.0, 0.0);
+            self.dbg_left = 30;
+            self.dbg_n = 0;
+            self.dbg_sum = (0.0, 0.0);
+            self.dbg_window = Instant::now();
             eprintln!("[wl] mouse grabbed (relative mode; Ctrl+Alt+M to release)");
         } else {
             // destroy EXPLICITLY: both interfaces have a destructor request,
@@ -413,6 +427,11 @@ impl St {
             }
             self.grabbed = false;
             self.grab_acc = (0.0, 0.0);
+            eprintln!(
+                "[wl] grab session: {} relative events, Σx={:+.1} Σy={:+.1} counts",
+                self.dbg_n, self.dbg_sum.0, self.dbg_sum.1
+            );
+            self.dbg_left = 0;
             if self.pointer_active {
                 if let Some(dev) = self.cursor_device.as_ref() {
                     dev.set_shape(self.pointer_serial, Shape::Default);
@@ -522,8 +541,25 @@ impl Dispatch<ZwpRelativePointerV1, ()> for St {
             if !state.grabbed {
                 return;
             }
+            // wl_fixed (24.8): compositor sends raw counts * 256. The raw
+            // wire values and per-2s aggregates below settle any doubt about
+            // scale or event rate on the client side.
+            if state.dbg_left > 0 {
+                state.dbg_left -= 1;
+                eprintln!("[wl] rel wire dx={dx_unaccel} dy={dy_unaccel}");
+            }
             state.grab_acc.0 += dx_unaccel as f64 / 256.0;
             state.grab_acc.1 += dy_unaccel as f64 / 256.0;
+            state.dbg_n += 1;
+            state.dbg_sum.0 += dx_unaccel as f64 / 256.0;
+            state.dbg_sum.1 += dy_unaccel as f64 / 256.0;
+            if state.dbg_window.elapsed().as_secs_f64() >= 2.0 {
+                eprintln!(
+                    "[wl] rel agg: {} ev Σx={:+.1} Σy={:+.1} counts in 2s",
+                    state.dbg_n, state.dbg_sum.0, state.dbg_sum.1
+                );
+                state.dbg_window = Instant::now();
+            }
             let dx = state.grab_acc.0.trunc() as i32;
             let dy = state.grab_acc.1.trunc() as i32;
             state.grab_acc.0 -= dx as f64;

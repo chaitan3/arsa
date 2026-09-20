@@ -452,7 +452,11 @@ fn uinput_loop(rx: mpsc::Receiver<InputEvent>, screen: Arc<ScreenSize>) -> Resul
     // buttons route to whichever device saw the last motion (inputtino's
     // active_mouse_device); rel is the default
     let mut last_abs = false;
-    let mut rel_dbg = 10u32; // first 10 relative deltas, for one test run
+    // rel diagnostics: per-2s aggregate (event rate + total counts) to
+    // locate motion attenuation between client and injection
+    let mut agg_n: u64 = 0;
+    let mut agg_sum: (i64, i64) = (0, 0);
+    let mut agg_window = std::time::Instant::now();
 
     while let Ok(ev) = rx.recv() {
         match ev {
@@ -517,9 +521,17 @@ fn uinput_loop(rx: mpsc::Receiver<InputEvent>, screen: Arc<ScreenSize>) -> Resul
                 last_abs = true;
             }
             InputEvent::Rel { dx, dy } => {
-                if rel_dbg > 0 {
-                    rel_dbg -= 1;
-                    eprintln!("[input] rel dx={dx} dy={dy}");
+                agg_n += 1;
+                agg_sum.0 += dx as i64;
+                agg_sum.1 += dy as i64;
+                if agg_window.elapsed().as_secs_f64() >= 2.0 {
+                    eprintln!(
+                        "[input] rel agg: {agg_n} ev Σdx={:+} Σdy={:+} counts in 2s",
+                        agg_sum.0, agg_sum.1
+                    );
+                    agg_n = 0;
+                    agg_sum = (0, 0);
+                    agg_window = std::time::Instant::now();
                 }
                 let Some(r) = rel_ptr.as_ref() else { continue };
                 r.emit(EV_REL, REL_X, dx);
