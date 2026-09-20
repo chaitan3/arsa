@@ -1,0 +1,17 @@
+[package]
+name = "rdma-display-client"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dev-dependencies]
+tempfile = "3"
+
+[dependencies]
+rdma-display-proto.workspace = true
+rdma-display-rdma = { path = "../rdma" }
+anyhow.workspace = true
+libloading = "0.8"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+wayland-backend = { version = "0.3", features = ["client_system"] }

@@ -1,0 +1,9 @@
+# build artifacts
+/target
+**/*.rs.bk
+
+# editor / misc
+*.swp
+*~
+.vscode/
+.idea/

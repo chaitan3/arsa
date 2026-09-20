@@ -1,0 +1,12 @@
+[package]
+name = "rdma-display-server"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+rdma-display-proto.workspace = true
+rdma-display-rdma = { path = "../rdma" }
+rdma-display-capture = { path = "../capture" }
+anyhow.workspace = true
+ibverbs.workspace = true

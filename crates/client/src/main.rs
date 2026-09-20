@@ -1,0 +1,284 @@
+//! rdma-display client: connects to an rdma-display server over the control
+//! channel, receives frames via RDMA WRITE into registered slots, and either
+//! presents them on Wayland (`--output wayland`, C1: the slots themselves are
+//! wl_buffers, credits pace on compositor release) or runs headless
+//! (stats/checksums + optional PPM dump).
+
+mod eglwin;
+mod keymap;
+mod metrics;
+mod wayland;
+
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Instant;
+
+use anyhow::{bail, Context, Result};
+use rdma_display_proto::Conn;
+
+fn main() -> Result<()> {
+    let mut server: String = "127.0.0.1:4791".to_string();
+    let mut device: Option<String> = None;
+    let mut slots: usize = 3;
+    let mut dump: Option<String> = None;
+    let mut seconds: Option<u64> = None;
+    let mut slot_mem: String = "host".to_string();
+    let mut cuda_device: u32 = 0;
+    let mut output: String = "none".to_string();
+    let mut metrics_on = false;
+
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--server" => server = args.next().expect("--server needs a value"),
+            "--device" => device = Some(args.next().expect("--device needs a value")),
+            "--slots" => slots = args.next().expect("--slots needs a value").parse()?,
+            "--dump" => dump = Some(args.next().expect("--dump needs a value")),
+            "--seconds" => seconds = Some(args.next().expect("--seconds needs a value").parse()?),
+            "--slot-mem" => slot_mem = args.next().expect("--slot-mem needs a value").to_string(),
+            "--cuda-device" => cuda_device = args.next().expect("--cuda-device needs a value").parse()?,
+            "--output" => output = args.next().expect("--output needs a value").to_string(),
+            "--metrics" => metrics_on = true,
+            "--help" | "-h" => {
+                println!("usage: rdma-display-client --server HOST:PORT [--device mlx5_0] [--slots 3] [--dump frame.ppm] [--seconds N]");
+                println!("  --slot-mem host|cuda  receive slots: host = pinned RAM (default); cuda = dormant GPU path");
+                println!("  --cuda-device N       CUDA device ordinal for --slot-mem cuda (default 0)");
+                println!("  --output none|egl     egl = present in a Wayland window (needs --slot-mem host)");
+                println!("  --metrics             latency/bandwidth overlay (top-left) + clock-sync pings");
+                return Ok(());
+            }
+            other if other.starts_with("--") => anyhow::bail!("unknown arg: {other}"),
+            _ => {}
+        }
+    }
+
+    if !["host", "cuda"].contains(&slot_mem.as_str()) {
+        anyhow::bail!("--slot-mem must be host|cuda, got {slot_mem:?}");
+    }
+
+    let addr = server
+        .to_socket_addrs()?
+        .next()
+        .with_context(|| format!("bad --server {server:?}"))?;
+    let stream = TcpStream::connect(addr).with_context(|| format!("connect {addr}"))?;
+    // input events are latency-sensitive; the control channel must not batch
+    stream.set_nodelay(true)?;
+    eprintln!("connected to {server}");
+
+    let ctx = rdma_display_rdma::open_device(device.as_deref())?;
+    let pd = ctx.alloc_pd()?;
+    let mem = match slot_mem.as_str() {
+        "host" => rdma_display_rdma::SlotMem::Host,
+        "cuda" => rdma_display_rdma::SlotMem::Cuda { device: cuda_device },
+        other => anyhow::bail!("--slot-mem must be host|cuda, got {other:?}"),
+    };
+    let mut link =
+        rdma_display_rdma::ClientLink::connect_with(Conn::new(stream), &ctx, &pd, slots, mem)?;
+    if link.slots_gpu_only() {
+        eprintln!("[client] GPU slots without CPU mapping: content checks use the verification-only device->host copy (the render path itself stays zero-copy)");
+    }
+    eprintln!(
+        "session up: {}x{} fourcc=0x{:08x} modifier=0x{:x} frame_bytes={} slots={}",
+        link.meta.width,
+        link.meta.height,
+        link.meta.fourcc,
+        link.meta.modifier,
+        link.meta.frame_bytes,
+        slots,
+    );
+
+    // Wayland presentation: the EGL upload backend — the mirror of the
+    // server's copy path. Needs a CPU view of the slots (host memory):
+    // CUDA slots are GPU-only and cannot be uploaded from.
+    // user-input path: Wayland events -> this channel -> control TCP
+    let (input_tx, input_rx) = std::sync::mpsc::channel();
+
+    let mut presenter = match output.as_str() {
+        "none" => None,
+        "egl" => {
+            if slot_mem != "host" {
+                bail!("--output egl requires --slot-mem host (the upload reads the slot through a CPU pointer)");
+            }
+            let p = wayland::Presenter::new(link.meta.width, link.meta.height, input_tx)?;
+            let win = eglwin::EglWindow::new(
+                p.wl_display_ptr(),
+                p.wl_surface_ptr(),
+                link.meta.width,
+                link.meta.height,
+                metrics_on,
+            )?;
+            Some((p, win))
+        }
+        other => bail!("--output must be none|egl, got {other:?}"),
+    };
+
+    // --metrics collector: consumes server Stamps + Pongs via the control
+    // reader, samples t3/t4/t5 around the GL calls, pings every PING_SECS
+    let mut metrics = metrics_on.then(|| {
+        let mut m = metrics::Metrics::new();
+        m.set_frame_bytes(link.meta.frame_bytes as usize);
+        m
+    });
+    let mut last_overlay = Instant::now();
+
+    let started = Instant::now();
+    let deadline = seconds.map(|s| started + std::time::Duration::from_secs(s));
+    let mut frames: u64 = 0;
+    let mut last_seq = 0u64;
+    let mut last_report = Instant::now();
+    let mut dumped = false;
+
+    loop {
+        if let Some(d) = deadline {
+            if Instant::now() >= d {
+                break;
+            }
+        }
+        if let Some((p, win)) = presenter.as_mut() {
+            // presenter mode: drain RDMA completions, upload+present, drain
+            // the compositor. Bytes are never CPU-touched: the NIC wrote the
+            // slot, the GPU reads it through the upload pointer. Credits
+            // fire at upload time (glTexImage2D consumed the pointer).
+            while let Some((seq, slot)) = link.try_next_frame()? {
+                let t3 = rdma_display_proto::unix_now_us();
+                link.rearm_slot(slot)?;
+                // refresh the overlay raster at the metrics cadence only;
+                // every frame still draws the last one (no flicker)
+                let overlay = match metrics.as_mut() {
+                    Some(m) => {
+                        if last_overlay.elapsed().as_millis() as u64
+                            >= metrics::REFRESH_MS
+                        {
+                            last_overlay = Instant::now();
+                            m.refresh().map(|text| {
+                                (
+                                    metrics::rasterize(&text),
+                                    metrics::OVERLAY_W,
+                                    metrics::OVERLAY_H,
+                                )
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
+                let (t4, t5) = win.present(
+                    link.slot_bytes(slot),
+                    overlay.as_ref().map(|(r, w, h)| (&r[..], *w, *h)),
+                )?;
+                link.credit_slot(slot)?; // upload consumed the pointer
+                if let Some(m) = metrics.as_mut() {
+                    m.record(seq, t3, t4, t5);
+                }
+                last_seq = seq;
+                frames += 1;
+                if seq % 60 == 0 || seq == 0 {
+                    eprintln!("[client] presented seq={seq} slot={slot}");
+                }
+            }
+            // metrics: drain control events (stamps/pongs) + keep the clock
+            // sync warm
+            if let Some(m) = metrics.as_mut() {
+                while let Some(ev) = link.try_control() {
+                    m.on_control(ev);
+                }
+                if m.maybe_ping() {
+                    link.send_ping()?;
+                }
+            } else {
+                // without metrics there is no server→client traffic expected;
+                // still drain so nothing accumulates
+                while link.try_control().is_some() {}
+            }
+            // forward queued user-input events to the server
+            while let Ok(ev) = input_rx.try_recv() {
+                link.send_input(ev)?;
+            }
+            p.pump(1)?; // short wait: bounds frame latency at ~1ms
+            if p.closed() {
+                eprintln!("[client] window closed, ending");
+                break;
+            }
+        } else {
+            // headless mode: today's blocking stats/dump path
+            let (seq, slot) = link.next_frame()?;
+            let t3 = rdma_display_proto::unix_now_us();
+            if let Some(m) = metrics.as_mut() {
+                // no GL here: t4=t5=t3 (upload/present rows read 0.00)
+                m.record(seq, t3, t3, t3);
+            }
+            if seq % 60 == 0 || seq == 0 {
+                match link.slot_read(slot) {
+                    Ok(bytes) => {
+                        let sum: u32 = bytes.iter().map(|b| *b as u32).sum();
+                        let nonzero = bytes.iter().filter(|b| **b != 0).count();
+                        eprintln!(
+                            "[client-check] seq={} slot={} sum={} nonzero={}/{}",
+                            seq, slot, sum, nonzero, bytes.len()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[client-check] seq={seq} slot={slot}: content unreadable ({e:#})")
+                    }
+                }
+            }
+            if !dumped {
+                dumped = true;
+                if let Some(path) = &dump {
+                    dump_ppm(path, &link, slot)?;
+                }
+            }
+            link.ack_frame(slot)?;
+            frames += 1;
+            last_seq = seq;
+        }
+        if last_report.elapsed() >= std::time::Duration::from_secs(5) {
+            let elapsed = started.elapsed().as_secs_f64();
+            eprintln!(
+                "[stats] frames={} fps={:.1} seq={}",
+                frames,
+                frames as f64 / elapsed,
+                last_seq
+            );
+            if let Some(m) = metrics.as_mut() {
+                while let Some(ev) = link.try_control() {
+                    m.on_control(ev);
+                }
+                if m.maybe_ping() {
+                    link.send_ping()?;
+                }
+                if presenter.is_none() {
+                    eprintln!("[metrics]\n{}", metrics::stderr_line(m));
+                } else {
+                    eprintln!("[metrics]\n{}", metrics::snapshot(m));
+                }
+            }
+            last_report = Instant::now();
+        }
+    }
+    eprintln!("done: {} frames in {:?}", frames, started.elapsed());
+    Ok(())
+}
+
+fn dump_ppm(path: &str, link: &rdma_display_rdma::ClientLink, slot: usize) -> Result<()> {
+    // XRGB8888 -> binary PPM (P6), dropping the alpha/upper byte
+    let m = &link.meta;
+    let bytes = link.slot_read(slot)?;
+    let width = m.width as usize;
+    let height = m.height as usize;
+    let stride = m.stride as usize;
+    let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+    for y in 0..height {
+        for x in 0..width {
+            let o = y * stride + x * 4;
+            // XRGB8888 little-endian: bytes are B, G, R, X
+            let b = bytes[o];
+            let g = bytes[o + 1];
+            let r = bytes[o + 2];
+            ppm.extend_from_slice(&[r, g, b]);
+        }
+    }
+    std::fs::write(path, &ppm).with_context(|| format!("write {path}"))?;
+    eprintln!("dumped {path}");
+    Ok(())
+}

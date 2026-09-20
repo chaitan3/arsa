@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+
+[workspace.dependencies]
+ibverbs = { git = "https://github.com/jonhoo/rust-ibverbs" }
+rdma-display-proto = { path = "crates/proto" }
+qemu-display = { git = "https://gitlab.com/marcandre.lureau/qemu-display", default-features = false, features = ["qmp"] }
+async-std = "1"
+anyhow = "1"
+
+[profile.release]
+debug = true

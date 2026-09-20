@@ -1,0 +1,721 @@
+//! RDMA transport for rdma-display.
+//!
+//! Model: one RC queue pair per session. The *client* allocates N receive
+//! slots (registered host memory), advertises them over the control channel,
+//! and posts N zero-payload receives to catch WRITE-with-immediate
+//! notifications. The *server* writes each frame directly into a client slot
+//! and encodes `{frame_seq, slot}` in the immediate value. Credits flow back
+//! over the control channel so the server only reuses a slot after the client
+//! has consumed it.
+//!
+//! The data path uses polling completion loops; no async runtime. The control
+//! channel is a plain blocking TCP connection. All verbs resources are
+//! Arc-backed, so link structs can move to threads freely.
+
+use std::net::TcpStream;
+use std::sync::mpsc;
+use std::time::Duration;
+
+use anyhow::{anyhow, Context, Result};
+use ibverbs::{
+    AccessFlags, CompletionQueue, MemoryRegion, QueuePair, QueuePairEndpoint, Rc,
+    RemoteMemorySlice,
+};
+
+use rdma_display_proto as proto;
+use proto::{Conn, DisplayMeta, Message, SlotDesc};
+
+/// Events that arrive on the client's control channel from the server
+/// (server → client direction). Forwarded to the main loop by the
+/// control-reader thread.
+pub enum ControlEvent {
+    Stamp(proto::FrameStamp),
+    /// c0 = the client's clock when it sent the ping, s1 = server's reply
+    /// time, c2 = client's clock when the pong arrived (reader thread).
+    Pong { c0: u64, s1: u64, c2: u64 },
+}
+
+pub mod cuda;
+pub mod slots;
+use slots::{SlotAlloc, SlotBuf};
+
+/// Where the client's receive slots live.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SlotMem {
+    /// Registered host memory (today's copy path; the NIC lands frames in
+    /// RAM and the consumer copies/uploads from there).
+    Host,
+    /// `cuMemAlloc` memory exported via `cuMemGetHandleForAddressRange` —
+    /// NVIDIA's documented GPUDirect-over-dmabuf path (C0 route 2); refused
+    /// CUDA_ERROR_NOT_SUPPORTED on GeForce (RM product gate). Dormant code
+    /// for future cooperative hardware.
+    Cuda { device: u32 },
+}
+
+/// Open an RDMA device by name (or the first available one).
+pub fn open_device(name: Option<&str>) -> Result<ibverbs::Context> {
+    let list = ibverbs::devices().context("ibv_get_device_list failed")?;
+    if list.is_empty() {
+        anyhow::bail!("no RDMA devices found");
+    }
+    for dev in &list {
+        let dev_name = dev
+            .name()
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name.is_none() || name == Some(dev_name.as_str()) {
+            return Ok(dev.open()?);
+        }
+    }
+    anyhow::bail!("RDMA device {name:?} not found")
+}
+
+fn routable_gid_index(ctx: &ibverbs::Context) -> Result<u32> {
+    if let Some(gid) = ctx.routable_gid(1).context("routable_gid failed")? {
+        return Ok(gid.gid_index);
+    }
+    anyhow::bail!("no routable GID found on port 1 (check RoCE config)")
+}
+
+fn create_prepared_qp(
+    ctx: &ibverbs::Context,
+    pd: &ibverbs::ProtectionDomain,
+) -> Result<(
+    ibverbs::PreparedQueuePair<Rc>,
+    CompletionQueue,
+    CompletionQueue,
+)> {
+    let send_cq = ctx.create_cq(256).build().context("create send CQ")?;
+    let recv_cq = ctx.create_cq(256).build().context("create recv CQ")?;
+    let gid_index = routable_gid_index(ctx)?;
+    let prepared = pd
+        .create_qp::<Rc>(&send_cq, &recv_cq, 1)
+        .context("create_qp")?
+        .set_gid_index(gid_index)
+        // both sides must accept inbound RDMA WRITEs (the client receives
+        // frames; the server's QP is only the initiator today, but symmetric
+        // permissions keep future two-way paths from tripping on this)
+        .set_access(AccessFlags::PERMISSIVE)
+        .build()
+        .context("qp build")?;
+    Ok((prepared, send_cq, recv_cq))
+}
+
+fn hello_exchange<T: std::io::Read + std::io::Write>(conn: &mut Conn<T>) -> Result<()> {
+    conn.send(&Message::Hello(proto::Hello {
+        magic: proto::MAGIC,
+        version: proto::VERSION,
+    }))?;
+    match conn.recv()? {
+        Message::Hello(h) if h.magic == proto::MAGIC => {
+            if h.version != proto::VERSION {
+                anyhow::bail!(
+                    "peer protocol version {} != our {}",
+                    h.version,
+                    proto::VERSION
+                );
+            }
+            Ok(())
+        }
+        other => Err(anyhow!("expected Hello, got {other:?}")),
+    }
+}
+
+fn endpoint_exchange<T: std::io::Read + std::io::Write>(
+    conn: &mut Conn<T>,
+    ctx: &ibverbs::Context,
+    pd: &ibverbs::ProtectionDomain,
+) -> Result<(QueuePair<Rc>, CompletionQueue, CompletionQueue)> {
+    let (prepared, send_cq, recv_cq) = create_prepared_qp(ctx, pd)?;
+    let local = prepared.endpoint().context("qp endpoint")?;
+    conn.send(&Message::QpEndpoint(local.to_bytes()))?;
+    match conn.recv()? {
+        Message::QpEndpoint(bytes) => {
+            let remote = QueuePairEndpoint::from_bytes(&bytes).map_err(|e| anyhow!("{e}"))?;
+            let qp = prepared.handshake(remote).context("qp handshake")?;
+            Ok((qp, send_cq, recv_cq))
+        }
+        other => Err(anyhow!("expected QpEndpoint, got {other:?}")),
+    }
+}
+
+/// Immediate-word layout: `frame_seq << 8 | slot_index`.
+pub fn imm_encode(frame_seq: u64, slot: usize) -> u32 {
+    (((frame_seq & 0x00ff_ffff) << 8) as u32) | ((slot as u32) & 0xff)
+}
+
+pub fn imm_decode(imm: u32) -> (u64, usize) {
+    ((imm >> 8) as u64, (imm & 0xff) as usize)
+}
+
+// ---------------------------------------------------------------------------
+// Server side
+// ---------------------------------------------------------------------------
+
+pub struct ServerLink {
+    /// credits arrive from the control-reader thread; None = client gone
+    credit_rx: mpsc::Receiver<Option<u32>>,
+    qp: QueuePair<Rc>,
+    send_cq: CompletionQueue,
+    /// local staging slots (copy path / testcard writes here before the WRITE)
+    slots: Vec<MemoryRegion<Box<[u8]>>>,
+    remote: Vec<RemoteMemorySlice>,
+    slot_free: Vec<bool>,
+    seq: u64,
+    /// cloned control stream: the send path writes per-frame `Stamp`s here
+    /// while the control-reader thread owns the receive side
+    stamp_w: Option<TcpStream>,
+}
+
+impl ServerLink {
+    /// Server half of a session on an accepted TCP stream. `meta` describes
+    /// the frames we will send (testcard or captured display format).
+    pub fn accept(
+        conn: Conn<TcpStream>,
+        ctx: &ibverbs::Context,
+        pd: &ibverbs::ProtectionDomain,
+        meta: &DisplayMeta,
+        slots: usize,
+        input_tx: mpsc::Sender<proto::InputEvent>,
+    ) -> Result<ServerLink> {
+        // split the stream: reader thread gets the receive half, the frame
+        // send path keeps a write-only clone for per-frame Stamps
+        let stream = conn.into_inner();
+        let stamp_w = stream.try_clone().context("clone stream for stamps")?;
+        let mut conn = Conn::new(stream);
+        hello_exchange(&mut conn)?;
+        let (qp, send_cq, _recv_cq) = endpoint_exchange(&mut conn, ctx, pd)?;
+
+        let mut stage: Vec<MemoryRegion<Box<[u8]>>> = Vec::with_capacity(slots);
+        for _ in 0..slots {
+            let mr = pd
+                .allocate(meta.frame_bytes as usize, AccessFlags::PERMISSIVE)
+                .context("allocate staging slot")?;
+            stage.push(mr);
+        }
+
+        conn.send(&Message::Meta(meta.clone()))?;
+        let remote: Vec<RemoteMemorySlice> = match conn.recv()? {
+            Message::Buffers(slots) => slots
+                .into_iter()
+                .map(|s| {
+                    if s.len != meta.frame_bytes as u64 {
+                        anyhow::bail!(
+                            "client slot len {} != frame bytes {}",
+                            s.len,
+                            meta.frame_bytes
+                        );
+                    }
+                    Ok(RemoteMemorySlice {
+                        addr: s.addr,
+                        len: s.len as usize,
+                        rkey: s.rkey,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            other => anyhow::bail!("expected Buffers, got {other:?}"),
+        };
+        conn.send(&Message::Ready)?;
+
+        // Control channel reader: owns the TCP stream from here on. Credits
+        // go to the sender loop via a channel; input events are forwarded to
+        // the capture side (QEMU D-Bus input injection). Reading ONLY inside
+        // wait_free_slot would starve input while slots are busy.
+        let (credit_tx, credit_rx) = mpsc::channel::<Option<u32>>();
+        let reader = std::thread::Builder::new()
+            .name("control-reader".into())
+            .spawn(move || loop {
+                match conn.recv() {
+                    Ok(proto::Message::Credit(slot)) => {
+                        if credit_tx.send(Some(slot)).is_err() {
+                            break; // sender gone (server shutting down)
+                        }
+                    }
+                    Ok(proto::Message::Input(ev)) => {
+                        if input_tx.send(ev).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(proto::Message::Ping(c0)) => {
+                        // clock-sync reply: echo the client's stamp + our time
+                        if let Err(e) = conn.send(&proto::Message::Pong(c0, proto::unix_now_us()))
+                        {
+                            eprintln!("[rdma] pong failed: {e}");
+                        }
+                    }
+                    Ok(proto::Message::Bye(_)) => {
+                        let _ = credit_tx.send(None);
+                        break;
+                    }
+                    Ok(other) => {
+                        eprintln!("[rdma] unexpected control message {other:?}");
+                    }
+                    Err(e) => {
+                        if e.kind() != std::io::ErrorKind::UnexpectedEof
+                            && e.kind() != std::io::ErrorKind::ConnectionReset
+                        {
+                            eprintln!("[rdma] control channel error: {e}");
+                        }
+                        let _ = credit_tx.send(None);
+                        break;
+                    }
+                }
+            })
+            .context("spawn control reader")?;
+        std::mem::forget(reader); // runs for the session lifetime
+
+        let n = remote.len();
+        Ok(ServerLink {
+            credit_rx,
+            qp,
+            send_cq,
+            slots: stage,
+            remote,
+            slot_free: vec![true; n],
+            seq: 0,
+            stamp_w: Some(stamp_w),
+        })
+    }
+
+    /// Non-blocking hangup/credit check: drains the credit channel (applying
+    /// credits) and returns true when the control-reader thread signaled the
+    /// client hung up (EOF/Bye). Call each loop iteration — an idle capture
+    /// loop may send nothing for a long time and otherwise never notices.
+    pub fn client_gone(&mut self) -> bool {
+        loop {
+            match self.credit_rx.try_recv() {
+                Ok(Some(slot)) => {
+                    if let Some(f) = self.slot_free.get_mut(slot as usize) {
+                        *f = true;
+                    }
+                }
+                Ok(None) => return true, // reader thread saw EOF
+                Err(mpsc::TryRecvError::Empty) => return false,
+                Err(mpsc::TryRecvError::Disconnected) => return true,
+            }
+        }
+    }
+
+    /// Blocks until a slot is free, absorbing credit messages meanwhile.
+    /// (Credits now arrive via the control-reader thread's channel.)
+    fn wait_free_slot(&mut self) -> Result<usize> {
+        loop {
+            if let Some(slot) = self.slot_free.iter().position(|f| *f) {
+                return Ok(slot);
+            }
+            match self.credit_rx.recv() {
+                Ok(Some(slot)) => {
+                    if let Some(f) = self.slot_free.get_mut(slot as usize) {
+                        *f = true;
+                    }
+                }
+                Ok(None) => anyhow::bail!("client hung up"),
+                Err(_) => anyhow::bail!("client disconnected"),
+            }
+        }
+    }
+
+    /// Send one frame. `fill` writes the frame bytes into the staging slot
+    /// before it is posted to the client. `t0_unix_us` is the frame's
+    /// pipeline t0 (D-Bus event arrival; for testcard just pass `now`).
+    /// Returns the frame sequence number.
+    pub fn send_frame(&mut self, fill: impl FnOnce(&mut [u8]), t0_unix_us: u64) -> Result<u64> {
+        self.send_frame_checked(
+            |out| {
+                fill(out);
+                Ok((true, proto::MatTimes::ZERO))
+            },
+            t0_unix_us,
+        )?
+        .ok_or_else(|| anyhow!("frame unexpectedly unchanged"))
+    }
+
+    /// Like [`send_frame`](Self::send_frame), but `fill` decides whether the
+    /// frame content changed and should be sent (`Ok(false)` = skip), and
+    /// returns the frame's GPU stage times for the Stamp.
+    pub fn send_frame_checked(
+        &mut self,
+        fill: impl FnOnce(&mut [u8]) -> anyhow::Result<(bool, proto::MatTimes)>,
+        t0_unix_us: u64,
+    ) -> Result<Option<u64>> {
+        let t0d = proto::unix_now_us(); // frame picked up for sending
+        let slot = self.wait_free_slot()?;
+        let t1s = proto::unix_now_us(); // staging slot available
+        let slot_wait_us = t1s.saturating_sub(t0d);
+        if slot_wait_us > 5_000 {
+            eprintln!(
+                "[rdma] slot wait {} ms (client credits lagging)",
+                slot_wait_us / 1000
+            );
+        }
+        self.slot_free[slot] = false;
+        let frame_bytes = self.slots[slot].bytes().len();
+        let (changed, mat_times) = fill(&mut self.slots[slot].bytes_mut()[..frame_bytes])?;
+        if !changed {
+            // unchanged frame: return the slot, don't send
+            self.slot_free[slot] = true;
+            return Ok(None);
+        }
+        let t1_unix_us = proto::unix_now_us(); // readback/materialize complete
+        #[cfg(feature = "frame-checksums")]
+        {
+            let sum: u32 = self.slots[slot].bytes()[..frame_bytes]
+                .iter()
+                .map(|b| *b as u32)
+                .sum();
+            let nonzero = self.slots[slot].bytes()[..frame_bytes]
+                .iter()
+                .filter(|b| **b != 0)
+                .count();
+            eprintln!(
+                "[rdma] staging slot {} checksum sum={} nonzero={}/{}",
+                slot, sum, nonzero, frame_bytes
+            );
+        }
+
+        let remote = self.remote[slot];
+        let seq = self.seq;
+        let imm = imm_encode(seq, slot);
+        let mut batch = self.qp.start_send();
+        batch.op().signaled().imm(imm).write(
+            seq,
+            &[self.slots[slot].slice(..frame_bytes)],
+            remote,
+        );
+        unsafe { batch.submit() }.context("post RDMA WRITE")?;
+        let t2_unix_us = proto::unix_now_us(); // WRITE posted to the NIC
+
+        // drain completions so the signaled WRITE is confirmed before we hand
+        // the staging slot back to the caller
+        loop {
+            let mut completions = self.send_cq.poll().context("poll send CQ")?;
+            match completions.next() {
+                Some(wc) => {
+                    wc.ok().context("RDMA WRITE failed")?;
+                    break;
+                }
+                None => std::thread::sleep(Duration::from_micros(20)),
+            }
+        }
+        // WRITE completion, same-host stamp: t2c - t2 is the true transfer
+        // time and needs no clock sync at all (unlike the client's t3)
+        let t2c_unix_us = proto::unix_now_us();
+        self.seq += 1;
+        // pipeline stamp for the client's metrics overlay; the TCP trip is
+        // intentionally after the WRITE completes, so the client sees the
+        // stamp ~immediately after the frame itself
+        if let Some(w) = self.stamp_w.as_mut() {
+            // Clamp: a frame that sat dirty >1 s (e.g. arrived before any
+            // client connected, or a zero-initialized t0) would poison the
+            // latency stats with a meaningless queue wait — collapse it to 0.
+            let t0 = if t0_unix_us == 0 || t0d.saturating_sub(t0_unix_us) > 1_000_000 {
+                t0d
+            } else {
+                t0_unix_us
+            };
+            let s = proto::FrameStamp {
+                seq,
+                t0,
+                t0d,
+                t1s,
+                t1: t1_unix_us,
+                t2: t2_unix_us,
+                t2c: t2c_unix_us,
+                blit_us: mat_times.blit_us,
+                read_us: mat_times.read_us,
+                fin_us: mat_times.fin_us,
+            };
+            if let Err(e) = proto::send_msg(w, &Message::Stamp(s)) {
+                eprintln!("[rdma] stamp send failed: {e}");
+                self.stamp_w = None;
+            }
+        }
+        Ok(Some(seq))
+    }
+
+    pub fn frame_bytes(&self) -> usize {
+        self.slots.first().map(|m| m.bytes().len()).unwrap_or(0)
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.seq
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client side
+// ---------------------------------------------------------------------------
+
+/// Spawn the client-side control-channel reader (server → client direction:
+/// per-frame Stamps + clock-sync Pongs). Returns the receiver the main loop
+/// drains. Ends silently when the link (and thus the channel) is dropped.
+fn spawn_control_reader(stream: TcpStream) -> mpsc::Receiver<ControlEvent> {
+    let (tx, rx) = mpsc::channel::<ControlEvent>();
+    let _ = std::thread::Builder::new()
+        .name("ctrl-reader".into())
+        .spawn(move || {
+            let mut conn = Conn::new(stream);
+            loop {
+                match conn.recv() {
+                    Ok(proto::Message::Stamp(s)) => {
+                        if tx.send(ControlEvent::Stamp(s)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(proto::Message::Pong(c0, s1)) => {
+                        let ev = ControlEvent::Pong {
+                            c0,
+                            s1,
+                            c2: proto::unix_now_us(),
+                        };
+                        if tx.send(ev).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(other) => {
+                        eprintln!("[rdma] unexpected client control message {other:?}");
+                    }
+                    Err(e) => {
+                        if e.kind() != std::io::ErrorKind::UnexpectedEof
+                            && e.kind() != std::io::ErrorKind::ConnectionReset
+                        {
+                            eprintln!("[rdma] client control channel error: {e}");
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+    rx
+}
+
+/// One receive slot: either host memory or an exported GPU buffer.
+/// For `Gpu`, field declaration order is load-bearing: `mr` drops (and
+/// deregisters) before `gbm` unmaps/destroys the bo.
+enum Slot {
+    Host(MemoryRegion<Box<[u8]>>),
+    Gpu {
+        mr: MemoryRegion<()>,
+        // declared after mr: deregisters before the buffer is freed
+        gpu: Box<dyn SlotBuf>,
+    },
+}
+
+impl Slot {
+    fn desc(&self) -> SlotDesc {
+        let r = match self {
+            Slot::Host(mr) => mr.remote(),
+            Slot::Gpu { mr, .. } => mr.remote(),
+        };
+        SlotDesc {
+            addr: r.addr,
+            len: r.len as u64,
+            rkey: r.rkey,
+        }
+    }
+}
+
+pub struct ClientLink {
+    pub conn: Conn<TcpStream>,
+    pub meta: DisplayMeta,
+    qp: QueuePair<Rc>,
+    recv_cq: CompletionQueue,
+    slots: Vec<Slot>,
+    /// server→client control events (Stamps, Pongs) from the reader thread
+    ctrl_rx: mpsc::Receiver<ControlEvent>,
+}
+
+impl ClientLink {
+    /// Client half of a session with host-memory slots.
+    pub fn connect(
+        conn: Conn<TcpStream>,
+        ctx: &ibverbs::Context,
+        pd: &ibverbs::ProtectionDomain,
+        slots: usize,
+    ) -> Result<ClientLink> {
+        Self::connect_with(conn, ctx, pd, slots, SlotMem::Host)
+    }
+
+    /// Client half of a session; `mem` chooses host vs GPU (GBM) slots.
+    pub fn connect_with(
+        conn: Conn<TcpStream>,
+        ctx: &ibverbs::Context,
+        pd: &ibverbs::ProtectionDomain,
+        slots: usize,
+        mem: SlotMem,
+    ) -> Result<ClientLink> {
+        // split the stream: the frame/metrics reader gets the receive half as
+        // its own clone; the link's conn keeps doing client→server sends
+        let stream = conn.into_inner();
+        let reader_stream = stream.try_clone().context("clone stream for control reader")?;
+        let mut conn = Conn::new(stream);
+        hello_exchange(&mut conn)?;
+        let (qp, _send_cq, recv_cq) = endpoint_exchange(&mut conn, ctx, pd)?;
+
+        let meta = match conn.recv()? {
+            Message::Meta(m) => m,
+            other => anyhow::bail!("expected Meta, got {other:?}"),
+        };
+
+        let gpu_alloc: Option<Box<dyn SlotAlloc>> = match &mem {
+            SlotMem::Host => None,
+            SlotMem::Cuda { device } => Some(Box::new(cuda::CudaSlots::open(*device)?)),
+        };
+
+        let mut slots_v: Vec<Slot> = Vec::with_capacity(slots);
+        for i in 0..slots {
+            let slot = match (&gpu_alloc, meta.width, meta.height) {
+                (None, _, _) => {
+                    let mr = pd
+                        .allocate(meta.frame_bytes as usize, AccessFlags::PERMISSIVE)
+                        .context("allocate recv slot")?;
+                    Slot::Host(mr)
+                }
+                (Some(dev), w, h) => {
+                    let gpu = dev.alloc_slot(w, h, meta.stride)?;
+                    // Deliberately NOT PERMISSIVE: PERMISSIVE includes
+                    // RELAXED_ORDERING, which would let the NIC reorder
+                    // posted writes across PCIe destinations (CQE vs GPU
+                    // payload). Strict ordering is a zero-copy invariant.
+                    let flags = AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE;
+                    let mr = pd
+                        .register_dmabuf(gpu.fd(), gpu.offset(), meta.frame_bytes as usize, gpu.iova(), flags)
+                        .with_context(|| format!("ibv_reg_dmabuf_mr slot {i} (C0 gate #3)"))?;
+                    eprintln!(
+                        "[slots] gpu slot {i}: iova={:#x} rkey={:#x}",
+                        mr.remote().addr,
+                        mr.remote().rkey
+                    );
+                    Slot::Gpu { mr, gpu }
+                }
+            };
+            slots_v.push(slot);
+        }
+        let descs: Vec<SlotDesc> = slots_v.iter().map(Slot::desc).collect();
+        conn.send(&Message::Buffers(descs))?;
+        match conn.recv()? {
+            Message::Ready => {}
+            other => anyhow::bail!("expected Ready, got {other:?}"),
+        }
+
+        let mut link = ClientLink {
+            conn,
+            meta,
+            qp,
+            recv_cq,
+            slots: slots_v,
+            ctrl_rx: spawn_control_reader(reader_stream),
+        };
+        link.rearm_all()?;
+        Ok(link)
+    }
+
+    fn rearm_all(&mut self) -> Result<()> {
+        let n = self.slots.len();
+        let reqs: Vec<ibverbs::RecvRequest> = (0..n)
+            .map(|slot| ibverbs::RecvRequest::new(slot as u64, &[]))
+            .collect();
+        unsafe { self.qp.post_recv(reqs) }.context("post_recv")?;
+        Ok(())
+    }
+
+    /// Blocking (poll with tiny sleeps): wait for the next frame notification.
+    /// Returns `(frame_seq, slot)`. The slot's bytes stay valid until
+    /// [`ack_frame`](Self::ack_frame) is called — the server respects credits,
+    /// so nothing will overwrite the slot in between.
+    pub fn next_frame(&mut self) -> Result<(u64, usize)> {
+        loop {
+            if let Some(f) = self.try_next_frame()? {
+                return Ok(f);
+            }
+            std::thread::sleep(Duration::from_micros(50));
+        }
+    }
+
+    /// Non-blocking variant: `Ok(None)` if no completion is ready. The
+    /// presenter loop uses this to interleave RDMA with Wayland events.
+    pub fn try_next_frame(&mut self) -> Result<Option<(u64, usize)>> {
+        let mut completions = self.recv_cq.poll().context("poll recv CQ")?;
+        if let Some(wc) = completions.next() {
+            wc.ok().context("recv work request failed")?;
+            let imm = wc.imm_data().context("expected WRITE immediate")?;
+            let (frame_seq, slot) = imm_decode(imm);
+            return Ok(Some((frame_seq, slot)));
+        }
+        Ok(None)
+    }
+
+    /// Re-arm the slot's notification receipt. Must happen right after
+    /// [`try_next_frame`](Self::try_next_frame) took the completion; the
+    /// *credit* (server permission to overwrite again) is separate —
+    /// presenters hold it until the compositor releases the buffer.
+    pub fn rearm_slot(&mut self, slot: usize) -> Result<()> {
+        unsafe {
+            self.qp
+                .post_recv([ibverbs::RecvRequest::new(slot as u64, &[])])
+        }
+        .context("re-arm recv")?;
+        Ok(())
+    }
+
+    /// Return a slot to the server pool (credits it for reuse).
+    pub fn credit_slot(&mut self, slot: usize) -> Result<()> {
+        self.conn.send(&Message::Credit(slot as u32))?;
+        Ok(())
+    }
+
+    /// Forward one user-input event to the server (proto v2).
+    pub fn send_input(&mut self, ev: proto::InputEvent) -> Result<()> {
+        self.conn.send(&proto::Message::Input(ev))?;
+        Ok(())
+    }
+
+    /// Clock-sync probe: server replies with its time; the collector pairs
+    /// the pong with our send/recv times to estimate the clock offset.
+    pub fn send_ping(&mut self) -> Result<()> {
+        self.conn.send(&proto::Message::Ping(proto::unix_now_us()))?;
+        Ok(())
+    }
+
+    /// Drain one control event from the reader thread, if any.
+    pub fn try_control(&mut self) -> Option<ControlEvent> {
+        self.ctrl_rx.try_recv().ok()
+    }
+
+    /// Tell the server the slot may be reused, and re-arm its notification.
+    /// (Headless/stats mode: consumption == "bytes copied out".)
+    pub fn ack_frame(&mut self, slot: usize) -> Result<()> {
+        self.rearm_slot(slot)?;
+        self.credit_slot(slot)
+    }
+
+
+    /// Read the bytes of slot `slot`. For GPU slots this is the best-effort
+    /// CPU mapping of the dma-buf; an empty slice means "no CPU view" (the
+    /// data is still valid in GPU memory — verify GPU-side).
+    pub fn slot_bytes(&self, slot: usize) -> &[u8] {
+        let n = self.meta.frame_bytes as usize;
+        match &self.slots[slot] {
+            Slot::Host(mr) => &mr.bytes()[..n],
+            Slot::Gpu { gpu, .. } => gpu.cpu_bytes(n).unwrap_or(&[]),
+        }
+    }
+
+    /// True when frames land in GPU memory with no CPU view.
+    pub fn slots_gpu_only(&self) -> bool {
+        matches!(&self.slots.first(), Some(Slot::Gpu { gpu, .. }) if gpu.cpu_bytes(1).is_none())
+    }
+
+    /// Whole-slot read for content verification: CPU map when present, else
+    /// the (verification-only) device->host copy. Errors when neither exists.
+    pub fn slot_read(&self, slot: usize) -> Result<Vec<u8>> {
+        let n = self.meta.frame_bytes as usize;
+        match &self.slots[slot] {
+            Slot::Host(mr) => Ok(mr.bytes()[..n].to_vec()),
+            Slot::Gpu { gpu, .. } => match gpu.cpu_bytes(n) {
+                Some(b) => Ok(b.to_vec()),
+                None => gpu.dto_h_vec(n),
+            },
+        }
+    }
+}
