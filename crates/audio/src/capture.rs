@@ -146,16 +146,23 @@ pub fn start_capture(dev: Option<&str>) -> Result<Mailbox> {
 fn in_process_loop(pulse: Pulse, dev: String, mbox: Mailbox) -> ! {
     let mut seq: u32 = 0;
     let mut drops: u64 = 0;
+    let mut fed: u64 = 0;
+    let mut last_report = std::time::Instant::now();
     loop {
         match open_capture_stream(&pulse, &dev) {
             Ok(stream) => {
                 eprintln!("[audio] capturing {dev:?} (f32le {} Hz, {}ch, 10 ms packets)", wire::RATE, wire::CHANNELS);
                 match capture_into(&stream, |pkt| {
+                    fed += 1;
                     if mbox.put_overwrites(pkt) {
                         drops += 1;
                         if drops == 1 || drops % 1000 == 0 {
                             eprintln!("[audio] capture dropped {drops} packets (no consumer or stalled client)");
                         }
+                    }
+                    if last_report.elapsed() >= Duration::from_secs(10) {
+                        eprintln!("[audio] capture feed alive: {fed} packets so far");
+                        last_report = std::time::Instant::now();
                     }
                 }, &mut seq) {
                     Ok(()) => eprintln!("[audio] capture stream ended; reopening in 2 s"),
@@ -206,10 +213,13 @@ fn helper_loop(
                 eprintln!("[audio] helper process running (uid {uid}) capturing {dev:?}");
                 let mut seq: u32 = 0;
                 let mut drops: u64 = 0;
+                let mut fed: u64 = 0;
+                let mut last_report = std::time::Instant::now();
                 let mut buf = vec![0u8; wire::PACKET_BYTES];
                 loop {
                     match f.read_exact(&mut buf) {
                         Ok(()) => {
+                            fed += 1;
                             let pkt = AudioPacket {
                                 seq,
                                 host_unix_us: wire::unix_now_us(),
@@ -222,6 +232,10 @@ fn helper_loop(
                                 if drops == 1 || drops % 1000 == 0 {
                                     eprintln!("[audio] capture dropped {drops} packets (no consumer or stalled client)");
                                 }
+                            }
+                            if last_report.elapsed() >= Duration::from_secs(10) {
+                                eprintln!("[audio] capture feed alive: {fed} packets so far");
+                                last_report = std::time::Instant::now();
                             }
                         }
                         Err(e) => {
@@ -358,22 +372,38 @@ fn open_capture_stream(pulse: &Pulse, dev: &str) -> Result<super::pulse::Simple>
     }
 }
 
-/// Per-connection sender: format record, then packets off the mailbox
-/// until the socket dies. Reconnects are the client's job.
+/// Per-connection sender: format record, then packets off the mailbox.
+///
+/// A silent monitor (nothing playing into the sink) delivers NO packets —
+/// that is not an error and must never close the connection; when the
+/// game starts playing, packets resume and the client hears them. So the
+/// stream idles open indefinitely, warning only (the old 500 ms idle kill
+/// caused the "reset by peer" reconnect loop on silent monitors).
 pub fn serve_connection(mut stream: TcpStream, mbox: &Mailbox) -> Result<()> {
     stream
         .write_all(&wire::encode_format())
         .and_then(|_| stream.flush())
         .map_err(|e| anyhow::anyhow!("audio socket: format send failed: {e}"))?;
+    let mut warned = false;
     loop {
-        let pkt = mbox
-            .take_wait(Duration::from_millis(500))
-            .ok_or_else(|| anyhow::anyhow!("audio stream idle for 500 ms (capture thread gone)"))?;
-        let hdr = wire::encode_packet_header(pkt.seq, pkt.host_unix_us, pkt.frames);
-        stream
-            .write_all(&hdr)
-            .and_then(|_| stream.write_all(&pkt.data))
-            .map_err(|e| anyhow::anyhow!("audio socket write failed: {e}"))?;
+        match mbox.take_wait(Duration::from_secs(10)) {
+            Some(pkt) => {
+                warned = false;
+                let hdr = wire::encode_packet_header(pkt.seq, pkt.host_unix_us, pkt.frames);
+                stream
+                    .write_all(&hdr)
+                    .and_then(|_| stream.write_all(&pkt.data))
+                    .map_err(|e| anyhow::anyhow!("audio socket write failed: {e}"))?;
+            }
+            None => {
+                if !warned {
+                    eprintln!(
+                        "[audio] no capture data for 10 s (silent monitor? is anything playing into the sink?); keeping the stream open"
+                    );
+                    warned = true;
+                }
+            }
+        }
     }
 }
 

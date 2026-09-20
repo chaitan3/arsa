@@ -10,7 +10,7 @@ use std::io::Read;
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use super::pulse::{Pulse, SampleSpec};
 use super::wire;
@@ -32,6 +32,12 @@ pub fn run(addr: std::net::SocketAddr) {
 fn session(addr: std::net::SocketAddr) -> Result<()> {
     let mut sock = TcpStream::connect(addr).with_context(|| format!("audio connect {addr}"))?;
     sock.set_nodelay(true)?;
+    // idle tolerance: a silent monitor delivers nothing for as long as the
+    // game is quiet — the server keeps the stream open and waits, so read
+    // timeouts here are warnings, not session-killers (a mid-frame timeout
+    // can only happen after packets already stopped, where reconnecting
+    // via the normal path is the fallback)
+    sock.set_read_timeout(Some(Duration::from_secs(10)))?;
     use std::io::Write;
     sock.write_all(&[wire::TAG_AUDIO])
         .context("audio: send tag")?;
@@ -57,11 +63,30 @@ fn session(addr: std::net::SocketAddr) -> Result<()> {
     let mut next_report = Instant::now() + Duration::from_secs(5);
     let mut last_seq: Option<u32> = None;
     loop {
-        sock.read_exact(&mut hdr).context("audio: read packet header")?;
+        match sock.read_exact(&mut hdr) {
+            Ok(()) => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                eprintln!("[audio] no packets for 10 s (silent capture — nothing playing into the server's sink?); still waiting");
+                continue;
+            }
+            Err(e) => return Err(e).context("audio: read packet header"),
+        }
         let (seq, _host_us, frames) = wire::decode_packet_header(&hdr);
         wire::frames_plausible(frames)?;
         let mut payload = vec![0u8; wire::payload_len(frames)?];
-        sock.read_exact(&mut payload).context("audio: read packet payload")?;
+        match sock.read_exact(&mut payload) {
+            Ok(()) => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                bail!("audio: payload read timed out mid-frame (framing desync; reconnecting)")
+            }
+            Err(e) => return Err(e).context("audio: read packet payload"),
+        }
         stream.write_all(&payload)?;
         if let Some(prev) = last_seq {
             if seq != prev.wrapping_add(1) {
