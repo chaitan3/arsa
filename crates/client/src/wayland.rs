@@ -135,6 +135,10 @@ struct St {
     /// user-input forwarding: gated on Wayland focus (keyboard enter/leave)
     input_tx: Sender<InputEvent>,
     kb_active: bool,
+    /// forwarded evdev codes currently believed held (for repeat handling
+    /// and focus-loss flushes); KWin repeats keys with state=2
+    /// (WL_KEYBOARD_KEY_STATE_REPEATED) which surfaces as WEnum::Raw
+    held_keys: std::collections::HashSet<u32>,
     pointer_active: bool,
     last_abs: Option<(u32, u32)>,
     width: u32,
@@ -280,6 +284,7 @@ impl Presenter {
                 closed: false,
                 input_tx,
                 kb_active: false,
+                held_keys: std::collections::HashSet::new(),
                 pointer_active: false,
                 last_abs: None,
                 width,
@@ -712,11 +717,18 @@ impl Dispatch<WlKeyboard, ()> for St {
             }
             wl_keyboard::Event::Enter { .. } => {
                 state.kb_active = true;
+                state.held_keys.clear();
                 eprintln!("[wl] kb enter (kb_active=true)");
             }
             wl_keyboard::Event::Leave { .. } => {
                 state.kb_active = false;
-                eprintln!("[wl] kb leave (kb_active=false)");
+                // flush held keys: a Wayland focus break means the guest must
+                // not keep any keys down (this is what made walking stop when
+                // the compositor churned focus under us)
+                for code in state.held_keys.drain() {
+                    let _ = state.input_tx.send(InputEvent::Key { code, down: false });
+                }
+                eprintln!("[wl] kb leave (kb_active=false, held keys flushed)");
             }
             wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
                 // depressed modifier mask: Control = bit2, Alt = bit3 (xkb)
@@ -724,32 +736,37 @@ impl Dispatch<WlKeyboard, ()> for St {
                     mods_depressed & (0x4 | 0x8) == (0x4 | 0x8);
             }
             wl_keyboard::Event::Key { key, state: st, .. } => {
+                // KWin repeats held keys with state=2 (WL_KEYBOARD_KEY_STATE_
+                // REPEATED, v10+) which surfaces as WEnum::Raw — anything but
+                // an explicit Released means "down". Forward only true
+                // press/release transitions: a spurious or repeated release
+                // stops the guest game mid-walk (verified by the up-flood in
+                // the grab logs), and repeat presses add nothing over uinput.
+                let released = matches!(st, WEnum::Value(KeyState::Released));
                 eprintln!(
                     "[wl] key {key:#04x} {} kb_active={}",
-                    if matches!(st, WEnum::Value(KeyState::Pressed)) {
-                        "down"
-                    } else {
-                        "up  "
-                    },
+                    if released { "up  " } else { "down" },
                     state.kb_active
                 );
                 if !state.kb_active {
                     return;
                 }
                 // grab hotkey: Ctrl+Alt+M toggles relative mouse grab —
-                // client-local, never forwarded to the guest
+                // client-local, never forwarded to the guest. Toggle only on
+                // the INITIAL press; a repeat must not re-toggle the grab.
                 if key == 0x32 && state.mods_ctrl_alt {
-                    if matches!(st, WEnum::Value(KeyState::Pressed)) {
+                    if !released && !state.held_keys.contains(&key) {
                         if state.pointer_active {
                             state.set_grab(!state.grabbed, qh);
                         } else {
                             eprintln!("[wl] grab: hover the window first (pointer not over it)");
                         }
                         state.swallow_m_release = true;
+                        state.held_keys.insert(key);
                     }
                     return; // swallow the chord's press AND release
                 }
-                if !matches!(st, WEnum::Value(KeyState::Pressed)) && state.swallow_m_release {
+                if released && state.swallow_m_release {
                     // chord released before M itself (ctrl+alt up first)
                     state.swallow_m_release = false;
                     return;
@@ -759,8 +776,18 @@ impl Dispatch<WlKeyboard, ()> for St {
                 let Some(code) = keymap::linux_to_qnum(key) else {
                     return; // unmapped key
                 };
-                let down = matches!(st, WEnum::Value(KeyState::Pressed));
-                let _ = state.input_tx.send(InputEvent::Key { code, down });
+                if released {
+                    if state.held_keys.remove(&key) || true {
+                        let _ = state.input_tx.send(InputEvent::Key { code, down: false });
+                    }
+                    return;
+                }
+                // down (initial press OR repeat)
+                if state.held_keys.contains(&key) {
+                    return; // repeat: guest compositor repeats on its own
+                }
+                state.held_keys.insert(key);
+                let _ = state.input_tx.send(InputEvent::Key { code, down: true });
             }
             _ => {} // latched/locked mods, repeat_info
         }
