@@ -154,6 +154,7 @@ impl Pulse {
                 fragsize: fragsize_bytes,
             },
         )
+        .map_err(|code| PaOpenError { code: code.code })
         .with_context(|| format!("pa record stream open (device {dev:?})"))
     }
 
@@ -194,7 +195,7 @@ impl Pulse {
         name: &str,
         spec: SampleSpec,
         attr: BufferAttr,
-    ) -> Result<Simple> {
+    ) -> Result<Simple, PaOpenError> {
         let server_c = server.map(|s| CString::new(s).unwrap()).unwrap_or_else(|| CString::new("").unwrap());
         let dev_c = dev.map(|s| CString::new(s).unwrap()).unwrap_or_else(|| CString::new("").unwrap());
         let name_c = CString::new(name).unwrap();
@@ -218,11 +219,25 @@ impl Pulse {
             )
         };
         if s.is_null() {
-            bail!("pa_simple_new failed: {}", err_str(err));
+            return Err(PaOpenError { code: err });
         }
         Ok(Simple { s, pulse: self.clone() })
     }
 }
+
+#[derive(Debug)]
+pub struct PaOpenError {
+    /// pa_error_code_t value (see err_str)
+    pub code: i32,
+}
+
+impl std::fmt::Display for PaOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pa_simple_new failed: {}", err_str(self.code))
+    }
+}
+
+impl std::error::Error for PaOpenError {}
 
 /// A live pa_simple stream. libpulse-simple is not thread-safe per stream —
 /// each Simple stays on its owning thread; we only promise Send (moved

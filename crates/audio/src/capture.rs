@@ -144,11 +144,10 @@ pub fn start_capture(dev: Option<&str>) -> Result<Mailbox> {
 
 /// Normal case: this process's uid matches the session owner.
 fn in_process_loop(pulse: Pulse, dev: String, mbox: Mailbox) -> ! {
-    let spec = SampleSpec { rate: wire::RATE, channels: wire::CHANNELS };
     let mut seq: u32 = 0;
     let mut drops: u64 = 0;
     loop {
-        match pulse.open_record(None, &dev, spec, wire::PACKET_BYTES as u32) {
+        match open_capture_stream(&pulse, &dev) {
             Ok(stream) => {
                 eprintln!("[audio] capturing {dev:?} (f32le {} Hz, {}ch, 10 ms packets)", wire::RATE, wire::CHANNELS);
                 match capture_into(&stream, |pkt| {
@@ -306,12 +305,11 @@ fn spawn_helper(exe: &std::path::Path, dev: &str, uid: u32, gid: u32) -> Result<
 /// (PDEATHSIG); the parent respawns on pipe EOF.
 pub fn run_helper(dev: &str) -> Result<()> {
     let pulse = Pulse::dlopen()?;
-    let spec = SampleSpec { rate: wire::RATE, channels: wire::CHANNELS };
     let mut out = std::mem::ManuallyDrop::new(unsafe {
         File::from_raw_fd(1) // parent's pipe, unbuffered
     });
     loop {
-        match pulse.open_record(None, dev, spec, wire::PACKET_BYTES as u32) {
+        match open_capture_stream(&pulse, dev) {
             Ok(stream) => {
                 eprintln!("[audio-helper] capturing {dev:?} (f32le {} Hz, {}ch)", wire::RATE, wire::CHANNELS);
                 match capture_into(&stream, |pkt| {
@@ -327,6 +325,36 @@ pub fn run_helper(dev: &str) -> Result<()> {
             }
         }
         std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Open the record stream with a usability fallback: PA record streams
+/// take a SOURCE name, but everyone naturally passes a SINK name
+/// (Sunshine's `audio_sink = my-sink`) — when the lookup fails with
+/// NOENTITY, retry once against the sink's monitor source `<name>.monitor`.
+fn open_capture_stream(pulse: &Pulse, dev: &str) -> Result<super::pulse::Simple> {
+    let spec = SampleSpec { rate: wire::RATE, channels: wire::CHANNELS };
+    match pulse.open_record(None, dev, spec, wire::PACKET_BYTES as u32) {
+        Ok(s) => Ok(s),
+        Err(e) => {
+            let code = e
+                .downcast_ref::<super::pulse::PaOpenError>()
+                .map(|p| p.code)
+                .unwrap_or(-1);
+            if code == 5 && !dev.ends_with(".monitor") && !dev.starts_with('@') {
+                let alt = format!("{dev}.monitor");
+                match pulse.open_record(None, &alt, spec, wire::PACKET_BYTES as u32) {
+                    Ok(s) => {
+                        eprintln!(
+                            "[audio] {dev:?} is a sink name (sinks can't be recorded directly); capturing its monitor source {alt:?} instead"
+                        );
+                        return Ok(s);
+                    }
+                    Err(e2) => return Err(e2.context(format!("pa record stream open (device {dev:?})"))),
+                }
+            }
+            Err(e)
+        }
     }
 }
 
