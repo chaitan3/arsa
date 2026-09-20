@@ -120,11 +120,25 @@ impl InputSink for QemuDbusInput {
 // uinput injection into the host compositor (DRM capture path)
 // ---------------------------------------------------------------------------
 
-/// Injects into the host via /dev/uinput: a keyboard device (all EV_KEY bits)
-/// plus a pointer device (REL_X/Y/WHEEL + BTN_* + ABS_X/Y sized to the
-/// captured screen). Runs as root under the server (sudo), which also holds
-/// /dev/uinput write access.
+/// Injects into the host via /dev/uinput, device split matching Sunshine's
+/// inputtino (upstream src/uinput/mouse.cpp, verified):
+/// - a REL mouse: buttons + REL_X/Y/WHEEL only. libinput classifies it as a
+///   plain mouse, so relative deltas reach pointer-locked games 1:1.
+/// - an ABS pointer: INPUT_PROP_POINTER + buttons + wheel + ABS_X/Y over
+///   giant fixed ranges; client pixel coords are scaled in, so the device
+///   never needs recreation when the captured resolution changes.
+/// A single combined ABS+REL device is NOT what Sunshine ships: rel events
+/// on a device that also declares ABS axes move the cursor only minutely
+/// (observed on hyprland/libinput). Buttons go to whichever device saw the
+/// last motion, like inputtino's active_mouse_device.
 pub struct UinputSink;
+
+/// inputtino's giant ABS ranges: x scaled into 0..19200, y into 0..12000
+const ABS_MAX_W: i32 = 19200;
+const ABS_MAX_H: i32 = 12000;
+/// linux/input.h INPUT_PROP_POINTER (prop bit 0)
+const INPUT_PROP_POINTER: u32 = 0;
+const REL_WHEEL_HI_RES: u16 = 0x0b;
 
 // evdev constants (linux/input-event-codes.h)
 const EV_SYN: u16 = 0x00;
@@ -163,6 +177,7 @@ const UI_SET_EVBIT: u16 = 100;
 const UI_SET_KEYBIT: u16 = 101;
 const UI_SET_RELBIT: u16 = 102;
 const UI_SET_ABSBIT: u16 = 103;
+const UI_SET_PROPBIT: u16 = 110; // _IOW('U', 110, unsigned int)
 
 #[repr(C)]
 struct UinputSetup {
@@ -244,7 +259,12 @@ impl UinputDev {
             .map(|_| ())
             .context("UI_SET_RELBIT")
     }
-    fn set_absbit(&self, v: u16, max: i32) -> Result<()> {
+    fn set_propbit(&self, bit: u32) -> Result<()> {
+        unsafe { ioctl_u32(self.fd.as_raw_fd(), iow(UI_SET_PROPBIT, 4), bit) }
+            .map(|_| ())
+            .context("UI_SET_PROPBIT")
+    }
+    fn set_absbit(&self, v: u16, max: i32, fuzz: i32, resolution: i32) -> Result<()> {
         unsafe {
             ioctl_u32(self.fd.as_raw_fd(), iow(UI_SET_ABSBIT, 4), v as u32)
                 .map(|_| ())
@@ -256,9 +276,9 @@ impl UinputDev {
                 value: 0,
                 minimum: 0,
                 maximum: max,
-                fuzz: 0,
+                fuzz,
                 flat: 0,
-                resolution: 0,
+                resolution,
             },
         };
         unsafe {
@@ -359,12 +379,28 @@ fn uinput_keyboard() -> Result<UinputDev> {
     d.create()
 }
 
-/// Pointer device with relative motion + wheel + buttons + an absolute axis
-/// pair sized to the current screen. A combined abs+rel device is what
-/// Sunshine ships; libinput/KWin accepts it. Recreated when the scanout dims
-/// change (ABS ranges are fixed at UI_DEV_CREATE time).
-fn uinput_pointer(w: u32, h: u32) -> Result<UinputDev> {
-    let d = UinputDev { fd: open_uinput()? }.setup("rdma-display pointer")?;
+/// REL mouse (inputtino's create_mouse): buttons + REL_X/Y + wheel. No ABS
+/// axes — libinput must classify this as a plain mouse for 1:1 relative
+/// motion into pointer-locked games.
+fn uinput_pointer_rel() -> Result<UinputDev> {
+    let d = UinputDev { fd: open_uinput()? }.setup("rdma-display mouse")?;
+    d.set_evbit(EV_SYN)?;
+    d.set_evbit(EV_KEY)?;
+    d.set_evbit(EV_REL)?;
+    for b in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA] {
+        let _ = d.set_keybit(b as u32);
+    }
+    for r in [REL_X, REL_Y, REL_WHEEL] {
+        d.set_relbit(r)?;
+    }
+    d.create()
+}
+
+/// Absolute pointer (inputtino's create_mouse_abs): INPUT_PROP_POINTER +
+/// buttons + wheel + ABS X/Y over the giant fixed ranges. No REL_X/REL_Y.
+fn uinput_pointer_abs() -> Result<UinputDev> {
+    let d = UinputDev { fd: open_uinput()? }.setup("rdma-display mouse (absolute)")?;
+    d.set_propbit(INPUT_PROP_POINTER)?;
     d.set_evbit(EV_SYN)?;
     d.set_evbit(EV_KEY)?;
     d.set_evbit(EV_REL)?;
@@ -372,12 +408,10 @@ fn uinput_pointer(w: u32, h: u32) -> Result<UinputDev> {
     for b in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA] {
         let _ = d.set_keybit(b as u32);
     }
-    for r in [REL_X, REL_Y, REL_WHEEL] {
-        d.set_relbit(r)?;
-    }
-    // abs ranges 0..=dim-1; Abs frame coords map directly
-    d.set_absbit(ABS_X, w.saturating_sub(1) as i32)?;
-    d.set_absbit(ABS_Y, h.saturating_sub(1) as i32)?;
+    d.set_relbit(REL_WHEEL)?;
+    // inputtino: fuzz=1, resolution=28
+    d.set_absbit(ABS_X, ABS_MAX_W, 1, 28)?;
+    d.set_absbit(ABS_Y, ABS_MAX_H, 1, 28)?;
     d.create()
 }
 
@@ -396,38 +430,29 @@ fn open_uinput() -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Ensure a pointer device exists with ABS ranges matching the current screen
-/// dims; recreate it when the dims change. Returns the device if usable.
-fn ensure_ptr<'a>(
-    ptr: &'a mut Option<(UinputDev, u32, u32)>,
-    screen: &ScreenSize,
-) -> Option<&'a UinputDev> {
-    let (w, h) = screen.get();
-    let (w, h) = if w == 0 || h == 0 { (1920, 1080) } else { (w, h) };
-    if let Some((_, pw, ph)) = ptr.as_ref() {
-        if *pw == w && *ph == h {
-            return Some(&ptr.as_ref().unwrap().0);
-        }
-    }
-    *ptr = None;
-    let d = match uinput_pointer(w, h) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("[input] uinput pointer create failed: {e:#}");
-            return None;
-        }
-    };
-    eprintln!("[input] uinput pointer created ({w}x{h})");
-    *ptr = Some((d, w, h));
-    Some(&ptr.as_ref().unwrap().0)
-}
-
 fn uinput_loop(rx: mpsc::Receiver<InputEvent>, screen: Arc<ScreenSize>) -> Result<()> {
     let kb = uinput_keyboard().context("create uinput keyboard")?;
     eprintln!("[input] uinput keyboard created");
-    // pointer is created lazily: ABS ranges need real screen dims, which only
-    // exist after the first scanout
-    let mut ptr: Option<(UinputDev, u32, u32)> = None;
+    // both mice created up front: the ABS device uses inputtino's giant
+    // fixed ranges, so nothing needs recreation when the dims change
+    let rel_ptr = match uinput_pointer_rel() {
+        Ok(d) => Some(d),
+        Err(e) => {
+            eprintln!("[input] uinput rel mouse create failed: {e:#}");
+            None
+        }
+    };
+    let abs_ptr = match uinput_pointer_abs() {
+        Ok(d) => Some(d),
+        Err(e) => {
+            eprintln!("[input] uinput abs mouse create failed: {e:#}");
+            None
+        }
+    };
+    // buttons route to whichever device saw the last motion (inputtino's
+    // active_mouse_device); rel is the default
+    let mut last_abs = false;
+    let mut rel_dbg = 10u32; // first 10 relative deltas, for one test run
 
     while let Ok(ev) = rx.recv() {
         match ev {
@@ -441,7 +466,14 @@ fn uinput_loop(rx: mpsc::Receiver<InputEvent>, screen: Arc<ScreenSize>) -> Resul
                 d.syn();
             }
             InputEvent::Btn { button, down } => {
-                let Some(d) = ensure_ptr(&mut ptr, &screen) else { continue };
+                // wheel lives on both mice; buttons go to the active one
+                let Some(active) = (if last_abs {
+                    abs_ptr.as_ref()
+                } else {
+                    rel_ptr.as_ref()
+                }) else {
+                    continue;
+                };
                 match button {
                     // Left=0 Middle=1 Right=2 WheelUp=3 WheelDown=4 Side=5 Extra=6
                     0 | 1 | 2 | 5 | 6 => {
@@ -452,16 +484,18 @@ fn uinput_loop(rx: mpsc::Receiver<InputEvent>, screen: Arc<ScreenSize>) -> Resul
                             5 => BTN_SIDE,
                             _ => BTN_EXTRA,
                         };
-                        d.emit(EV_KEY, code, down as i32);
-                        d.syn();
+                        active.emit(EV_KEY, code, down as i32);
+                        active.syn();
                     }
                     3 => {
-                        d.emit(EV_REL, REL_WHEEL, 1);
-                        d.syn();
+                        active.emit(EV_REL, REL_WHEEL, 1);
+                        active.emit(EV_REL, REL_WHEEL_HI_RES, 120);
+                        active.syn();
                     }
                     4 => {
-                        d.emit(EV_REL, REL_WHEEL, -1);
-                        d.syn();
+                        active.emit(EV_REL, REL_WHEEL, -1);
+                        active.emit(EV_REL, REL_WHEEL_HI_RES, -120);
+                        active.syn();
                     }
                     other => eprintln!("[input] unknown button {other}"),
                 }
@@ -471,18 +505,27 @@ fn uinput_loop(rx: mpsc::Receiver<InputEvent>, screen: Arc<ScreenSize>) -> Resul
                 if w == 0 || h == 0 {
                     continue; // no scanout yet
                 }
-                let Some(d) = ensure_ptr(&mut ptr, &screen) else { continue };
+                let Some(a) = abs_ptr.as_ref() else { continue };
                 let x = x.min(w.saturating_sub(1));
                 let y = y.min(h.saturating_sub(1));
-                d.emit(EV_ABS, ABS_X, x as i32);
-                d.emit(EV_ABS, ABS_Y, y as i32);
-                d.syn();
+                // client pixels -> inputtino's giant ABS ranges
+                let ax = (ABS_MAX_W as f64 * x as f64 / w as f64).round() as i32;
+                let ay = (ABS_MAX_H as f64 * y as f64 / h as f64).round() as i32;
+                a.emit(EV_ABS, ABS_X, ax);
+                a.emit(EV_ABS, ABS_Y, ay);
+                a.syn();
+                last_abs = true;
             }
             InputEvent::Rel { dx, dy } => {
-                let Some(d) = ensure_ptr(&mut ptr, &screen) else { continue };
-                d.emit(EV_REL, REL_X, dx);
-                d.emit(EV_REL, REL_Y, dy);
-                d.syn();
+                if rel_dbg > 0 {
+                    rel_dbg -= 1;
+                    eprintln!("[input] rel dx={dx} dy={dy}");
+                }
+                let Some(r) = rel_ptr.as_ref() else { continue };
+                r.emit(EV_REL, REL_X, dx);
+                r.emit(EV_REL, REL_Y, dy);
+                r.syn();
+                last_abs = false;
             }
         }
     }
@@ -507,6 +550,7 @@ mod tests {
         assert_eq!(iow(UI_SET_KEYBIT, 4), 0x40045565);
         assert_eq!(iow(UI_SET_RELBIT, 4), 0x40045566);
         assert_eq!(iow(UI_SET_ABSBIT, 4), 0x40045567);
+        assert_eq!(iow(UI_SET_PROPBIT, 4), 0x4004556E);
         assert_eq!(iow(UI_DEV_SETUP, size_of::<UinputSetup>() as u64), 0x405C5503);
         assert_eq!(
             iow(UI_ABS_SETUP, size_of::<UinputAbsSetup>() as u64),

@@ -401,10 +401,16 @@ impl St {
             self.grab_acc = (0.0, 0.0);
             eprintln!("[wl] mouse grabbed (relative mode; Ctrl+Alt+M to release)");
         } else {
-            // dropping the proxies destroys the protocol objects and
-            // deactivates the lock
-            self.rel_obj = None;
-            self.locked_obj = None;
+            // destroy EXPLICITLY: both interfaces have a destructor request,
+            // and dropping the proxy alone never sends it — the compositor
+            // kept the constraint (and the frozen cursor) alive until the
+            // next focus change forced a constraint break (observed on KWin)
+            if let Some(p) = self.rel_obj.take() {
+                p.destroy();
+            }
+            if let Some(p) = self.locked_obj.take() {
+                p.destroy();
+            }
             self.grabbed = false;
             self.grab_acc = (0.0, 0.0);
             if self.pointer_active {
