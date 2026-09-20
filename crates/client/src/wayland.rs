@@ -117,6 +117,21 @@ struct St {
     scale120: u32,
     logical_w: u32,
     logical_h: u32,
+    /// buffer size in device pixels (logical × scale) — what the EGL
+    /// window/GL must render at; letterboxed when aspect ≠ frame's
+    dev_w: u32,
+    dev_h: u32,
+    /// compositor-driven fullscreen state (xdg_toplevel.configure states
+    /// array): our own --fullscreen request AND the compositor's own
+    /// toggle shortcuts both arrive through configure, so this is the
+    /// single source of truth
+    fullscreened: bool,
+    /// toplevel configure that xdg_surface.ack_configure must precede:
+    /// target logical size to apply at ack time
+    pending_mode: Option<(u32, u32)>,
+    /// buffer size change waiting to be applied by the EGL window owner
+    /// (main loop calls Presenter::take_resize → EglWindow::resize)
+    pending_resize: Option<(u32, u32)>,
     /// scale plumbing keep-alives
     #[allow(dead_code)]
     viewporter: WpViewporter,
@@ -167,11 +182,14 @@ impl Presenter {
     /// Connect to the compositor, build the window, map it with an early
     /// empty commit, and block until the initial xdg configure arrives.
     /// `input_tx` receives user-input events (keyboard/pointer) for the
-    /// session's input path.
+    /// session's input path. `fullscreen` requests a fullscreen toplevel
+    /// on the current output before mapping (the compositor answers with
+    /// a configure carrying the real output size + the fullscreen state).
     pub fn new(
         width: u32,
         height: u32,
         input_tx: Sender<InputEvent>,
+        fullscreen: bool,
     ) -> Result<Self> {
         let conn = Connection::connect_to_env().context(
             "wayland connect: needs WAYLAND_DISPLAY + XDG_RUNTIME_DIR in env \
@@ -224,10 +242,16 @@ impl Presenter {
         let toplevel = xdg_surface.get_toplevel(&qh, ());
         toplevel.set_title("rdma-display".into());
         toplevel.set_app_id("rdma-display-client".into());
-        // 1:1 fixed-size window (resize/renegotiation is M7)
+        // 1:1 fixed-size window (resize/renegotiation is M7); fullscreen
+        // hands sizing to the compositor instead (configure-driven)
         xdg_surface.set_window_geometry(0, 0, width as i32, height as i32);
-        toplevel.set_min_size(width as i32, height as i32);
-        toplevel.set_max_size(width as i32, height as i32);
+        if fullscreen {
+            toplevel.set_fullscreen(None);
+            eprintln!("[wl] fullscreen requested (current output)");
+        } else {
+            toplevel.set_min_size(width as i32, height as i32);
+            toplevel.set_max_size(width as i32, height as i32);
+        }
         // request the compositor-drawn titlebar before the map commit
         let decoration = decoration_mgr
             .as_ref()
@@ -273,6 +297,11 @@ impl Presenter {
                 scale120: 120,
                 logical_w: width,
                 logical_h: height,
+                dev_w: width,
+                dev_h: height,
+                fullscreened: false,
+                pending_mode: None,
+                pending_resize: None,
                 viewporter,
                 fs_mgr,
                 fs_obj,
@@ -385,6 +414,13 @@ impl Presenter {
     pub fn closed(&self) -> bool {
         self.state.closed
     }
+
+    /// Pop a queued EGL buffer resize (device pixels) produced by xdg
+    /// configure (fullscreen/restore) or a fractional-scale change. The
+    /// caller routes it to `EglWindow::resize`.
+    pub fn take_resize(&mut self) -> Option<(u32, u32)> {
+        self.state.pending_resize.take()
+    }
 }
 
 impl St {
@@ -455,27 +491,64 @@ impl St {
         }
     }
 
-    /// Recompute the logical window size for the compositor's output scale:
-    /// buffer stays native (W×H, the guest frame verbatim), the viewport
-    /// destination becomes native/scale — so the compositor maps the buffer
-    /// 1:1 onto physical pixels. Input coords are converted the same way.
+    /// Windowed mode: recompute the logical window size for the
+    /// compositor's output scale — buffer stays native (W×H, the guest
+    /// frame verbatim), the viewport destination becomes native/scale so
+    /// the compositor maps the buffer 1:1 onto physical pixels.
     fn apply_scale(&mut self) {
+        if self.fullscreened {
+            // fullscreen: the logical size is configure-driven (output
+            // size); a scale change only shifts the device-pixel buffer
+            // size (e.g. output moved to a monitor with another scale)
+            self.queue_egl_resize();
+            return;
+        }
         let lw = (self.width as u64 * 120 / self.scale120.max(1) as u64) as u32;
         let lh = (self.height as u64 * 120 / self.scale120.max(1) as u64) as u32;
         if (lw, lh) == (self.logical_w, self.logical_h) {
             return;
         }
+        self.apply_mode(lw, lh);
+    }
+
+    /// Apply a target logical size: viewport destination, window geometry,
+    /// min/max (windowed only), EGL buffer resize, commit. Called from the
+    /// xdg_surface.ack_configure path so the ack precedes our commit.
+    fn apply_mode(&mut self, lw: u32, lh: u32) {
         self.logical_w = lw;
         self.logical_h = lh;
         self.viewport.set_destination(lw as i32, lh as i32);
         self.xdg_surface.set_window_geometry(0, 0, lw as i32, lh as i32);
-        self.toplevel.set_min_size(lw as i32, lh as i32);
-        self.toplevel.set_max_size(lw as i32, lh as i32);
+        if !self.fullscreened {
+            self.toplevel.set_min_size(lw as i32, lh as i32);
+            self.toplevel.set_max_size(lw as i32, lh as i32);
+        }
+        self.queue_egl_resize();
         eprintln!(
-            "[wl] scale {}/120: window {}x{} logical, buffer {}x{} native (1:1 pixels)",
-            self.scale120, lw, lh, self.width, self.height
+            "[wl] mode: {}scale {}/120, window {}x{} logical, buffer {}x{} device (frame {}x{})",
+            if self.fullscreened { "fullscreen, " } else { "" },
+            self.scale120,
+            lw,
+            lh,
+            self.dev_w,
+            self.dev_h,
+            self.width,
+            self.height
         );
         self.surface.commit();
+    }
+
+    /// Recompute the device-pixel buffer size (logical × fractional scale)
+    /// and queue an EGL resize if it changed. No commit: the viewport
+    /// destination (logical) is unchanged, so compositor mapping is intact.
+    fn queue_egl_resize(&mut self) {
+        let dw = ((self.logical_w as u64 * self.scale120 as u64 / 120) as u32).max(1);
+        let dh = ((self.logical_h as u64 * self.scale120 as u64 / 120) as u32).max(1);
+        if (dw, dh) != (self.dev_w, self.dev_h) {
+            self.dev_w = dw;
+            self.dev_h = dh;
+            self.pending_resize = Some((dw, dh));
+        }
     }
 }
 
@@ -834,15 +907,25 @@ impl Dispatch<WlPointer, ()> for St {
                     return;
                 }
                 // surface-local coords are LOGICAL pixels (scaled by the
-                // compositor's output scale); convert to guest pixels and
-                // clamp to the console's last row/column (SetAbsPosition
-                // requires x < width, y < height strictly)
-                let lw = state.logical_w.max(1) as f64;
-                let lh = state.logical_h.max(1) as f64;
-                let x = ((surface_x as f64 * state.width as f64 / lw) as u32)
-                    .min(state.width.saturating_sub(1));
-                let y = ((surface_y as f64 * state.height as f64 / lh) as u32)
-                    .min(state.height.saturating_sub(1));
+                // compositor's output scale). Convert to device pixels,
+                // then map through the letterboxed picture rect (bars
+                // clamp to the guest edge): guest_px = (dev - origin)/fit.
+                let sx = state.scale120 as f64 / 120.0;
+                let dw = state.dev_w.max(1) as f64;
+                let dh = state.dev_h.max(1) as f64;
+                let px = surface_x as f64 * sx;
+                let py = surface_y as f64 * sx;
+                let fit = (dw / state.width as f64).min(dh / state.height.max(1) as f64);
+                let ox = (dw - state.width as f64 * fit) * 0.5;
+                let oy = (dh - state.height as f64 * fit) * 0.5;
+                let x = (((px - ox) / fit).floor().clamp(
+                    0.0,
+                    (state.width - 1) as f64,
+                )) as u32;
+                let y = (((py - oy) / fit).floor().clamp(
+                    0.0,
+                    (state.height - 1) as f64,
+                )) as u32;
                 if state.last_abs != Some((x, y)) {
                     state.last_abs = Some((x, y));
                     let _ = state.input_tx.send(InputEvent::Abs { x, y });
@@ -913,6 +996,12 @@ impl Dispatch<XdgSurface, ()> for St {
         if let xdg_surface::Event::Configure { serial } = ev {
             obj.ack_configure(serial);
             state.configured = true;
+            // Apply a staged mode change (fullscreen/restore/resize) AFTER
+            // the ack: xdg-shell requires the ack to precede any commit
+            // that adapts to the configure.
+            if let Some((lw, lh)) = state.pending_mode.take() {
+                state.apply_mode(lw, lh);
+            }
         }
     }
 }
@@ -928,9 +1017,51 @@ impl Dispatch<XdgToplevel, ()> for St {
     ) {
         match ev {
             xdg_toplevel::Event::Close => state.closed = true,
-            xdg_toplevel::Event::Configure { width, height, .. } => {
-                // 0x0 = "no preference"; C1 keeps the native frame size
-                let _ = (width, height);
+            xdg_toplevel::Event::Configure { width, height, states } => {
+                // The states array is uint32 values; Fullscreen (2) means
+                // the compositor has us fullscreen — whether from our own
+                // set_fullscreen request or its own toggle shortcut, the
+                // reaction is the same: honor the configure's size.
+                let fs = states.chunks_exact(4).any(|c| {
+                    u32::from_le_bytes([c[0], c[1], c[2], c[3]])
+                        == xdg_toplevel::State::Fullscreen as u32
+                });
+                if fs != state.fullscreened {
+                    state.fullscreened = fs;
+                    eprintln!(
+                        "[wl] toplevel {} (compositor configure)",
+                        if fs { "FULLSCREEN" } else { "windowed" }
+                    );
+                }
+                // Fullscreen configure always carries the output's logical
+                // size; a windowed 0x0 means "no opinion" — restore the
+                // fixed frame-size window.
+                let target = if fs {
+                    if width > 0 && height > 0 {
+                        Some((width as u32, height as u32))
+                    } else {
+                        Some((state.logical_w, state.logical_h))
+                    }
+                } else {
+                    let lw = (state.width as u64 * 120 / state.scale120.max(1) as u64) as u32;
+                    let lh = (state.height as u64 * 120 / state.scale120.max(1) as u64) as u32;
+                    if width > 0 && height > 0 && (width as u32, height as u32) != (lw, lh) {
+                        // compositor suggests a floating size: honor it only
+                        // if it matches the frame aspect (else keep fixed)
+                        let fa = state.width as f64 / state.height.max(1) as f64;
+                        let ca = width as f64 / height.max(1) as f64;
+                        if (fa - ca).abs() < 0.01 {
+                            Some((width as u32, height as u32))
+                        } else {
+                            Some((lw, lh))
+                        }
+                    } else {
+                        Some((lw, lh))
+                    }
+                };
+                // windowed no-op must still be staged: min/max may need
+                // re-asserting after a fullscreen round trip
+                state.pending_mode = target;
             }
             _ => {}
         }

@@ -25,6 +25,7 @@ fn main() -> Result<()> {
     let mut cuda_device: u32 = 0;
     let mut output: String = "none".to_string();
     let mut metrics_on = false;
+    let mut fullscreen = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -38,11 +39,13 @@ fn main() -> Result<()> {
             "--cuda-device" => cuda_device = args.next().expect("--cuda-device needs a value").parse()?,
             "--output" => output = args.next().expect("--output needs a value").to_string(),
             "--metrics" => metrics_on = true,
+            "--fullscreen" => fullscreen = true,
             "--help" | "-h" => {
                 println!("usage: rdma-display-client --server HOST:PORT [--device mlx5_0] [--slots 3] [--dump frame.ppm] [--seconds N]");
                 println!("  --slot-mem host|cuda  receive slots: host = pinned RAM (default); cuda = dormant GPU path");
                 println!("  --cuda-device N       CUDA device ordinal for --slot-mem cuda (default 0)");
                 println!("  --output none|egl     egl = present in a Wayland window (needs --slot-mem host)");
+                println!("  --fullscreen          fullscreen on the current output; frame letterboxed/scaled to the screen with aspect kept (compositor's own fullscreen toggle also works)");
                 println!("  --metrics             latency/bandwidth overlay (top-left) + clock-sync pings");
                 return Ok(());
             }
@@ -98,7 +101,7 @@ fn main() -> Result<()> {
             if slot_mem != "host" {
                 bail!("--output egl requires --slot-mem host (the upload reads the slot through a CPU pointer)");
             }
-            let p = wayland::Presenter::new(link.meta.width, link.meta.height, input_tx)?;
+            let p = wayland::Presenter::new(link.meta.width, link.meta.height, input_tx, fullscreen)?;
             let win = eglwin::EglWindow::new(
                 p.wl_display_ptr(),
                 p.wl_surface_ptr(),
@@ -195,6 +198,11 @@ fn main() -> Result<()> {
                 link.send_input(ev)?;
             }
             p.pump(1)?; // short wait: bounds frame latency at ~1ms
+            // apply compositor-driven buffer resizes (fullscreen toggles,
+            // fractional-scale changes) before the next frame is drawn
+            if let Some((w, h)) = p.take_resize() {
+                win.resize(w, h);
+            }
             if p.closed() {
                 eprintln!("[client] window closed, ending");
                 break;

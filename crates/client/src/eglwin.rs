@@ -38,6 +38,7 @@ const GL_UNSIGNED_BYTE: u32 = 0x1401;
 const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
 const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
 const GL_NEAREST: u32 = 0x2600;
+const GL_LINEAR: u32 = 0x2601;
 const GL_TRIANGLES: u32 = 0x0004;
 const GL_BLEND: u32 = 0x0BE2;
 const GL_SRC_ALPHA: u32 = 0x0302;
@@ -134,15 +135,29 @@ void main() {
 const FS: &str = r#"#version 300 es
 precision highp float;
 uniform sampler2D tex;
+uniform vec2 u_win;    // buffer (device) size, px
+uniform vec2 u_frame;  // guest frame size, px
 in vec2 v_uv;
 out vec4 frag;
 void main() {
-    // Wire bytes are B,G,R,X uploaded as RGBA — swizzle to true color (.bgra).
-    // Vertical flip: the wire is top-first (row 0 = screen top), but
-    // glTexImage2D places the first row at texture v=0, which our fullscreen
-    // triangle maps to the window's bottom — mirror v to undo it. (Client-side
-    // twin of the server's OES readback orientation lesson.)
-    frag = texture(tex, vec2(v_uv.x, 1.0 - v_uv.y)).bgra;
+    // Letterbox: aspect-fit the frame inside the buffer, black bars
+    // elsewhere. Windowed mode is the degenerate case (buffer == frame:
+    // scale 1, origin 0 — identical to the old plain stretch).
+    vec2 px = v_uv * u_win;              // bottom-left origin
+    vec2 scl = min(u_win / u_frame, vec2(1e6));
+    vec2 pic = u_frame * scl;
+    vec2 org = (u_win - pic) * 0.5;
+    if (all(greaterThanEqual(px, org)) && all(lessThan(px, org + pic))) {
+        vec2 uv = (px - org) / pic;
+        // Wire bytes are B,G,R,X uploaded as RGBA — swizzle to true color (.bgra).
+        // Vertical flip: the wire is top-first (row 0 = screen top), but
+        // glTexImage2D places the first row at texture v=0, which maps to
+        // the picture's bottom — mirror v to undo it. (Client-side twin of
+        // the server's OES readback orientation lesson.)
+        frag = texture(tex, vec2(uv.x, 1.0 - uv.y)).bgra;
+    } else {
+        frag = vec4(0.0, 0.0, 0.0, 1.0);  // letterbox bar
+    }
 }
 "#;
 
@@ -186,8 +201,19 @@ pub struct EglWindow {
     gl: Gl,
     prog: u32,
     tex: u32,
+    /// buffer (device-pixel) size — what GL renders into
     width: u32,
     height: u32,
+    /// guest frame size (what we upload) — differs from the buffer when
+    /// fullscreen letterboxes/scales
+    frame_w: u32,
+    frame_h: u32,
+    /// libwayland-egl native window + resize fn (fullscreen/window resizes)
+    window: *mut c_void,
+    wlegl_resize: unsafe extern "C" fn(*mut c_void, i32, i32) -> i32,
+    /// main program uniform locations for the letterbox shader
+    loc_win: i32,
+    loc_frame: i32,
     // --metrics overlay (top-left text quad); all zero/disabled when off
     ov_prog: u32,
     ov_tex: u32,
@@ -221,6 +247,11 @@ impl EglWindow {
             i32,
             i32,
         ) -> *mut c_void = sym(&wlegl, "wl_egl_window_create")?;
+        let wl_egl_window_resize: unsafe extern "C" fn(
+            *mut c_void,
+            i32,
+            i32,
+        ) -> i32 = sym(&wlegl, "wl_egl_window_resize")?;
         let window =
             unsafe { wl_egl_window_create(wl_surface_ptr, width as i32, height as i32) };
         if window.is_null() {
@@ -352,6 +383,12 @@ impl EglWindow {
             tex: 0,
             width,
             height,
+            frame_w: width,
+            frame_h: height,
+            window,
+            wlegl_resize: wl_egl_window_resize,
+            loc_win: -1,
+            loc_frame: -1,
             ov_prog: 0,
             ov_tex: 0,
             ov_loc_origin: -1,
@@ -470,8 +507,56 @@ impl EglWindow {
                 bail!("program link failed");
             }
             self.prog = prog;
+            let name = |s: &str| -> i32 {
+                let c = std::ffi::CString::new(s).unwrap();
+                (self.gl.get_uniform_location)(prog, c.as_ptr())
+            };
+            self.loc_win = name("u_win");
+            self.loc_frame = name("u_frame");
         }
         Ok(())
+    }
+
+    /// Resize the libwayland-egl native window (fullscreen configure,
+    /// fractional-scale change). The next `present` renders into the new
+    /// buffer size. Also retunes the texture filter: NEAREST stays
+    /// pixel-perfect for integer upscales, LINEAR avoids uneven-pixel
+    /// artifacts at fractional scales.
+    pub fn resize(&mut self, w: u32, h: u32) {
+        if (w, h) == (self.width, self.height) {
+            return;
+        }
+        unsafe { (self.wlegl_resize)(self.window, w as i32, h as i32) };
+        self.width = w;
+        self.height = h;
+        let scl = (w as f32 / self.frame_w.max(1) as f32)
+            .min(h as f32 / self.frame_h.max(1) as f32);
+        let linear = (scl - scl.round()).abs() > 1e-3;
+        let f = (if linear { GL_LINEAR } else { GL_NEAREST }) as i32;
+        unsafe {
+            (self.gl.bind_texture)(GL_TEXTURE_2D, self.tex);
+            (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
+            (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
+            (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
+        }
+        eprintln!(
+            "[eglwin] buffer {}x{} (frame {}x{}, scale {scl:.3}, filter {})",
+            w,
+            h,
+            self.frame_w,
+            self.frame_h,
+            if linear { "linear" } else { "nearest" }
+        );
+    }
+
+    /// Guest frame dimensions changed (mid-session resolution change): the
+    /// letterbox shader picks it up via the u_frame uniform; the filter
+    /// choice is recomputed at the next `resize`. The caller must also have
+    /// resized the buffer if the target window size differs.
+    #[allow(dead_code)] // wired up when mid-session resolution change lands
+    pub fn set_frame_size(&mut self, w: u32, h: u32) {
+        self.frame_w = w;
+        self.frame_h = h;
     }
 
     /// Upload slot bytes (the NIC-written staging buffer), draw to the
@@ -495,8 +580,8 @@ impl EglWindow {
                 GL_TEXTURE_2D,
                 0,
                 GL_RGBA8 as i32,
-                self.width as i32,
-                self.height as i32,
+                self.frame_w as i32,
+                self.frame_h as i32,
                 0,
                 GL_RGBA,
                 GL_UNSIGNED_BYTE,
@@ -509,6 +594,16 @@ impl EglWindow {
             t4 = rdma_display_proto::unix_now_us();
             (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
             (self.gl.use_program)(self.prog);
+            (self.gl.uniform_2f)(
+                self.loc_win,
+                self.width as f32,
+                self.height as f32,
+            );
+            (self.gl.uniform_2f)(
+                self.loc_frame,
+                self.frame_w as f32,
+                self.frame_h as f32,
+            );
             (self.gl.bind_texture)(GL_TEXTURE_2D, self.tex);
             (self.gl.viewport)(0, 0, self.width as i32, self.height as i32);
             (self.gl.draw_arrays)(GL_TRIANGLES, 0, 3);
