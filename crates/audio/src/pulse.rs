@@ -147,7 +147,14 @@ impl Pulse {
             "rdma-display-capture",
             spec,
             BufferAttr {
-                maxlength: 0, // server default
+                // (uint32)-1 = "server default": pipewire-pulse clamps a
+                // LITERAL 0 to frame_size (8 bytes) — maxlength=8 then makes
+                // every graph cycle hit the overrun-recovery path
+                // (skip-to-latest, send one fragsize per cycle), throttling
+                // the capture to 8 bytes/cycle ≈ one 10 ms packet per 2.5 s.
+                // PulseAudio proper treats 0 as default; pipewire-pulse
+                // (fix_record_buffer_attr) only treats -1 as default.
+                maxlength: u32::MAX,
                 tlength: 0,
                 prebuf: 0,
                 minreq: 0,
