@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 pub mod keymap;
 
 pub const MAGIC: u32 = 0x5244_4453; // "RDDS"
-pub const VERSION: u32 = 5; // v5: Stamp carries the materializer's blit/read/finish times
+pub const VERSION: u32 = 6; // v6: audio side-channel (2nd connection to the main port, tag byte 0x02); control bytes unchanged
 
 /// Wall-clock microseconds since the unix epoch. Cross-host comparable
 /// (that is the point): per-frame server stamps and ping-pong clock-sync

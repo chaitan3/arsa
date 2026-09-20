@@ -1,0 +1,91 @@
+//! Client side: connect to the audio side-channel and play it out.
+//!
+//! One thread per session: TCP recv → pa_simple_write. The pulse
+//! server-side buffer (`tlength`/`prebuf` = wire::BUFFER_MS) IS the jitter
+//! buffer: playout starts once it is full, after every underrun it
+//! re-gates, and network backlog beyond ~150 ms is flushed (log + resync)
+//! so drift can never accumulate. No ring, no second thread.
+
+use std::io::Read;
+use std::net::TcpStream;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+
+use super::pulse::{Pulse, SampleSpec};
+use super::wire;
+
+/// Retry loop wrapper — an audio session failure never takes down video;
+/// we log once per failure and reconnect.
+pub fn run(addr: std::net::SocketAddr) {
+    loop {
+        match session(addr) {
+            Ok(()) => unreachable!("audio session loop returned"),
+            Err(e) => {
+                eprintln!("[audio] session ended: {e:#}; reconnecting in 2 s");
+            }
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+fn session(addr: std::net::SocketAddr) -> Result<()> {
+    let mut sock = TcpStream::connect(addr).with_context(|| format!("audio connect {addr}"))?;
+    sock.set_nodelay(true)?;
+    use std::io::Write;
+    sock.write_all(&[wire::TAG_AUDIO])
+        .context("audio: send tag")?;
+
+    let mut fmt = [0u8; wire::FORMAT_LEN];
+    sock.read_exact(&mut fmt).context("audio: read format record")?;
+    wire::decode_format(&fmt)?;
+
+    let pulse = Pulse::dlopen()?;
+    let stream = pulse.open_playback(
+        None,
+        SampleSpec { rate: wire::RATE, channels: wire::CHANNELS },
+        wire::BUFFER_MS,
+    )?;
+    eprintln!(
+        "[audio] playing (f32le {} Hz, {}ch, {} ms buffer via the default sink)",
+        wire::RATE,
+        wire::CHANNELS,
+        wire::BUFFER_MS
+    );
+
+    let mut hdr = [0u8; wire::PACKET_HDR_LEN];
+    let mut next_report = Instant::now() + Duration::from_secs(5);
+    let mut last_seq: Option<u32> = None;
+    loop {
+        sock.read_exact(&mut hdr).context("audio: read packet header")?;
+        let (seq, _host_us, frames) = wire::decode_packet_header(&hdr);
+        wire::frames_plausible(frames)?;
+        let mut payload = vec![0u8; wire::payload_len(frames)?];
+        sock.read_exact(&mut payload).context("audio: read packet payload")?;
+        stream.write_all(&payload)?;
+        if let Some(prev) = last_seq {
+            if seq != prev.wrapping_add(1) {
+                eprintln!("[audio] seq gap {} -> {}", prev, seq);
+            }
+        }
+        last_seq = Some(seq);
+        if Instant::now() > next_report {
+            next_report += Duration::from_secs(5);
+            match stream.latency_us() {
+                Ok(us) => {
+                    // drift guard: if backlog exceeds the buffer by a wide
+                    // margin (clock skew between the two pulse streams),
+                    // flush and resync rather than accumulating latency
+                    let backlog_us = us as i64 - (wire::BUFFER_MS as i64) * 1000;
+                    if backlog_us > 150_000 {
+                        eprintln!("[audio] playout latency {} ms > buffer, flushing to resync", us / 1000);
+                        stream.flush()?;
+                    } else {
+                        eprintln!("[audio] playout latency ~{} ms", us / 1000);
+                    }
+                }
+                Err(e) => eprintln!("[audio] latency query failed: {e:#}"),
+            }
+        }
+    }
+}

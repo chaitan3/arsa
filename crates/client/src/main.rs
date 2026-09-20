@@ -26,6 +26,7 @@ fn main() -> Result<()> {
     let mut output: String = "none".to_string();
     let mut metrics_on = false;
     let mut fullscreen = false;
+    let mut audio_on = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -40,12 +41,14 @@ fn main() -> Result<()> {
             "--output" => output = args.next().expect("--output needs a value").to_string(),
             "--metrics" => metrics_on = true,
             "--fullscreen" => fullscreen = true,
+            "--audio" => audio_on = true,
             "--help" | "-h" => {
                 println!("usage: rdma-display-client --server HOST:PORT [--device mlx5_0] [--slots 3] [--dump frame.ppm] [--seconds N]");
                 println!("  --slot-mem host|cuda  receive slots: host = pinned RAM (default); cuda = dormant GPU path");
                 println!("  --cuda-device N       CUDA device ordinal for --slot-mem cuda (default 0)");
                 println!("  --output none|egl     egl = present in a Wayland window (needs --slot-mem host)");
                 println!("  --fullscreen          fullscreen on the current output; frame letterboxed/scaled to the screen with aspect kept (compositor's own fullscreen toggle also works)");
+                println!("  --audio               play the server's audio side-channel (default sink; server captures its own monitor source)");
                 println!("  --metrics             latency/bandwidth overlay (top-left) + clock-sync pings");
                 return Ok(());
             }
@@ -122,6 +125,17 @@ fn main() -> Result<()> {
         m
     });
     let mut last_overlay = Instant::now();
+
+    // audio side-channel: second connection to the same port, tagged 0x02;
+    // the thread owns its socket outright and retries on its own schedule —
+    // a dead audio path never affects video/input
+    if audio_on {
+        std::thread::Builder::new()
+            .name("audio".into())
+            .spawn(move || rdma_display_audio::playback::run(addr))
+            .context("spawn audio thread")?;
+        eprintln!("[audio] client stream connecting ({addr})");
+    }
 
     let started = Instant::now();
     let deadline = seconds.map(|s| started + std::time::Duration::from_secs(s));

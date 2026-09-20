@@ -10,6 +10,7 @@ tempfile = "3"
 [dependencies]
 rdma-display-proto.workspace = true
 rdma-display-rdma = { path = "../rdma" }
+rdma-display-audio = { path = "../audio" }
 anyhow.workspace = true
 libloading = "0.8"
 wayland-client = "0.31"

@@ -43,6 +43,8 @@ fn main() -> Result<()> {
     let mut drm_card: Option<String> = None;
     let mut input_test = false;
     let mut readback: String = "pbo".to_string();
+    let mut audio = false;
+    let mut audio_device: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -64,13 +66,17 @@ fn main() -> Result<()> {
             "--rendernode" => rendernode = Some(args.next().expect("--rendernode needs a value")),
             "--drm-card" => drm_card = Some(args.next().expect("--drm-card needs a value")),
             "--input-test" => input_test = true,
+            "--audio" => audio = true,
+            "--audio-device" => audio_device = Some(args.next().expect("--audio-device needs a value")),
             "--help" | "-h" => {
                 println!("usage: rdma-display-server [--mode testcard|capture] [--device mlx5_0] [--listen 0.0.0.0:4791] [--slots 3] [--fps 60]\n  \
 capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS capture, the host — requires sudo/CAP_SYS_ADMIN, kernel >= 5.8)\n  \
   --input qemu|uinput (default auto: qemu↔qemu-dbus, drm↔uinput)\n  \
   qemu: [--dbus-socket /path/dbus.sock] [--console 0]   drm: [--drm-card /dev/dri/card0]\n  \
   [--materialize egl|plain] [--rendernode /dev/dri/renderD128] [--readback pbo|direct] [--input-test]\n  \
-  --fps N (capture): pacing cap; 0 = uncapped, consumer-paced by client credits (default 30). For lower latency use 60 or 0.");
+  --fps N (capture): pacing cap; 0 = uncapped, consumer-paced by client credits (default 30). For lower latency use 60 or 0.\n  \
+  --audio [--audio-device my-sink.monitor]  audio side-channel: capture the named source's PCM through the pipewire-pulse\n  \
+  compat socket (XDG_RUNTIME_DIR must point at the user's session when running under sudo; '@DEFAULT_MONITOR@' = default sink).");
                 return Ok(());
             }
             other => anyhow::bail!("unknown arg: {other}"),
@@ -85,6 +91,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
         "capture" => run_capture(
             &ctx, &pd, &source, input.as_deref(), &dbus_socket, console, &drm_card,
             &materialize, rendernode.as_deref(), &listen, slots, fps, input_test, &readback,
+            audio, audio_device.as_deref(),
         ),
         other => bail!("mode {other:?} not implemented yet"),
     }
@@ -113,6 +120,13 @@ fn run_testcard_server(
     for stream in listener.incoming() {
         let stream = stream?;
         let _ = stream.set_nodelay(true);
+        // tag routing (testcard has no audio capture): an audio-tagged
+        // connection is dropped; control proceeds as usual
+        let mut probe = [0u8; 1];
+        if stream.peek(&mut probe).map_or(false, |n| n == 1 && probe[0] == rdma_display_audio::wire::TAG_AUDIO) {
+            eprintln!("[server] audio connection in testcard mode: dropped");
+            continue;
+        }
         eprintln!("client connected: {}", stream.peer_addr()?);
         // testcard has no console to inject into: drain input events
         let (input_tx, input_rx) = mpsc::channel();
@@ -187,10 +201,21 @@ fn run_capture(
     fps: u64,
     input_test: bool,
     readback: &str,
+    audio: bool,
+    audio_device: Option<&str>,
 ) -> Result<()> {
     if source_name == "drm" && materialize != "egl" {
         bail!("--source drm requires --materialize egl (KMS capture is dmabuf-only)");
     }
+    // audio side-channel: capture starts with the server (video flows even
+    // if no client ever connects the audio stream; the mailbox just
+    // overwrites — realtime drop-oldest, zero backpressure)
+    let audio_mbox = if audio {
+        Some(rdma_display_audio::capture::start_capture(audio_device)?)
+    } else {
+        None
+    };
+    let audio_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut mat: Box<dyn FrameMaterializer> = match materialize {
         "egl" => Box::new(rdma_display_capture::EglMaterializer::new(rendernode)?),
         "plain" => Box::new(rdma_display_capture::materializer::PlainMaterializer::new()),
@@ -379,10 +404,43 @@ fn run_capture(
             }
         }
 
-        // 3. ensure a client session exists
-        if session.is_none() {
-            if let Ok((stream, _addr)) = listener.accept() {
-                let _ = stream.set_nodelay(true);
+        // 3. accept new connections and route by tag byte (audio uses a
+        // SECOND connection to the same port; the control connection is
+        // byte-compatible as before)
+        if let Ok((stream, addr)) = listener.accept() {
+            let _ = stream.set_nodelay(true);
+            let mut probe = [0u8; 1];
+            let tag = stream
+                .peek(&mut probe)
+                .map(|n| if n == 1 { probe[0] } else { 0 })
+                .unwrap_or(0);
+            if tag == rdma_display_audio::wire::TAG_AUDIO {
+                match audio_mbox.as_ref() {
+                    Some(mbox) => {
+                        if audio_busy
+                            .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            eprintln!("[audio] client stream connected ({addr})");
+                            let mbox = mbox.clone();
+                            let busy = audio_busy.clone();
+                            std::thread::spawn(move || {
+                                if let Err(e) =
+                                    rdma_display_audio::capture::serve_connection(stream, &mbox)
+                                {
+                                    eprintln!("[audio] stream ended: {e:#}");
+                                }
+                                busy.store(false, std::sync::atomic::Ordering::SeqCst);
+                            });
+                        } else {
+                            eprintln!("[audio] second audio connection refused ({addr})");
+                        }
+                    }
+                    None => {
+                        eprintln!("[server] audio connection but --audio is off: dropped ({addr})");
+                    }
+                }
+            } else if session.is_none() {
                 if let Some(meta) = pending_meta.clone() {
                     eprintln!("client connected: {}", stream.peer_addr()?);
                     // zero-copy staging (PBO readback): bind the materializer's
@@ -424,6 +482,10 @@ fn run_capture(
                         Err(e) => eprintln!("[server] session setup failed: {e:#}"),
                     }
                 }
+            } else {
+                eprintln!(
+                    "[server] control connection while a session is active: dropped ({addr})"
+                );
             }
         }
 

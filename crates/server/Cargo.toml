@@ -8,5 +8,6 @@ publish = false
 rdma-display-proto.workspace = true
 rdma-display-rdma = { path = "../rdma" }
 rdma-display-capture = { path = "../capture" }
+rdma-display-audio = { path = "../audio" }
 anyhow.workspace = true
 ibverbs.workspace = true

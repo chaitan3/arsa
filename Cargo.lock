@@ -1826,6 +1826,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rdma-display-audio"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libloading",
+]
+
+[[package]]
 name = "rdma-display-capture"
 version = "0.1.0"
 dependencies = [
@@ -1845,6 +1853,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "libloading",
+ "rdma-display-audio",
  "rdma-display-proto",
  "rdma-display-rdma",
  "tempfile",
@@ -1873,6 +1882,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ibverbs",
+ "rdma-display-audio",
  "rdma-display-capture",
  "rdma-display-proto",
  "rdma-display-rdma",
