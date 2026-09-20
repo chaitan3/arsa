@@ -524,9 +524,17 @@ impl EglMaterializer {
 
     /// (re)create the linear RGBA8 target and the persistent readback buffer
     fn build_targets(&mut self, fmt: &FrameFormat) -> Result<()> {
+        // Only rebuild when the format actually changed: QEMU re-announces
+        // the scanout on every buffer alternation, and rebuilding here
+        // allocates + frees an 8 MB texture per update (churn even when the
+        // delete is correct).
+        if let Some(f) = &self.fmt {
+            if f.width == fmt.width && f.height == fmt.height && f.stride == fmt.stride {
+                return Ok(());
+            }
+        }
         let w = fmt.width as i32;
         let h = fmt.height as i32;
-        let size = fmt.frame_bytes() as isize;
         unsafe {
             // linear target texture
             let mut tex = 0u32;
@@ -551,12 +559,19 @@ impl EglMaterializer {
             }
             (self.gl.bind_framebuffer)(GL_FRAMEBUFFER, 0);
 
+            // delete the previous FBO *and* texture: a deleted texture stays
+            // alive while an FBO attachment still references it — skipping the
+            // FBO delete leaked one 8 MB texture + FBO per scanout re-announce
+            // (the VRAM leak)
+            if self.fbo != 0 {
+                (self.gl.delete_framebuffers)(1, &[self.fbo] as *const u32);
+            }
+            (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
             if self.linear_tex != 0 {
                 (self.gl.delete_textures)(1, &[self.linear_tex] as *const u32);
             }
             self.linear_tex = tex;
             self.fbo = fbo;
-            let _ = size; // staging is written by glReadPixels directly now
         }
         Ok(())
     }
@@ -573,9 +588,12 @@ impl EglMaterializer {
             0x3432_5258 | 0x3432_4258 | 0x3432_5241 | 0x3432_4241 => {}
             other => bail!("EGL materializer: unsupported fourcc {other:#010x}"),
         }
-        // destroy the previous import
+        // destroy the previous import: unbind BOTH targets the blit touches
+        // (the OES binding is what the blit leaves bound — a deleted texture
+        // stays alive while any binding still references it)
         if let Some((img, tex)) = self.img.take() {
             unsafe {
+                (self.gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, 0);
                 (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
                 (self.gl.delete_textures)(1, &[tex] as *const u32);
                 (self.egl.destroy_image)(self.dpy, img);
