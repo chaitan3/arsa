@@ -59,16 +59,22 @@ fn main() -> Result<()> {
     };
 
     let (tx, rx) = mpsc::channel();
-    // keep the input sender alive: dropping it would make the capture source's
-    // input loop see a disconnected channel (and --load uses a clone to drive
-    // guest repaints during the bench)
+    // --load drives guest repaints through the QEMU D-Bus input path; spawn
+    // the (split-off) input sink for it
     let (input_tx, input_rx) = mpsc::channel::<rdma_display_proto::InputEvent>();
     let _input_keepalive = input_tx.clone();
+    if load {
+        rdma_display_capture::InputSink::spawn(
+            Box::new(rdma_display_capture::QemuDbusInput::new(dbus_socket.clone(), console)),
+            input_rx,
+            std::sync::Arc::new(rdma_display_capture::ScreenSize::default()),
+        )
+        .context("spawn input sink")?;
+    }
 
     rdma_display_capture::CaptureSource::spawn(
         Box::new(QemuDbusSource::new(dbus_socket, console)),
         tx,
-        input_rx,
     )
     .context("spawn capture source")?;
 

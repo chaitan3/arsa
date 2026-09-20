@@ -12,12 +12,16 @@
 //! bytes the RDMA sender stages into its registered slots. Implemented:
 //! `plain` (D-Bus bytes, no GPU), `egl` (GPU blit + readback, default).
 
+pub mod drm;
 pub mod egl;
+pub mod input;
 pub mod materializer;
 pub mod qemu;
 
 pub use materializer::FrameMaterializer;
 pub use egl::{EglMaterializer, ReadBenchOpts, run_readback_bench};
+pub use input::{InputSink, QemuDbusInput, UinputSink};
+pub use drm::DrmKmsSource;
 pub use qemu::QemuDbusSource;
 
 use anyhow::Result;
@@ -91,13 +95,35 @@ pub enum CaptureEvent {
 }
 
 /// A running capture source delivers events until the receiver drops.
-/// `input_rx` carries user-input events (proto v2) for injection into the
-/// source's console (QEMU D-Bus Keyboard/Mouse interfaces).
+/// Input injection is decoupled from capture: see [`input::InputSink`] —
+/// the server pairs a source with a sink (`--source qemu` ↔ QEMU D-Bus
+/// console injection, `--source drm` ↔ uinput into the host compositor).
 pub trait CaptureSource: Send {
     fn name(&self) -> &'static str;
-    fn spawn(
-        self: Box<Self>,
-        tx: std::sync::mpsc::Sender<CaptureEvent>,
-        input_rx: std::sync::mpsc::Receiver<rdma_display_proto::InputEvent>,
-    ) -> Result<()>;
+    fn spawn(self: Box<Self>, tx: std::sync::mpsc::Sender<CaptureEvent>) -> Result<()>;
+}
+
+/// Current captured screen dimensions (for input sinks: Abs coordinates are
+/// frame pixels; uinput needs them as ABS ranges, and they can change with
+/// the scanout). Shared cell, updated by the server when a scanout arrives.
+#[derive(Debug, Default)]
+pub struct ScreenSize {
+    pub w: std::sync::atomic::AtomicU32,
+    pub h: std::sync::atomic::AtomicU32,
+}
+
+impl ScreenSize {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+    pub fn set(&self, w: u32, h: u32) {
+        self.w.store(w, std::sync::atomic::Ordering::Relaxed);
+        self.h.store(h, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn get(&self) -> (u32, u32) {
+        (
+            self.w.load(std::sync::atomic::Ordering::Relaxed),
+            self.h.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
 }

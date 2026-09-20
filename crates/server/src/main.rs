@@ -3,19 +3,30 @@
 //!
 //! Modes:
 //!   --mode testcard   synthetic frames (validates the transport end-to-end)
-//!   --mode capture    QEMU dbus display capture:
-//!                       --materialize egl    GPU blit+readback (default, gl=on)
-//!                       --materialize plain  D-Bus host-memory scanouts (gl=off)
-//!                       --readback pbo       zero-copy staging: GL readback DMA
-//!                       fills persistent-mapped PBOs registered as RDMA slots
-//!                       (default for egl); "direct" = legacy readPixels path
+//!   --mode capture    --source qemu|drm:
+//!     qemu  QEMU dbus display capture (the guest):
+//!             --materialize egl    GPU blit+readback (default, gl=on)
+//!             --materialize plain  D-Bus host-memory scanouts (gl=off)
+//!             --readback pbo       zero-copy staging: GL readback DMA fills
+//!                                  persistent-mapped PBOs registered as RDMA
+//!                                  slots (default for egl); "direct" = legacy
+//!                                  readPixels path
+//!             --input qemu         inject into the guest console (default)
+//!     drm   KMS capture of the host screen (Sunshine-style): grabs the
+//!             CRTC's current fb via GETFB2 as a dmabuf each flip; requires
+//!             sudo (CAP_SYS_ADMIN) and kernel >= 5.8; egl materialize only
+//!             --input uinput        inject into the host compositor (default)
 
 use std::net::TcpListener;
 use std::sync::mpsc;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use rdma_display_proto::{Conn, DisplayMeta};
-use rdma_display_capture::{CaptureEvent, FrameFormat, FrameMaterializer, QemuDbusSource};
+use rdma_display_capture::{
+    CaptureEvent, CaptureSource, DrmKmsSource, FrameFormat, FrameMaterializer, InputSink,
+    QemuDbusInput, QemuDbusSource, ScreenSize,
+};
 
 fn main() -> Result<()> {
     let mut mode = "testcard".to_string();
@@ -23,10 +34,13 @@ fn main() -> Result<()> {
     let mut listen: String = "0.0.0.0:4791".to_string();
     let mut slots: usize = 3;
     let mut fps: u64 = 30;
+    let mut source = "qemu".to_string();
+    let mut input: Option<String> = None; // None = paired default for the source
     let mut dbus_socket: Option<String> = None;
     let mut console: u32 = 0;
     let mut materialize: String = "egl".to_string();
     let mut rendernode: Option<String> = None;
+    let mut drm_card: Option<String> = None;
     let mut input_test = false;
     let mut readback: String = "pbo".to_string();
 
@@ -39,6 +53,8 @@ fn main() -> Result<()> {
             "--slots" => slots = args.next().expect("--slots needs a value").parse()?,
             "--fps" => fps = args.next().expect("--fps needs a value").parse()?,
 
+            "--source" => source = args.next().expect("--source needs a value"),
+            "--input" => input = Some(args.next().expect("--input needs a value")),
             "--dbus-socket" => {
                 dbus_socket = Some(args.next().expect("--dbus-socket needs a value"))
             }
@@ -46,11 +62,14 @@ fn main() -> Result<()> {
             "--materialize" => materialize = args.next().expect("--materialize needs a value"),
             "--readback" => readback = args.next().expect("--readback needs a value"),
             "--rendernode" => rendernode = Some(args.next().expect("--rendernode needs a value")),
+            "--drm-card" => drm_card = Some(args.next().expect("--drm-card needs a value")),
             "--input-test" => input_test = true,
             "--help" | "-h" => {
                 println!("usage: rdma-display-server [--mode testcard|capture] [--device mlx5_0] [--listen 0.0.0.0:4791] [--slots 3] [--fps 60]\n  \
-capture: [--dbus-socket /path/dbus.sock] [--console 0] [--materialize egl|plain] [--rendernode /dev/dri/renderD128]
-  [--input-test]  capture only: inject synthetic keys/mouse (validates the D-Bus input path without a client)
+capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS capture, the host — requires sudo/CAP_SYS_ADMIN, kernel >= 5.8)\n  \
+  --input qemu|uinput (default auto: qemu↔qemu-dbus, drm↔uinput)\n  \
+  qemu: [--dbus-socket /path/dbus.sock] [--console 0]   drm: [--drm-card /dev/dri/card0]\n  \
+  [--materialize egl|plain] [--rendernode /dev/dri/renderD128] [--readback pbo|direct] [--input-test]\n  \
   --fps N (capture): pacing cap; 0 = uncapped, consumer-paced by client credits (default 30). For lower latency use 60 or 0.");
                 return Ok(());
             }
@@ -64,8 +83,8 @@ capture: [--dbus-socket /path/dbus.sock] [--console 0] [--materialize egl|plain]
     match mode.as_str() {
         "testcard" => run_testcard_server(&ctx, &pd, &listen, slots, fps),
         "capture" => run_capture(
-            &ctx, &pd, &dbus_socket, console, &materialize, rendernode.as_deref(), &listen, slots,
-            fps, input_test, &readback,
+            &ctx, &pd, &source, input.as_deref(), &dbus_socket, console, &drm_card,
+            &materialize, rendernode.as_deref(), &listen, slots, fps, input_test, &readback,
         ),
         other => bail!("mode {other:?} not implemented yet"),
     }
@@ -152,11 +171,15 @@ fn testcard_fill(bytes: &mut [u8], frame: u64) {
 // capture mode
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn run_capture(
     ctx: &ibverbs::Context,
     pd: &ibverbs::ProtectionDomain,
+    source_name: &str,
+    input_name: Option<&str>,
     dbus_socket: &Option<String>,
     console: u32,
+    drm_card: &Option<String>,
     materialize: &str,
     rendernode: Option<&str>,
     listen: &str,
@@ -165,6 +188,9 @@ fn run_capture(
     input_test: bool,
     readback: &str,
 ) -> Result<()> {
+    if source_name == "drm" && materialize != "egl" {
+        bail!("--source drm requires --materialize egl (KMS capture is dmabuf-only)");
+    }
     let mut mat: Box<dyn FrameMaterializer> = match materialize {
         "egl" => Box::new(rdma_display_capture::EglMaterializer::new(rendernode)?),
         "plain" => Box::new(rdma_display_capture::materializer::PlainMaterializer::new()),
@@ -172,11 +198,34 @@ fn run_capture(
     };
     eprintln!("[server] capture materializer: {}", mat.name());
 
+    // input sink: explicit --input wins, else paired default
+    let input_name = input_name.unwrap_or(match source_name {
+        "drm" => "uinput",
+        _ => "qemu",
+    });
+    if input_name == "qemu" && source_name == "drm" {
+        bail!("--input qemu injects into the QEMU guest, which --source drm does not capture (use --input uinput)");
+    }
+    if input_name == "uinput" && source_name == "qemu" {
+        bail!("--input uinput injects into the host compositor, but --source qemu captures the guest (use --input qemu)");
+    }
+    let screen = ScreenSize::new();
+    let (input_tx, input_rx) = mpsc::channel::<rdma_display_proto::InputEvent>();
+    let sink: Box<dyn InputSink> = match input_name {
+        "qemu" => Box::new(QemuDbusInput::new(dbus_socket.clone(), console)),
+        "uinput" => Box::new(rdma_display_capture::UinputSink),
+        other => bail!("input sink {other:?} not implemented (qemu|uinput)"),
+    };
+    InputSink::spawn(sink, input_rx, screen.clone())?;
+    eprintln!("[server] input sink: {input_name}");
+
     let (tx, rx) = mpsc::channel();
-    let (input_tx, input_rx) = mpsc::channel();
-    let source: Box<dyn rdma_display_capture::CaptureSource> =
-        Box::new(QemuDbusSource::new(dbus_socket.clone(), console));
-    source.spawn(tx, input_rx)?;
+    let source: Box<dyn CaptureSource> = match source_name {
+        "qemu" => Box::new(QemuDbusSource::new(dbus_socket.clone(), console)),
+        "drm" => Box::new(DrmKmsSource::new(drm_card.clone())),
+        other => bail!("source {other:?} not implemented (qemu|drm)"),
+    };
+    CaptureSource::spawn(source, tx)?;
     eprintln!("[server] capture running; listening on {listen}");
 
     // --input-test: synthetic injector in the BACKGROUND so a client can
@@ -296,7 +345,7 @@ fn run_capture(
                 Ok(ev) => {
                     handle_capture_event(
                         ev, &mut mat, &mut session, &mut pending_meta,
-                        &mut t0_unix_us, &mut frame_dirty,
+                        &mut t0_unix_us, &mut frame_dirty, &screen,
                     )?;
                 }
                 Err(_) => bail!("capture source ended"),
@@ -306,7 +355,7 @@ fn run_capture(
                 Ok(ev) => {
                     handle_capture_event(
                         ev, &mut mat, &mut session, &mut pending_meta,
-                        &mut t0_unix_us, &mut frame_dirty,
+                        &mut t0_unix_us, &mut frame_dirty, &screen,
                     )?;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -322,7 +371,7 @@ fn run_capture(
                 Ok(ev) => {
                     handle_capture_event(
                         ev, &mut mat, &mut session, &mut pending_meta,
-                        &mut t0_unix_us, &mut frame_dirty,
+                        &mut t0_unix_us, &mut frame_dirty, &screen,
                     )?;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -479,12 +528,14 @@ fn handle_capture_event(
     pending_meta: &mut Option<DisplayMeta>,
     t0_unix_us: &mut u64,
     frame_dirty: &mut bool,
+    screen: &Arc<ScreenSize>,
 ) -> Result<()> {
     match ev {
         CaptureEvent::Scanout(dmabuf) => {
             let fmt = dmabuf.format.clone();
             mat.prepare(&fmt, Some(&dmabuf))
                 .context("prepare scanout")?;
+            screen.set(fmt.width, fmt.height);
             *pending_meta = Some(meta_linear(&fmt));
             *t0_unix_us = rdma_display_proto::unix_now_us();
             *frame_dirty = true;
@@ -492,6 +543,7 @@ fn handle_capture_event(
         CaptureEvent::PlainScanout(fmt, data, t0) => {
             *t0_unix_us = t0;
             mat.prepare(&fmt, None).context("prepare plain scanout")?;
+            screen.set(fmt.width, fmt.height);
             mat.handle_event(CaptureEvent::PlainUpdate(
                 rdma_display_capture::DirtyRect {
                     x: 0,

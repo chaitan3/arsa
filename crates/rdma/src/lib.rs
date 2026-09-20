@@ -72,6 +72,10 @@ pub fn open_device(name: Option<&str>) -> Result<ibverbs::Context> {
 
 fn routable_gid_index(ctx: &ibverbs::Context) -> Result<u32> {
     if let Some(gid) = ctx.routable_gid(1).context("routable_gid failed")? {
+        eprintln!(
+            "[rdma] sgid: index={} type={:?} gid={:?} ndev_ifindex={}",
+            gid.gid_index, gid.gid_type, gid.gid, gid.ndev_ifindex
+        );
         return Ok(gid.gid_index);
     }
     anyhow::bail!("no routable GID found on port 1 (check RoCE config)")
@@ -132,6 +136,15 @@ fn endpoint_exchange<T: std::io::Read + std::io::Write>(
     match conn.recv()? {
         Message::QpEndpoint(bytes) => {
             let remote = QueuePairEndpoint::from_bytes(&bytes).map_err(|e| anyhow!("{e}"))?;
+            eprintln!(
+                "[rdma] endpoints: local qpn={} psn={:#010x} gid={:?} | remote qpn={} psn={:#010x} gid={:?}",
+                local.qp_num,
+                local.psn,
+                local.gid,
+                remote.qp_num,
+                remote.psn,
+                remote.gid,
+            );
             let qp = prepared.handshake(remote).context("qp handshake")?;
             Ok((qp, send_cq, recv_cq))
         }

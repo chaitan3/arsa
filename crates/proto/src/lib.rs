@@ -7,6 +7,8 @@
 
 use std::io::{Read, Write};
 
+pub mod keymap;
+
 pub const MAGIC: u32 = 0x5244_4453; // "RDDS"
 pub const VERSION: u32 = 5; // v5: Stamp carries the materializer's blit/read/finish times
 

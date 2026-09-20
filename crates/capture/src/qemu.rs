@@ -3,13 +3,12 @@
 //! Ported from the M0 spike: connects to QEMU's display D-Bus (session bus or
 //! a libvirt-managed private bus given by socket path), registers a console
 //! listener, and forwards `Scanout`/`ScanoutDMABUF`/`Update` events.
+//! Input injection lives in `input::QemuDbusInput` (same D-Bus console).
 
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::mpsc::Sender;
 
 use anyhow::{Context, Result};
-
-use rdma_display_proto::InputEvent;
 
 use crate::{CaptureEvent, CaptureSource, DmabufScanout, DirtyRect, FrameFormat};
 
@@ -124,6 +123,33 @@ impl qemu_display::ConsoleListenerHandler for Listener {
     }
 }
 
+/// Open the QEMU display D-Bus and return the console proxy. Shared by the
+/// capture source and the input sink (separate D-Bus connections are fine —
+/// each opens its own listener/proxy).
+pub async fn open_console(
+    dbus_socket: &Option<String>,
+    console: u32,
+) -> Result<qemu_display::Console> {
+    let conn: zbus::Connection = if let Some(path) = dbus_socket {
+        eprintln!("[capture] connecting to dbus at {path}");
+        let stream = std::os::unix::net::UnixStream::connect(path)
+            .with_context(|| format!("connect {path}"))?;
+        zbus::connection::Builder::async_io_unix_stream(stream)
+            .build()
+            .await
+            .context("dbus connect")?
+    } else {
+        eprintln!("[capture] connecting to session bus");
+        zbus::Connection::session().await.context("session bus")?
+    };
+    let _display =
+        qemu_display::Display::new::<&str>(&conn, None).await.context("no org.qemu")?;
+    // leak the connection: the console proxies borrow it; source/input threads
+    // live forever anyway
+    let conn: &'static zbus::Connection = Box::leak(Box::new(conn));
+    qemu_display::Console::new(conn, console).await.context("console proxy")
+}
+
 pub struct QemuDbusSource {
     /// `None` → session bus; `Some(path)` → connect as bus client to a private
     /// (libvirt) dbus-daemon listening at that socket.
@@ -136,33 +162,8 @@ impl QemuDbusSource {
         Self { dbus_socket, console }
     }
 
-    async fn run(
-        self,
-        tx: Sender<CaptureEvent>,
-        input_rx: std::sync::mpsc::Receiver<InputEvent>,
-    ) -> Result<()> {
-        let console = if let Some(path) = &self.dbus_socket {
-            eprintln!("[capture] connecting to dbus at {path}");
-            let stream = std::os::unix::net::UnixStream::connect(path)
-                .with_context(|| format!("connect {path}"))?;
-            let conn = zbus::connection::Builder::async_io_unix_stream(stream)
-                .build()
-                .await
-                .context("dbus connect")?;
-            let _display =
-                qemu_display::Display::new::<&str>(&conn, None).await.context("no org.qemu")?;
-            qemu_display::Console::new(&conn, self.console)
-                .await
-                .context("console proxy")?
-        } else {
-            eprintln!("[capture] connecting to session bus");
-            let conn = zbus::Connection::session().await.context("session bus")?;
-            let _display =
-                qemu_display::Display::new::<&str>(&conn, None).await.context("no org.qemu")?;
-            qemu_display::Console::new(&conn, self.console)
-                .await
-                .context("console proxy")?
-        };
+    async fn run(self, tx: Sender<CaptureEvent>) -> Result<()> {
+        let console = open_console(&self.dbus_socket, self.console).await?;
 
         eprintln!(
             "[capture] console {}: {:?} ({}x{})",
@@ -177,63 +178,6 @@ impl QemuDbusSource {
             .context("RegisterListener")?;
         eprintln!("[capture] listener registered; streaming events");
 
-        // Input injection: user events from the control channel go out as
-        // D-Bus method calls on the console's Keyboard/Mouse interfaces.
-        // Plain thread + async_std::block_on per call: each event is one
-        // small method invocation, no runtime needed beyond this.
-        let kb = console.keyboard.clone();
-        let mo = console.mouse.clone();
-        // probe the guest's pointing-device mode once (IsAbsolute property)
-        if let Ok(abs) = async_std::task::block_on(mo.is_absolute()) {
-            eprintln!("[input] guest mouse IsAbsolute={abs}");
-        }
-        std::thread::Builder::new()
-            .name("capture-input".into())
-            .spawn(move || {
-                while let Ok(ev) = input_rx.recv() {
-                    let r = async_std::task::block_on(async {
-                        match ev {
-                            InputEvent::Key { code, down } => {
-                                if down {
-                                    kb.press(code).await
-                                } else {
-                                    kb.release(code).await
-                                }
-                            }
-                            InputEvent::Btn { button, down } => {
-                                // D-Bus button values: Left=0 Middle=1 Right=2
-                                // WheelUp=3 WheelDown=4 Side=5 Extra=6
-                                let btn = match button {
-                                    0 => qemu_display::MouseButton::Left,
-                                    1 => qemu_display::MouseButton::Middle,
-                                    2 => qemu_display::MouseButton::Right,
-                                    3 => qemu_display::MouseButton::WheelUp,
-                                    4 => qemu_display::MouseButton::WheelDown,
-                                    5 => qemu_display::MouseButton::Side,
-                                    6 => qemu_display::MouseButton::Extra,
-                                    other => {
-                                        eprintln!("[input] unknown button {other}");
-                                        return Ok(());
-                                    }
-                                };
-                                if down {
-                                    mo.press(btn).await
-                                } else {
-                                    mo.release(btn).await
-                                }
-                            }
-                            InputEvent::Abs { x, y } => mo.set_abs_position(x, y).await,
-                            InputEvent::Rel { dx, dy } => mo.rel_motion(dx, dy).await,
-                        }
-                    });
-                    if let Err(e) = r {
-                        eprintln!("[input] D-Bus call failed for {ev:?}: {e}");
-                    }
-                }
-                eprintln!("[input] control channel closed; input forwarding stopped");
-            })
-            .context("spawn input forwarder")?;
-
         // keep the console (and its D-Bus connection) alive forever —
         // dropping it tears down the listener
         std::future::pending::<()>().await;
@@ -246,15 +190,11 @@ impl CaptureSource for QemuDbusSource {
         "qemu-dbus"
     }
 
-    fn spawn(
-        self: Box<Self>,
-        tx: Sender<CaptureEvent>,
-        input_rx: std::sync::mpsc::Receiver<InputEvent>,
-    ) -> Result<()> {
+    fn spawn(self: Box<Self>, tx: Sender<CaptureEvent>) -> Result<()> {
         std::thread::Builder::new()
             .name("capture-qemu".into())
             .spawn(move || {
-                if let Err(e) = async_std::task::block_on(self.run(tx, input_rx)) {
+                if let Err(e) = async_std::task::block_on(self.run(tx)) {
                     eprintln!("[capture] source failed: {e:#}");
                 }
             })
