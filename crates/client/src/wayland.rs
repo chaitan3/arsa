@@ -35,6 +35,10 @@ use rdma_display_proto::InputEvent;
 
 use crate::keymap;
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1};
+use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_locked_pointer_v1::ZwpLockedPointerV1;
+use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1::{Lifetime, ZwpPointerConstraintsV1};
+use wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1;
+use wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1::{self, ZwpRelativePointerV1};
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1::WpCursorShapeManagerV1;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1::{self, Mode, ZxdgToplevelDecorationV1};
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
@@ -71,11 +75,31 @@ struct St {
     decoration_mgr: Option<ZxdgDecorationManagerV1>,
     #[allow(dead_code)]
     decoration: Option<ZxdgToplevelDecorationV1>,
+    /// keep-alive: our wl_pointer (needed to lock it / create the relative
+    /// pointer for grab mode)
+    #[allow(dead_code)]
+    pointer: Option<WlPointer>,
     /// shape device for our wl_pointer (created with the pointer)
     #[allow(dead_code)]
     cursor_device: Option<WpCursorShapeDeviceV1>,
     /// wl_pointer enter serial: set_shape must use the latest one
     pointer_serial: u32,
+    /// zwp_relative_pointer_manager_v1 + zwp_pointer_constraints_v1 for grab
+    /// mode (None when the compositor lacks either global)
+    rel_mgr: Option<ZwpRelativePointerManagerV1>,
+    constraints: Option<ZwpPointerConstraintsV1>,
+    /// grab-mode keep-alives (dropping them releases the constraint)
+    rel_obj: Option<ZwpRelativePointerV1>,
+    locked_obj: Option<ZwpLockedPointerV1>,
+    /// mouse grab (game) mode: pointer locked locally, deltas forwarded as
+    /// InputEvent::Rel, local cursor hidden. Toggled with Ctrl+Alt+M.
+    grabbed: bool,
+    /// fractional accumulator for wl_fixed relative deltas
+    grab_acc: (f64, f64),
+    /// Ctrl+Alt both held (from wl_keyboard.modifiers) — grab hotkey chord
+    mods_ctrl_alt: bool,
+    /// the hotkey's M key release must not be forwarded after a toggle
+    swallow_m_release: bool,
     /// output scale (120ths; 120 = 1.0) — the compositor's render scale.
     /// The buffer is always the NATIVE guest frame (no resampling, sharp
     /// pixels); the logical window size is native/scale via wp_viewporter.
@@ -151,6 +175,13 @@ impl Presenter {
         // non-fatal — we'd just show the compositor's fallback again
         let cursor_mgr: Option<WpCursorShapeManagerV1> =
             globals.bind(&qh, 1..=1, ()).ok();
+        // relative-pointer + pointer-constraints: grab mode (games) — lock the
+        // local pointer and forward raw relative deltas. Absence just means
+        // the toggle prints a hint instead of grabbing.
+        let rel_mgr: Option<ZwpRelativePointerManagerV1> =
+            globals.bind(&qh, 1..=1, ()).ok();
+        let constraints: Option<ZwpPointerConstraintsV1> =
+            globals.bind(&qh, 1..=1, ()).ok();
         // viewporter + fractional-scale: buffer stays at the NATIVE guest
         // frame size; the compositor maps it 1:1 onto physical pixels at
         // whatever output scale the desktop runs (no upscale/blur)
@@ -205,8 +236,17 @@ impl Presenter {
                 wmbase,
                 seat,
                 cursor_mgr,
+                pointer: None,
                 cursor_device: None,
                 pointer_serial: 0,
+                rel_mgr,
+                constraints,
+                rel_obj: None,
+                locked_obj: None,
+                grabbed: false,
+                grab_acc: (0.0, 0.0),
+                mods_ctrl_alt: false,
+                swallow_m_release: false,
                 decoration_mgr,
                 decoration,
                 scale120: 120,
@@ -326,6 +366,56 @@ impl Presenter {
 }
 
 impl St {
+    /// Enter/leave mouse grab: lock the local pointer (compositor freezes the
+    /// cursor) and subscribe to relative motion; hide the local cursor since
+    /// the guest draws its own (FPS games especially). Releasing restores the
+    /// absolute cursor.
+    fn set_grab(&mut self, on: bool, qh: &QueueHandle<St>) {
+        if on == self.grabbed {
+            return;
+        }
+        if on {
+            let (Some(rel_mgr), Some(con), Some(pointer)) =
+                (self.rel_mgr.as_ref(), self.constraints.as_ref(), self.pointer.as_ref())
+            else {
+                eprintln!(
+                    "[wl] grab unavailable: compositor lacks relative-pointer/pointer-constraints"
+                );
+                return;
+            };
+            let rel = rel_mgr.get_relative_pointer(pointer, qh, ());
+            let locked = con.lock_pointer(
+                &self.surface,
+                pointer,
+                None,
+                Lifetime::Persistent,
+                qh,
+                (),
+            );
+            // hide the local cursor (guest games draw their own; desktop
+            // users get the guest cursor back on release)
+            pointer.set_cursor(self.pointer_serial, None, 0, 0);
+            self.rel_obj = Some(rel);
+            self.locked_obj = Some(locked);
+            self.grabbed = true;
+            self.grab_acc = (0.0, 0.0);
+            eprintln!("[wl] mouse grabbed (relative mode; Ctrl+Alt+M to release)");
+        } else {
+            // dropping the proxies destroys the protocol objects and
+            // deactivates the lock
+            self.rel_obj = None;
+            self.locked_obj = None;
+            self.grabbed = false;
+            self.grab_acc = (0.0, 0.0);
+            if self.pointer_active {
+                if let Some(dev) = self.cursor_device.as_ref() {
+                    dev.set_shape(self.pointer_serial, Shape::Default);
+                }
+            }
+            eprintln!("[wl] mouse released (absolute mode)");
+        }
+    }
+
     /// Recompute the logical window size for the compositor's output scale:
     /// buffer stays native (W×H, the guest frame verbatim), the viewport
     /// destination becomes native/scale — so the compositor maps the buffer
@@ -403,6 +493,41 @@ quiet!(WpViewporter => ());
 quiet!(WpViewport => ());
 quiet!(WpFractionalScaleManagerV1 => ());
 quiet!(ZxdgDecorationManagerV1 => ());
+quiet!(ZwpRelativePointerManagerV1 => ());
+quiet!(ZwpPointerConstraintsV1 => ());
+quiet!(ZwpLockedPointerV1 => ());
+
+/// Relative motion while grabbed: forward UNACCELERATED deltas (games want
+/// raw counts, not the compositor's accelerated ones) as InputEvent::Rel,
+/// accumulating the wl_fixed (24.8) fraction between events.
+impl Dispatch<ZwpRelativePointerV1, ()> for St {
+    fn event(
+        state: &mut St,
+        _: &ZwpRelativePointerV1,
+        ev: <ZwpRelativePointerV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<St>,
+    ) {
+        if let zwp_relative_pointer_v1::Event::RelativeMotion {
+            dx_unaccel, dy_unaccel, ..
+        } = ev
+        {
+            if !state.grabbed {
+                return;
+            }
+            state.grab_acc.0 += dx_unaccel as f64 / 256.0;
+            state.grab_acc.1 += dy_unaccel as f64 / 256.0;
+            let dx = state.grab_acc.0.trunc() as i32;
+            let dy = state.grab_acc.1.trunc() as i32;
+            state.grab_acc.0 -= dx as f64;
+            state.grab_acc.1 -= dy as f64;
+            if dx != 0 || dy != 0 {
+                let _ = state.input_tx.send(InputEvent::Rel { dx, dy });
+            }
+        }
+    }
+}
 
 /// Decoration negotiate: we want the titlebar drawn by the compositor; if
 /// KWin ever configures client-side, re-assert our request.
@@ -471,6 +596,7 @@ impl Dispatch<WlSeat, ()> for St {
                 if let Some(mgr) = state.cursor_mgr.as_ref() {
                     state.cursor_device = Some(mgr.get_pointer(&pointer, qh, ()));
                 }
+                state.pointer = Some(pointer);
             }
             if caps.contains(Capability::Keyboard) {
                 seat.get_keyboard(qh, ());
@@ -489,7 +615,7 @@ impl Dispatch<WlKeyboard, ()> for St {
         ev: <WlKeyboard as Proxy>::Event,
         _: &(),
         _: &Connection,
-        _: &QueueHandle<St>,
+        qh: &QueueHandle<St>,
     ) {
         match ev {
             wl_keyboard::Event::Keymap { .. } => {
@@ -497,8 +623,31 @@ impl Dispatch<WlKeyboard, ()> for St {
             }
             wl_keyboard::Event::Enter { .. } => state.kb_active = true,
             wl_keyboard::Event::Leave { .. } => state.kb_active = false,
+            wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
+                // depressed modifier mask: Control = bit2, Alt = bit3 (xkb)
+                state.mods_ctrl_alt =
+                    mods_depressed & (0x4 | 0x8) == (0x4 | 0x8);
+            }
             wl_keyboard::Event::Key { key, state: st, .. } => {
                 if !state.kb_active {
+                    return;
+                }
+                // grab hotkey: Ctrl+Alt+M toggles relative mouse grab —
+                // client-local, never forwarded to the guest
+                if key == 0x32 && state.mods_ctrl_alt {
+                    if matches!(st, WEnum::Value(KeyState::Pressed)) {
+                        if state.pointer_active {
+                            state.set_grab(!state.grabbed, qh);
+                        } else {
+                            eprintln!("[wl] grab: hover the window first (pointer not over it)");
+                        }
+                        state.swallow_m_release = true;
+                    }
+                    return; // swallow the chord's press AND release
+                }
+                if !matches!(st, WEnum::Value(KeyState::Pressed)) && state.swallow_m_release {
+                    // chord released before M itself (ctrl+alt up first)
+                    state.swallow_m_release = false;
                     return;
                 }
                 // `key` is the Linux evdev keycode (no xkb +8 offset needed
@@ -509,37 +658,48 @@ impl Dispatch<WlKeyboard, ()> for St {
                 let down = matches!(st, WEnum::Value(KeyState::Pressed));
                 let _ = state.input_tx.send(InputEvent::Key { code, down });
             }
-            _ => {} // modifiers / repeat_info
+            _ => {} // latched/locked mods, repeat_info
         }
     }
 }
 
-/// Pointer: absolute positioning (guest is a tablet), buttons, wheel.
+/// Pointer: absolute positioning (default), grab mode (Ctrl+Alt+M) for
+/// relative motion, buttons, wheel.
 impl Dispatch<WlPointer, ()> for St {
     fn event(
         state: &mut St,
-        _: &WlPointer,
+        pointer: &WlPointer,
         ev: <WlPointer as Proxy>::Event,
         _: &(),
         _: &Connection,
-        _: &QueueHandle<St>,
+        qh: &QueueHandle<St>,
     ) {
         match ev {
             wl_pointer::Event::Enter { serial, .. } => {
                 state.pointer_active = true;
                 state.pointer_serial = serial;
-                // name our cursor: the plain arrow (compositors pick their
-                // own fallback for silent clients; KWin's is the text beam)
-                if let Some(dev) = state.cursor_device.as_ref() {
-                    dev.set_shape(serial, Shape::Default);
+                if state.grabbed {
+                    // keep the local cursor hidden while grabbed (re-enter)
+                    pointer.set_cursor(serial, None, 0, 0);
+                } else {
+                    // name our cursor: the plain arrow (compositors pick their
+                    // own fallback for silent clients; KWin's is the text beam)
+                    if let Some(dev) = state.cursor_device.as_ref() {
+                        dev.set_shape(serial, Shape::Default);
+                    }
                 }
             }
             wl_pointer::Event::Leave { .. } => {
                 state.pointer_active = false;
                 state.pending_axis = None;
+                if state.grabbed {
+                    // focus lost while grabbed (alt-tab, other output):
+                    // release so the user isn't stuck in relative mode
+                    state.set_grab(false, qh);
+                }
             }
             wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
-                if !state.pointer_active {
+                if !state.pointer_active || state.grabbed {
                     return;
                 }
                 // surface-local coords are LOGICAL pixels (scaled by the
