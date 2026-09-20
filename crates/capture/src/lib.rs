@@ -17,7 +17,7 @@ pub mod materializer;
 pub mod qemu;
 
 pub use materializer::FrameMaterializer;
-pub use egl::EglMaterializer;
+pub use egl::{EglMaterializer, ReadBenchOpts, run_readback_bench};
 pub use qemu::QemuDbusSource;
 
 use anyhow::Result;

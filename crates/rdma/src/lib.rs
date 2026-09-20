@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use ibverbs::{
-    AccessFlags, CompletionQueue, MemoryRegion, QueuePair, QueuePairEndpoint, Rc,
-    RemoteMemorySlice,
+    AccessFlags, CompletionQueue, LocalMemorySlice, MemoryRegion, QueuePair,
+    QueuePairEndpoint, Rc, RemoteMemorySlice,
 };
 
 use rdma_display_proto as proto;
@@ -152,13 +152,54 @@ pub fn imm_decode(imm: u32) -> (u64, usize) {
 // Server side
 // ---------------------------------------------------------------------------
 
+/// One server-side staging slot: either verbs-allocated heap (allocated
+/// mode, testcard/plain) or externally provided memory (PBO readback mode —
+/// the pages are the materializer's persistent-mapped PBOs, registered here
+/// per connection with `register_from_raw` so the NIC reads exactly what the
+/// GL readback DMA wrote: zero copy).
+enum StagingSlot {
+    Owned(MemoryRegion<Box<[u8]>>),
+    Ext(MemoryRegion<()>),
+}
+
+impl StagingSlot {
+    /// Postable slice covering the first `len` bytes.
+    fn post_slice(&self, len: usize) -> LocalMemorySlice {
+        match self {
+            StagingSlot::Owned(m) => m.slice(..len),
+            StagingSlot::Ext(m) => m.slice(..len),
+        }
+    }
+    /// Registered byte length.
+    fn len(&self) -> usize {
+        match self {
+            StagingSlot::Owned(m) => m.bytes().len(),
+            StagingSlot::Ext(m) => m.remote().len,
+        }
+    }
+    /// Mutable view of the registered memory. For `Ext` the memory is the
+    /// GL-owned PBO map: `glReadPixels(GL_BGRA)` writes it; `fill` only
+    /// recognizes the pointer and drives the GL side. Aliasing with the
+    /// materializer's map is intentional and safe while the MR is alive
+    /// (the backing memory is pinned and never moved).
+    fn as_mut_bytes(&mut self, len: usize) -> &mut [u8] {
+        match self {
+            StagingSlot::Owned(m) => &mut m.bytes_mut()[..len],
+            StagingSlot::Ext(m) => {
+                let s = m.slice(..len);
+                unsafe { core::slice::from_raw_parts_mut(s.addr() as *mut u8, len) }
+            }
+        }
+    }
+}
+
 pub struct ServerLink {
     /// credits arrive from the control-reader thread; None = client gone
     credit_rx: mpsc::Receiver<Option<u32>>,
     qp: QueuePair<Rc>,
     send_cq: CompletionQueue,
     /// local staging slots (copy path / testcard writes here before the WRITE)
-    slots: Vec<MemoryRegion<Box<[u8]>>>,
+    slots: Vec<StagingSlot>,
     remote: Vec<RemoteMemorySlice>,
     slot_free: Vec<bool>,
     seq: u64,
@@ -177,6 +218,7 @@ impl ServerLink {
         meta: &DisplayMeta,
         slots: usize,
         input_tx: mpsc::Sender<proto::InputEvent>,
+        external: Option<&[(*mut u8, usize)]>,
     ) -> Result<ServerLink> {
         // split the stream: reader thread gets the receive half, the frame
         // send path keeps a write-only clone for per-frame Stamps
@@ -186,12 +228,45 @@ impl ServerLink {
         hello_exchange(&mut conn)?;
         let (qp, send_cq, _recv_cq) = endpoint_exchange(&mut conn, ctx, pd)?;
 
-        let mut stage: Vec<MemoryRegion<Box<[u8]>>> = Vec::with_capacity(slots);
-        for _ in 0..slots {
-            let mr = pd
-                .allocate(meta.frame_bytes as usize, AccessFlags::PERMISSIVE)
-                .context("allocate staging slot")?;
-            stage.push(mr);
+        let mut stage: Vec<StagingSlot> = Vec::with_capacity(slots);
+        match external {
+            Some(list) => {
+                anyhow::ensure!(
+                    list.len() == slots,
+                    "external staging slot count {} != {slots}",
+                    list.len()
+                );
+                for (i, (ptr, len)) in list.iter().enumerate() {
+                    anyhow::ensure!(
+                        *len == meta.frame_bytes as usize,
+                        "external slot {i} len {len} != frame bytes {}",
+                        meta.frame_bytes
+                    );
+                    // zero-copy staging: the NIC reads the same pages the GL
+                    // readback DMA fills. LOCAL_WRITE|REMOTE_READ, matching
+                    // the bench probe (deliberately not PERMISSIVE).
+                    let mr = unsafe {
+                        pd.register_from_raw(
+                            *ptr,
+                            *len,
+                            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ,
+                        )
+                    }
+                    .context("register external staging slot (PBO)")?;
+                    stage.push(StagingSlot::Ext(mr));
+                }
+                eprintln!(
+                    "[rdma] external staging: {slots} slots from materializer PBOs (zero-copy)"
+                );
+            }
+            None => {
+                for _ in 0..slots {
+                    let mr = pd
+                        .allocate(meta.frame_bytes as usize, AccessFlags::PERMISSIVE)
+                        .context("allocate staging slot")?;
+                    stage.push(StagingSlot::Owned(mr));
+                }
+            }
         }
 
         conn.send(&Message::Meta(meta.clone()))?;
@@ -296,6 +371,29 @@ impl ServerLink {
         }
     }
 
+    /// Whether a staging slot is currently free (client-credited).
+    pub fn has_free_slot(&self) -> bool {
+        self.slot_free.iter().any(|f| *f)
+    }
+
+    /// Non-blocking claim of the first free slot (marks it in use).
+    pub fn try_claim_slot(&mut self) -> Option<usize> {
+        let slot = self.slot_free.iter().position(|f| *f)?;
+        self.slot_free[slot] = false;
+        Some(slot)
+    }
+
+    /// Return a claimed slot (used when a frame turns out unchanged).
+    pub fn release_slot(&mut self, slot: usize) {
+        self.slot_free[slot] = true;
+    }
+
+    /// The claimed slot's registered memory, for `issue_frame`.
+    pub fn slot_bytes_mut(&mut self, slot: usize) -> &mut [u8] {
+        let len = self.slots[slot].len();
+        self.slots[slot].as_mut_bytes(len)
+    }
+
     /// Blocks until a slot is free, absorbing credit messages meanwhile.
     /// (Credits now arrive via the control-reader thread's channel.)
     fn wait_free_slot(&mut self) -> Result<usize> {
@@ -349,8 +447,8 @@ impl ServerLink {
             );
         }
         self.slot_free[slot] = false;
-        let frame_bytes = self.slots[slot].bytes().len();
-        let (changed, mat_times) = fill(&mut self.slots[slot].bytes_mut()[..frame_bytes])?;
+        let frame_bytes = self.slots[slot].len();
+        let (changed, mat_times) = fill(self.slots[slot].as_mut_bytes(frame_bytes))?;
         if !changed {
             // unchanged frame: return the slot, don't send
             self.slot_free[slot] = true;
@@ -359,14 +457,9 @@ impl ServerLink {
         let t1_unix_us = proto::unix_now_us(); // readback/materialize complete
         #[cfg(feature = "frame-checksums")]
         {
-            let sum: u32 = self.slots[slot].bytes()[..frame_bytes]
-                .iter()
-                .map(|b| *b as u32)
-                .sum();
-            let nonzero = self.slots[slot].bytes()[..frame_bytes]
-                .iter()
-                .filter(|b| **b != 0)
-                .count();
+            let out = self.slots[slot].as_mut_bytes(frame_bytes);
+            let sum: u32 = out.iter().map(|b| *b as u32).sum();
+            let nonzero = out.iter().filter(|b| **b != 0).count();
             eprintln!(
                 "[rdma] staging slot {} checksum sum={} nonzero={}/{}",
                 slot, sum, nonzero, frame_bytes
@@ -379,7 +472,7 @@ impl ServerLink {
         let mut batch = self.qp.start_send();
         batch.op().signaled().imm(imm).write(
             seq,
-            &[self.slots[slot].slice(..frame_bytes)],
+            &[self.slots[slot].post_slice(frame_bytes)],
             remote,
         );
         unsafe { batch.submit() }.context("post RDMA WRITE")?;
@@ -433,8 +526,74 @@ impl ServerLink {
         Ok(Some(seq))
     }
 
+    /// Pipelined post: WRITE a slot that `issue_frame` already filled (the
+    /// materializer completed it via `finish_frame`). The stamp's staging
+    /// times come from the pipelined path: `t0d` = issue pickup, `t1s` = the
+    /// same instant (the slot was free at claim), `t1` = fence completion.
+    pub fn post_filled(
+        &mut self,
+        slot: usize,
+        t0_unix_us: u64,
+        t0d_unix_us: u64,
+        t1_unix_us: u64,
+        mat_times: proto::MatTimes,
+    ) -> Result<Option<u64>> {
+        let frame_bytes = self.slots[slot].len();
+        let remote = self.remote[slot];
+        let seq = self.seq;
+        let imm = imm_encode(seq, slot);
+        let mut batch = self.qp.start_send();
+        batch.op().signaled().imm(imm).write(
+            seq,
+            &[self.slots[slot].post_slice(frame_bytes)],
+            remote,
+        );
+        unsafe { batch.submit() }.context("post RDMA WRITE")?;
+        let t2_unix_us = proto::unix_now_us(); // WRITE posted to the NIC
+
+        // drain completions so the signaled WRITE is confirmed (t2c stamp);
+        // the staging slot stays busy until the client's credit arrives
+        loop {
+            let mut completions = self.send_cq.poll().context("poll send CQ")?;
+            match completions.next() {
+                Some(wc) => {
+                    wc.ok().context("RDMA WRITE failed")?;
+                    break;
+                }
+                None => std::thread::sleep(Duration::from_micros(20)),
+            }
+        }
+        let t2c_unix_us = proto::unix_now_us();
+        self.seq += 1;
+        if let Some(w) = self.stamp_w.as_mut() {
+            // same >1 s stale-t0 clamp as the serial path
+            let t0 = if t0_unix_us == 0 || t0d_unix_us.saturating_sub(t0_unix_us) > 1_000_000 {
+                t0d_unix_us
+            } else {
+                t0_unix_us
+            };
+            let s = proto::FrameStamp {
+                seq,
+                t0,
+                t0d: t0d_unix_us,
+                t1s: t0d_unix_us,
+                t1: t1_unix_us,
+                t2: t2_unix_us,
+                t2c: t2c_unix_us,
+                blit_us: mat_times.blit_us,
+                read_us: mat_times.read_us,
+                fin_us: mat_times.fin_us,
+            };
+            if let Err(e) = proto::send_msg(w, &Message::Stamp(s)) {
+                eprintln!("[rdma] stamp send failed: {e}");
+                self.stamp_w = None;
+            }
+        }
+        Ok(Some(seq))
+    }
+
     pub fn frame_bytes(&self) -> usize {
-        self.slots.first().map(|m| m.bytes().len()).unwrap_or(0)
+        self.slots.first().map(|m| m.len()).unwrap_or(0)
     }
 
     pub fn sequence(&self) -> u64 {

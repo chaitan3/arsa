@@ -6,6 +6,9 @@
 //!   --mode capture    QEMU dbus display capture:
 //!                       --materialize egl    GPU blit+readback (default, gl=on)
 //!                       --materialize plain  D-Bus host-memory scanouts (gl=off)
+//!                       --readback pbo       zero-copy staging: GL readback DMA
+//!                       fills persistent-mapped PBOs registered as RDMA slots
+//!                       (default for egl); "direct" = legacy readPixels path
 
 use std::net::TcpListener;
 use std::sync::mpsc;
@@ -25,6 +28,7 @@ fn main() -> Result<()> {
     let mut materialize: String = "egl".to_string();
     let mut rendernode: Option<String> = None;
     let mut input_test = false;
+    let mut readback: String = "pbo".to_string();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -40,6 +44,7 @@ fn main() -> Result<()> {
             }
             "--console" => console = args.next().expect("--console needs a value").parse()?,
             "--materialize" => materialize = args.next().expect("--materialize needs a value"),
+            "--readback" => readback = args.next().expect("--readback needs a value"),
             "--rendernode" => rendernode = Some(args.next().expect("--rendernode needs a value")),
             "--input-test" => input_test = true,
             "--help" | "-h" => {
@@ -60,7 +65,7 @@ capture: [--dbus-socket /path/dbus.sock] [--console 0] [--materialize egl|plain]
         "testcard" => run_testcard_server(&ctx, &pd, &listen, slots, fps),
         "capture" => run_capture(
             &ctx, &pd, &dbus_socket, console, &materialize, rendernode.as_deref(), &listen, slots,
-            fps, input_test,
+            fps, input_test, &readback,
         ),
         other => bail!("mode {other:?} not implemented yet"),
     }
@@ -102,6 +107,7 @@ fn run_testcard_server(
             &meta,
             slots,
             input_tx,
+            None,
         )?;
         eprintln!("session up: {slots} slots, {} frame bytes", link.frame_bytes());
         run_testcard(&mut link, fps)?;
@@ -157,6 +163,7 @@ fn run_capture(
     slots: usize,
     fps: u64,
     input_test: bool,
+    readback: &str,
 ) -> Result<()> {
     let mut mat: Box<dyn FrameMaterializer> = match materialize {
         "egl" => Box::new(rdma_display_capture::EglMaterializer::new(rendernode)?),
@@ -234,6 +241,12 @@ fn run_capture(
     let mut t0_unix_us: u64 = 0;
     let started = std::time::Instant::now();
 
+    // pipelined (PBO staging) state: frames issued to the materializer whose
+    // fence hasn't been finished+posted yet (slot, t0 event, t0d issue time)
+    let mut pipelined = false;
+    let mut issued: std::collections::VecDeque<(usize, u64, u64)> =
+        std::collections::VecDeque::new();
+
     loop {
         // 0. reap a hung-up client: the control-reader thread signals EOF
         // via the credit channel; without this, an idle capture loop (no
@@ -244,9 +257,14 @@ fn run_capture(
             if gone {
                 eprintln!("[server] client disconnected");
                 session = None;
+                pipelined = false;
+                issued.clear();
+                mat.drop_frames();
             }
         }
 
+        let gate_open =
+            cap_period.map_or(true, |p| last_send.map_or(true, |t| t.elapsed() >= p));
         // 1. wait for something to happen: a capture event, the pacing
         // deadline, or (sessionless) the accept-poll tick. While a session
         // is up and the screen is idle, wait on a short tick so hangups and
@@ -255,13 +273,21 @@ fn run_capture(
         let wait: Option<std::time::Duration> = if session.is_none() {
             Some(std::time::Duration::from_millis(20))
         } else if frame_dirty {
-            Some(
-                cap_period
-                    .map(|p| p.saturating_sub(
-                        last_send.map_or(p, |t| t.elapsed()),
-                    ))
-                    .unwrap_or_default(), // uncapped: frame is ready now
-            )
+            if pipelined && gate_open && !session.as_ref().unwrap().has_free_slot() {
+                // frame ready but no staging slot free yet: wait for a client
+                // credit on a fast tick (not a busy spin, not the cap period)
+                Some(std::time::Duration::from_millis(2))
+            } else {
+                Some(
+                    cap_period
+                        .map(|p| p.saturating_sub(
+                            last_send.map_or(p, |t| t.elapsed()),
+                        ))
+                        .unwrap_or_default(), // uncapped: frame is ready now
+                )
+            }
+        } else if pipelined && !issued.is_empty() {
+            Some(std::time::Duration::ZERO) // finish+post work pending
         } else {
             Some(std::time::Duration::from_millis(50))
         };
@@ -310,6 +336,20 @@ fn run_capture(
                 let _ = stream.set_nodelay(true);
                 if let Some(meta) = pending_meta.clone() {
                     eprintln!("client connected: {}", stream.peer_addr()?);
+                    // zero-copy staging (PBO readback): bind the materializer's
+                    // persistent-mapped PBOs as the staging slots; None = fall
+                    // back to verbs-allocated slots + direct readback
+                    let external = if readback == "pbo" && materialize == "egl" {
+                        match mat.bind_staging(slots, meta.frame_bytes as usize) {
+                            Some(v) => Some(v),
+                            None => {
+                                eprintln!("[server] PBO staging unavailable — direct readback slots");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     // client input events join the same channel as the
                     // synthetic --input-test injector -> capture forwarder
                     match rdma_display_rdma::ServerLink::accept(
@@ -319,6 +359,7 @@ fn run_capture(
                         &meta,
                         slots,
                         input_tx.clone(),
+                        external.as_deref(),
                     ) {
                         Ok(link) => {
                             eprintln!("session up: {slots} slots, {} frame bytes", link.frame_bytes());
@@ -328,6 +369,7 @@ fn run_capture(
                             // previous session's last frame
                             mat.mark_dirty();
                             frame_dirty = true;
+                            pipelined = external.is_some();
                             session = Some(link);
                         }
                         Err(e) => eprintln!("[server] session setup failed: {e:#}"),
@@ -336,24 +378,91 @@ fn run_capture(
             }
         }
 
-        // 4. send the newest frame if dirty and the (optional) cap allows
-        let gate_open =
-            cap_period.map_or(true, |p| last_send.map_or(true, |t| t.elapsed() >= p));
+        // 4. send the newest frame if dirty and the (optional) cap allows.
+        // Pipelined (PBO staging active): ISSUE the newest frame's readback
+        // first (µs; the GPU DMA starts immediately), THEN finish+post the
+        // oldest issued frame — its ~2.8 ms RDMA transfer overlaps the GPU
+        // work of the frame just issued.
         if frame_dirty && session.is_some() && gate_open {
             let link = session.as_mut().unwrap();
-            match link.send_frame_checked(|out| mat.copy_frame(out), t0_unix_us) {
-                Ok(Some(seq)) => {
-                    frame_dirty = false;
-                    last_send = Some(std::time::Instant::now());
-                    eprintln!("[server] frame {} sent", seq);
-                    if seq % 60 == 0 {
-                        eprintln!("[stats] frames={} uptime={:?}", seq, started.elapsed());
+            if pipelined {
+                if let Some(slot) = link.try_claim_slot() {
+                    let t0d = rdma_display_proto::unix_now_us();
+                    let out = link.slot_bytes_mut(slot);
+                    match mat.issue_frame(slot, out) {
+                        Ok(true) => {
+                            issued.push_back((slot, t0_unix_us, t0d));
+                            frame_dirty = false;
+                        }
+                        Ok(false) => {
+                            frame_dirty = false;
+                            link.release_slot(slot);
+                        }
+                        Err(e) => {
+                            eprintln!("[server] issue failed: {e:#}");
+                            link.release_slot(slot);
+                            session = None;
+                            mat.drop_frames();
+                            issued.clear();
+                        }
                     }
                 }
-                Ok(None) => frame_dirty = false,
-                Err(e) => {
-                    eprintln!("[server] send failed: {e:#}");
-                    session = None;
+            } else {
+                match link.send_frame_checked(|out| mat.copy_frame(out), t0_unix_us) {
+                    Ok(Some(seq)) => {
+                        frame_dirty = false;
+                        last_send = Some(std::time::Instant::now());
+                        eprintln!("[server] frame {} sent", seq);
+                        if seq % 60 == 0 {
+                            eprintln!("[stats] frames={} uptime={:?}", seq, started.elapsed());
+                        }
+                    }
+                    Ok(None) => frame_dirty = false,
+                    Err(e) => {
+                        eprintln!("[server] send failed: {e:#}");
+                        session = None;
+                    }
+                }
+            }
+        }
+        // 5. pipelined: finish + post the oldest issued frame (FIFO preserves
+        // frame order; the fence wait is mostly elapsed because the GPU DMA
+        // overlapped the previous frame's transfer)
+        if pipelined && session.is_some() {
+            while let Some((slot, f_t0, f_t0d)) = issued.front().copied() {
+                let link = session.as_mut().unwrap();
+                let out = link.slot_bytes_mut(slot);
+                let (changed, mat_times) = match mat.finish_frame(slot, out) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        eprintln!("[server] finish failed: {e:#}");
+                        session = None;
+                        mat.drop_frames();
+                        issued.clear();
+                        break;
+                    }
+                };
+                issued.pop_front();
+                if !changed {
+                    link.release_slot(slot);
+                    continue;
+                }
+                match link.post_filled(slot, f_t0, f_t0d, rdma_display_proto::unix_now_us(), mat_times) {
+                    Ok(Some(seq)) => {
+                        last_send = Some(std::time::Instant::now());
+                        eprintln!("[server] frame {} sent", seq);
+                        if seq % 60 == 0 {
+                            eprintln!("[stats] frames={} uptime={:?}", seq, started.elapsed());
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("[server] send failed: {e:#}");
+                        session = None;
+                        mat.drop_frames();
+                        issued.clear();
+                        break;
+                    }
                 }
             }
         }

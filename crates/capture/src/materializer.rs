@@ -33,6 +33,37 @@ pub trait FrameMaterializer: Send {
     /// (the internal dirty flag was consumed by the previous session's last
     /// send; the new client needs the current frame immediately).
     fn mark_dirty(&mut self);
+
+    /// Bind zero-copy staging: the materializer allocates `n` staging units
+    /// of `frame_bytes` each and returns their (pointer, len) so the server
+    /// can register them as RDMA staging slots (`register_from_raw`) — the
+    /// GPU readback DMA and the NIC read the same pages. None = no
+    /// externally-stageable memory (server falls back to verbs-allocated
+    /// slots + direct copy_frame output).
+    fn bind_staging(&mut self, _n: usize, _frame_bytes: usize) -> Option<Vec<(*mut u8, usize)>> {
+        None
+    }
+
+    /// Pipelined phase 1: enqueue the readback into staging slot `slot`
+    /// (`out` is the slot's registered memory). Must return promptly — the
+    /// GPU work proceeds asynchronously. Returns true when this frame is
+    /// real (dirty); false = nothing to send. The slot is then completed by
+    /// [`finish_frame`](Self::finish_frame).
+    /// Default: the synchronous copy_frame (no pipelining support).
+    fn issue_frame(&mut self, _slot: usize, out: &mut [u8]) -> Result<bool> {
+        Ok(self.copy_frame(out)?.0)
+    }
+
+    /// Pipelined phase 2: complete the slot `issue_frame` started (fence
+    /// wait) and return (changed, gpu stage times).
+    /// Default: passthrough (the default issue_frame did all the work).
+    fn finish_frame(&mut self, _slot: usize, _out: &mut [u8]) -> Result<(bool, rdma_display_proto::MatTimes)> {
+        Ok((true, rdma_display_proto::MatTimes::ZERO))
+    }
+
+    /// Drop any pipelined state (fences) after a session loss; the next
+    /// issue_frame reuses the slots.
+    fn drop_frames(&mut self) {}
 }
 
 /// The "plain" materializer: QEMU sends host-memory scanouts (requires
