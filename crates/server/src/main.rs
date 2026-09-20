@@ -45,6 +45,7 @@ fn main() -> Result<()> {
     let mut readback: String = "pbo".to_string();
     let mut audio = false;
     let mut audio_device: Option<String> = None;
+    let mut audio_helper = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -68,6 +69,7 @@ fn main() -> Result<()> {
             "--input-test" => input_test = true,
             "--audio" => audio = true,
             "--audio-device" => audio_device = Some(args.next().expect("--audio-device needs a value")),
+            "--audio-helper" => audio_helper = true,
             "--help" | "-h" => {
                 println!("usage: rdma-display-server [--mode testcard|capture] [--device mlx5_0] [--listen 0.0.0.0:4791] [--slots 3] [--fps 60]\n  \
 capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS capture, the host — requires sudo/CAP_SYS_ADMIN, kernel >= 5.8)\n  \
@@ -81,6 +83,14 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
             }
             other => anyhow::bail!("unknown arg: {other}"),
         }
+    }
+
+    // internal: setuid-down audio helper (spawned by run_capture; runs as
+    // the session user, needs no RDMA device, must not touch ibverbs)
+    if audio_helper {
+        return rdma_display_audio::capture::run_helper(
+            audio_device.as_deref().unwrap_or("@DEFAULT_MONITOR@"),
+        );
     }
 
     let ctx = rdma_display_rdma::open_device(device.as_deref())?;

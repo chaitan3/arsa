@@ -6,4 +6,5 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+libc = "0.2"
 libloading = "0.8"

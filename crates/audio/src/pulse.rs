@@ -52,13 +52,22 @@ type SimpleLatencyFn = unsafe extern "C" fn(s: *mut c_void, error: *mut i32) -> 
 type SimpleFreeFn = unsafe extern "C" fn(s: *mut c_void);
 
 fn err_str(code: i32) -> String {
+    // pa_error_code_t (pulse/def.h)
     match code {
-        -2 => "bad state".into(),
-        -3 => "timeout".into(),
-        -4 => "no entity".into(),
-        -5 => "connection refused".into(),
-        -6 => "invalid (device/server name?)".into(),
-        -11 => "not supported".into(),
+        0 => "ok".into(),
+        1 => "access failure".into(),
+        2 => "unknown command".into(),
+        3 => "invalid argument".into(),
+        4 => "entity exists".into(),
+        5 => "no such entity (bad device name?)".into(),
+        6 => "connection refused (no server reachable; under sudo this is the XDG_RUNTIME_DIR ownership check aborting the connect before any socket is opened)".to_string(),
+        7 => "protocol error".into(),
+        8 => "timeout".into(),
+        9 => "no auth key".into(),
+        10 => "internal error".into(),
+        11 => "connection terminated".into(),
+        15 => "bad state".into(),
+        19 => "not supported".into(),
         other => format!("pa error {other}"),
     }
 }
