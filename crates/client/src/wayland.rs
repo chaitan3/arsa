@@ -710,14 +710,29 @@ impl Dispatch<WlKeyboard, ()> for St {
             wl_keyboard::Event::Keymap { .. } => {
                 // we forward raw evdev codes; the xkb keymap is not needed
             }
-            wl_keyboard::Event::Enter { .. } => state.kb_active = true,
-            wl_keyboard::Event::Leave { .. } => state.kb_active = false,
+            wl_keyboard::Event::Enter { .. } => {
+                state.kb_active = true;
+                eprintln!("[wl] kb enter (kb_active=true)");
+            }
+            wl_keyboard::Event::Leave { .. } => {
+                state.kb_active = false;
+                eprintln!("[wl] kb leave (kb_active=false)");
+            }
             wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
                 // depressed modifier mask: Control = bit2, Alt = bit3 (xkb)
                 state.mods_ctrl_alt =
                     mods_depressed & (0x4 | 0x8) == (0x4 | 0x8);
             }
             wl_keyboard::Event::Key { key, state: st, .. } => {
+                eprintln!(
+                    "[wl] key {key:#04x} {} kb_active={}",
+                    if matches!(st, WEnum::Value(KeyState::Pressed)) {
+                        "down"
+                    } else {
+                        "up  "
+                    },
+                    state.kb_active
+                );
                 if !state.kb_active {
                     return;
                 }

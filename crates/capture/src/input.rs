@@ -461,6 +461,7 @@ fn uinput_loop(rx: mpsc::Receiver<InputEvent>, screen: Arc<ScreenSize>) -> Resul
     while let Ok(ev) = rx.recv() {
         match ev {
             InputEvent::Key { code, down } => {
+                eprintln!("[input] key {code:#04x} down={down}");
                 let Some(k) = rdma_display_proto::keymap::qnum_to_linux(code) else {
                     eprintln!("[input] no evdev mapping for qnum {code:#x}");
                     continue;
