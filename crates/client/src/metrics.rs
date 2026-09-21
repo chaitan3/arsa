@@ -171,6 +171,8 @@ impl Metrics {
                 self.try_match();
             }
             ControlEvent::Pong { c0, s1, c2 } => self.clock.add(c0, s1, c2),
+            // routed to the gamepad rumble player by the caller before this
+            ControlEvent::Rumble(_) => {}
         }
     }
 

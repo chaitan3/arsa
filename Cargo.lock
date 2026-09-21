@@ -1853,6 +1853,7 @@ name = "rdma-display-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "libloading",
  "rdma-display-audio",
  "rdma-display-proto",

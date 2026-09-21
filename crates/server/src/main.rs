@@ -143,6 +143,8 @@ fn run_testcard_server(
         std::thread::spawn(move || {
             while input_rx.recv().is_ok() {}
         });
+        // no input sink in testcard mode: nothing to relay rumble to
+        let rumble_hub = rdma_display_proto::gamepad::RumbleHub::new();
         let mut link = rdma_display_rdma::ServerLink::accept(
             Conn::new(stream),
             ctx,
@@ -151,6 +153,7 @@ fn run_testcard_server(
             slots,
             input_tx,
             None,
+            &rumble_hub,
         )?;
         eprintln!("session up: {slots} slots, {} frame bytes", link.frame_bytes());
         run_testcard(&mut link, fps)?;
@@ -246,12 +249,15 @@ fn run_capture(
     }
     let screen = ScreenSize::new();
     let (input_tx, input_rx) = mpsc::channel::<rdma_display_proto::InputEvent>();
+    // host-game rumble on the virtual pad rides this hub to the current
+    // session's control stream (installed per-accept by the RDMA layer)
+    let rumble_hub = rdma_display_proto::gamepad::RumbleHub::new();
     let sink: Box<dyn InputSink> = match input_name {
         "qemu" => Box::new(QemuDbusInput::new(dbus_socket.clone(), console)),
         "uinput" => Box::new(rdma_display_capture::UinputSink),
         other => bail!("input sink {other:?} not implemented (qemu|uinput)"),
     };
-    InputSink::spawn(sink, input_rx, screen.clone())?;
+    InputSink::spawn(sink, input_rx, screen.clone(), rumble_hub.clone())?;
     eprintln!("[server] input sink: {input_name}");
 
     let (tx, rx) = mpsc::channel();
@@ -477,6 +483,7 @@ fn run_capture(
                         slots,
                         input_tx.clone(),
                         external.as_deref(),
+                        &rumble_hub,
                     ) {
                         Ok(link) => {
                             eprintln!("session up: {slots} slots, {} frame bytes", link.frame_bytes());

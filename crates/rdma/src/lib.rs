@@ -33,6 +33,8 @@ pub enum ControlEvent {
     /// c0 = the client's clock when it sent the ping, s1 = server's reply
     /// time, c2 = client's clock when the pong arrived (reader thread).
     Pong { c0: u64, s1: u64, c2: u64 },
+    /// server → client: force-feedback event for the physical controller
+    Rumble(proto::gamepad::Rumble),
 }
 
 pub mod cuda;
@@ -232,11 +234,13 @@ impl ServerLink {
         slots: usize,
         input_tx: mpsc::Sender<proto::InputEvent>,
         external: Option<&[(*mut u8, usize)]>,
+        rumble: &proto::gamepad::RumbleHub,
     ) -> Result<ServerLink> {
         // split the stream: reader thread gets the receive half, the frame
         // send path keeps a write-only clone for per-frame Stamps
         let stream = conn.into_inner();
         let stamp_w = stream.try_clone().context("clone stream for stamps")?;
+        let rumble_w = stream.try_clone().context("clone stream for rumble")?;
         let mut conn = Conn::new(stream);
         hello_exchange(&mut conn)?;
         let (qp, send_cq, _recv_cq) = endpoint_exchange(&mut conn, ctx, pd)?;
@@ -305,49 +309,79 @@ impl ServerLink {
         };
         conn.send(&Message::Ready)?;
 
+        // rumble: the pad thread's events ride this channel to a dedicated
+        // forwarder on a private clone of the control stream; a live session
+        // owns the hub's sender slot, and the control-reader clears it on
+        // disconnect so pad threads never block on a dead session
+        let (rumble_tx, rumble_rx) = mpsc::channel::<proto::gamepad::Rumble>();
+        rumble.set(rumble_tx);
+        std::thread::Builder::new()
+            .name("rumble-fwd".into())
+            .spawn(move || {
+                let mut w = rumble_w;
+                loop {
+                    match rumble_rx.recv() {
+                        Ok(r) => {
+                            if proto::send_msg(&mut w, &proto::Message::Rumble(r)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break, // all senders dropped (session gone)
+                    }
+                }
+            })
+            .context("spawn rumble forwarder")?;
+
         // Control channel reader: owns the TCP stream from here on. Credits
         // go to the sender loop via a channel; input events are forwarded to
         // the capture side (QEMU D-Bus input injection). Reading ONLY inside
         // wait_free_slot would starve input while slots are busy.
         let (credit_tx, credit_rx) = mpsc::channel::<Option<u32>>();
+        let reader_rumble = rumble.clone();
         let reader = std::thread::Builder::new()
             .name("control-reader".into())
-            .spawn(move || loop {
-                match conn.recv() {
-                    Ok(proto::Message::Credit(slot)) => {
-                        if credit_tx.send(Some(slot)).is_err() {
-                            break; // sender gone (server shutting down)
+            .spawn(move || {
+                loop {
+                    match conn.recv() {
+                        Ok(proto::Message::Credit(slot)) => {
+                            if credit_tx.send(Some(slot)).is_err() {
+                                break; // sender gone (server shutting down)
+                            }
                         }
-                    }
-                    Ok(proto::Message::Input(ev)) => {
-                        if input_tx.send(ev).is_err() {
+                        Ok(proto::Message::Input(ev)) => {
+                            if input_tx.send(ev).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(proto::Message::Ping(c0)) => {
+                            // clock-sync reply: echo the client's stamp + our time
+                            if let Err(e) =
+                                conn.send(&proto::Message::Pong(c0, proto::unix_now_us()))
+                            {
+                                eprintln!("[rdma] pong failed: {e}");
+                            }
+                        }
+                        Ok(proto::Message::Bye(_)) => {
+                            let _ = credit_tx.send(None);
+                            break;
+                        }
+                        Ok(other) => {
+                            eprintln!("[rdma] unexpected control message {other:?}");
+                        }
+                        Err(e) => {
+                            if e.kind() != std::io::ErrorKind::UnexpectedEof
+                                && e.kind() != std::io::ErrorKind::ConnectionReset
+                            {
+                                eprintln!("[rdma] control channel error: {e}");
+                            }
+                            let _ = credit_tx.send(None);
                             break;
                         }
                     }
-                    Ok(proto::Message::Ping(c0)) => {
-                        // clock-sync reply: echo the client's stamp + our time
-                        if let Err(e) = conn.send(&proto::Message::Pong(c0, proto::unix_now_us()))
-                        {
-                            eprintln!("[rdma] pong failed: {e}");
-                        }
-                    }
-                    Ok(proto::Message::Bye(_)) => {
-                        let _ = credit_tx.send(None);
-                        break;
-                    }
-                    Ok(other) => {
-                        eprintln!("[rdma] unexpected control message {other:?}");
-                    }
-                    Err(e) => {
-                        if e.kind() != std::io::ErrorKind::UnexpectedEof
-                            && e.kind() != std::io::ErrorKind::ConnectionReset
-                        {
-                            eprintln!("[rdma] control channel error: {e}");
-                        }
-                        let _ = credit_tx.send(None);
-                        break;
-                    }
                 }
+                // session is gone: drop the hub's sender so the pad thread's
+                // rumbles become no-ops and the forwarder thread winds down
+                reader_rumble.clear();
             })
             .context("spawn control reader")?;
         std::mem::forget(reader); // runs for the session lifetime
@@ -641,6 +675,11 @@ fn spawn_control_reader(stream: TcpStream) -> mpsc::Receiver<ControlEvent> {
                             c2: proto::unix_now_us(),
                         };
                         if tx.send(ev).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(proto::Message::Rumble(r)) => {
+                        if tx.send(ControlEvent::Rumble(r)).is_err() {
                             break;
                         }
                     }

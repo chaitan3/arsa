@@ -5,6 +5,7 @@
 //! (stats/checksums + optional PPM dump).
 
 mod eglwin;
+mod gamepad;
 mod keymap;
 mod metrics;
 mod wayland;
@@ -27,6 +28,9 @@ fn main() -> Result<()> {
     let mut metrics_on = false;
     let mut fullscreen = false;
     let mut audio_on = false;
+    let mut controller_on = true;
+    let mut controller_grab = true;
+    let mut fake_gamepad = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -42,6 +46,9 @@ fn main() -> Result<()> {
             "--metrics" => metrics_on = true,
             "--fullscreen" => fullscreen = true,
             "--audio" => audio_on = true,
+            "--no-controller" => controller_on = false,
+            "--no-controller-grab" => controller_grab = false,
+            "--fake-gamepad" => fake_gamepad = true,
             "--help" | "-h" => {
                 println!("usage: rdma-display-client --server HOST:PORT [--device mlx5_0] [--slots 3] [--dump frame.ppm] [--seconds N]");
                 println!("  --slot-mem host|cuda  receive slots: host = pinned RAM (default); cuda = dormant GPU path");
@@ -50,6 +57,9 @@ fn main() -> Result<()> {
                 println!("  --fullscreen          fullscreen on the current output; frame letterboxed/scaled to the screen with aspect kept (compositor's own fullscreen toggle also works)");
                 println!("  --audio               play the server's audio side-channel (default sink; server captures its own monitor source)");
                 println!("  --metrics             latency/bandwidth overlay (top-left) + clock-sync pings");
+                println!("  --no-controller       don't forward attached gamepads");
+                println!("  --no-controller-grab  leave the gamepad exclusive-grabbable by the local compositor too (default: EVIOCGRAB while streaming)");
+                println!("  --fake-gamepad        synthesize a controller (slot 0) for testing without hardware");
                 return Ok(());
             }
             other if other.starts_with("--") => anyhow::bail!("unknown arg: {other}"),
@@ -97,6 +107,14 @@ fn main() -> Result<()> {
     // CUDA slots are GPU-only and cannot be uploaded from.
     // user-input path: Wayland events -> this channel -> control TCP
     let (input_tx, input_rx) = std::sync::mpsc::channel();
+
+    // controller: raw evdev capture (slot 0..n) + rumble player; rumble
+    // events from the server arrive on the control channel below
+    let rumble_tx = if controller_on || fake_gamepad {
+        Some(gamepad::start(input_tx.clone(), controller_grab, fake_gamepad))
+    } else {
+        None
+    };
 
     let mut presenter = match output.as_str() {
         "none" => None,
@@ -197,7 +215,7 @@ fn main() -> Result<()> {
             // sync warm
             if let Some(m) = metrics.as_mut() {
                 while let Some(ev) = link.try_control() {
-                    m.on_control(ev);
+                    route_control(ev, rumble_tx.as_ref(), Some(m));
                 }
                 if m.maybe_ping() {
                     link.send_ping()?;
@@ -205,7 +223,9 @@ fn main() -> Result<()> {
             } else {
                 // without metrics there is no server→client traffic expected;
                 // still drain so nothing accumulates
-                while link.try_control().is_some() {}
+                while let Some(ev) = link.try_control() {
+                    route_control(ev, rumble_tx.as_ref(), None);
+                }
             }
             // forward queued user-input events to the server
             while let Ok(ev) = input_rx.try_recv() {
@@ -264,7 +284,7 @@ fn main() -> Result<()> {
             );
             if let Some(m) = metrics.as_mut() {
                 while let Some(ev) = link.try_control() {
-                    m.on_control(ev);
+                    route_control(ev, rumble_tx.as_ref(), Some(m));
                 }
                 if m.maybe_ping() {
                     link.send_ping()?;
@@ -280,6 +300,25 @@ fn main() -> Result<()> {
     }
     eprintln!("done: {} frames in {:?}", frames, started.elapsed());
     Ok(())
+}
+
+fn route_control(
+    ev: rdma_display_rdma::ControlEvent,
+    rumble_tx: Option<&std::sync::mpsc::Sender<rdma_display_proto::gamepad::Rumble>>,
+    metrics: Option<&mut metrics::Metrics>,
+) {
+    match ev {
+        rdma_display_rdma::ControlEvent::Rumble(r) => {
+            if let Some(tx) = rumble_tx {
+                let _ = tx.send(r);
+            }
+        }
+        other => {
+            if let Some(m) = metrics {
+                m.on_control(other);
+            }
+        }
+    }
 }
 
 fn dump_ppm(path: &str, link: &rdma_display_rdma::ClientLink, slot: usize) -> Result<()> {

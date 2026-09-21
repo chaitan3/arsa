@@ -7,10 +7,11 @@
 
 use std::io::{Read, Write};
 
+pub mod gamepad;
 pub mod keymap;
 
 pub const MAGIC: u32 = 0x5244_4453; // "RDDS"
-pub const VERSION: u32 = 6; // v6: audio side-channel (2nd connection to the main port, tag byte 0x02); control bytes unchanged
+pub const VERSION: u32 = 7; // v7: gamepad (InputEvent::Gamepad* + server→client Message::Rumble)
 
 /// Wall-clock microseconds since the unix epoch. Cross-host comparable
 /// (that is the point): per-frame server stamps and ping-pong clock-sync
@@ -41,6 +42,8 @@ pub enum MsgType {
     Ping = 10,
     /// clock sync reply: payload = the ping's stamp + server's time at reply
     Pong = 11,
+    /// server → client: force-feedback event for the client's physical pad
+    Rumble = 12,
 }
 
 /// Server-side pipeline timestamps for one frame (all `unix_now_us`).
@@ -122,12 +125,18 @@ pub struct SlotDesc {
 /// `code` semantics (per org.qemu.Display1.* on the host):
 /// - Key: QEMU "key number" (qnum) — see client/src/keymap.rs
 /// - Btn: 0=Left, 1=Middle, 2=Right, 3=WheelUp, 4=WheelDown, 5=Side, 6=Extra
+/// - GamepadBtn/GamepadAxis (proto v7): kernel-standard gamepad codes —
+///   `code` is a BTN_* (see proto::gamepad) / ABS_* axis, value already
+///   rescaled into the virtual pad's ranges by the client. `slot` is the
+///   controller index (v7 wires slot 0 only; the field is here from day one).
 #[derive(Debug, Clone, Copy)]
 pub enum InputEvent {
     Key { code: u32, down: bool },
     Btn { button: u32, down: bool },
     Abs { x: u32, y: u32 },
     Rel { dx: i32, dy: i32 },
+    GamepadBtn { slot: u32, code: u32, down: bool },
+    GamepadAxis { slot: u32, code: u32, value: i32 },
 }
 
 impl InputEvent {
@@ -135,6 +144,8 @@ impl InputEvent {
     const KIND_BTN: u32 = 1;
     const KIND_ABS: u32 = 2;
     const KIND_REL: u32 = 3;
+    const KIND_GAMEPAD_BTN: u32 = 4;
+    const KIND_GAMEPAD_AXIS: u32 = 5;
 
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -158,6 +169,18 @@ impl InputEvent {
                 out.extend_from_slice(&Self::KIND_REL.to_le_bytes());
                 out.extend_from_slice(&dx.to_le_bytes());
                 out.extend_from_slice(&dy.to_le_bytes());
+            }
+            InputEvent::GamepadBtn { slot, code, down } => {
+                out.extend_from_slice(&Self::KIND_GAMEPAD_BTN.to_le_bytes());
+                out.extend_from_slice(&slot.to_le_bytes());
+                out.extend_from_slice(&code.to_le_bytes());
+                out.push(*down as u8);
+            }
+            InputEvent::GamepadAxis { slot, code, value } => {
+                out.extend_from_slice(&Self::KIND_GAMEPAD_AXIS.to_le_bytes());
+                out.extend_from_slice(&slot.to_le_bytes());
+                out.extend_from_slice(&code.to_le_bytes());
+                out.extend_from_slice(&value.to_le_bytes());
             }
         }
         out
@@ -197,6 +220,16 @@ impl InputEvent {
                 dx: u32_at(0)? as i32,
                 dy: u32_at(4)? as i32,
             },
+            Self::KIND_GAMEPAD_BTN => InputEvent::GamepadBtn {
+                slot: u32_at(0)?,
+                code: u32_at(4)?,
+                down: down(8),
+            },
+            Self::KIND_GAMEPAD_AXIS => InputEvent::GamepadAxis {
+                slot: u32_at(0)?,
+                code: u32_at(4)?,
+                value: u32_at(8)? as i32,
+            },
             other => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -223,6 +256,9 @@ pub enum Message {
     Ping(u64),
     /// server → client: (ping's stamp, server's reply time)
     Pong(u64, u64),
+    /// server → client: force-feedback event from the host game, to be
+    /// replayed on the client's physical controller (see proto::gamepad)
+    Rumble(gamepad::Rumble),
 }
 
 /// Encode + frame one message onto any writer. `Conn::send` is a wrapper;
@@ -298,6 +334,7 @@ pub fn send_msg<T: Write>(io: &mut T, msg: &Message) -> std::io::Result<()> {
                 v
             },
         ),
+        Message::Rumble(r) => (MsgType::Rumble as u32, r.encode()),
     };
     if payload.len() > MAX_PAYLOAD {
         return Err(std::io::Error::new(
@@ -451,6 +488,7 @@ impl<T: Read + Write> Conn<T> {
                     u64::from_le_bytes(payload[8..16].try_into().unwrap()),
                 )
             }
+            t if t == MsgType::Rumble as u32 => Message::Rumble(gamepad::Rumble::decode(&payload)?),
             other => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -484,6 +522,14 @@ mod tests {
             }),
             Message::Ping(1_700_000_000_003_111),
             Message::Pong(1_700_000_000_003_111, 1_700_000_000_003_500),
+            Message::Rumble(gamepad::Rumble {
+                slot: 0,
+                id: 7,
+                strong: 0xffff,
+                weak: 0x8000,
+                duration_ms: 5000,
+                action: gamepad::RUMBLE_UPLOAD,
+            }),
         ];
         for m in msgs {
             let mut buf: Vec<u8> = Vec::new();
@@ -508,6 +554,10 @@ mod tests {
             InputEvent::Abs { x: 0, y: 0 },
             InputEvent::Rel { dx: -17, dy: 42 },
             InputEvent::Rel { dx: 0, dy: 0 },
+            InputEvent::GamepadBtn { slot: 0, code: 0x130, down: true },
+            InputEvent::GamepadBtn { slot: 0, code: 0x220, down: false },
+            InputEvent::GamepadAxis { slot: 0, code: 0, value: -32768 },
+            InputEvent::GamepadAxis { slot: 0, code: 5, value: 255 },
         ];
         for ev in events {
             let enc = ev.encode();

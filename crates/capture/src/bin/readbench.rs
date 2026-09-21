@@ -68,6 +68,7 @@ fn main() -> Result<()> {
             Box::new(rdma_display_capture::QemuDbusInput::new(dbus_socket.clone(), console)),
             input_rx,
             std::sync::Arc::new(rdma_display_capture::ScreenSize::default()),
+            rdma_display_proto::gamepad::RumbleHub::new(),
         )
         .context("spawn input sink")?;
     }
