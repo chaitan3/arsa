@@ -242,6 +242,7 @@ pub struct ServerLink {
 impl ServerLink {
     /// Server half of a session on an accepted TCP stream. `meta` describes
     /// the frames we will send (testcard or captured display format).
+    #[allow(clippy::too_many_arguments)]
     pub fn accept(
         conn: Conn<TcpStream>,
         ctx: &ibverbs::Context,

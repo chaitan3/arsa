@@ -341,9 +341,15 @@ fn run_capture(
     let mut frame_dirty = false;
     // t0 of the most recent frame event (pipeline stamp origin)
     let mut t0_unix_us: u64 = 0;
-    // format of the last scanout we failed to import (skip-log dedup; u32::MAX
-    // = "none"), so a flipping unsupported buffer logs once, not per frame
-    let mut last_skipped_fourcc: u32 = u32::MAX;
+    // latest-wins capture mailbox: the newest scanout waiting to be
+    // materialized. Older captures are dropped, so dropped frames cost no GPU
+    // work; materialization happens only when the frame is actually sent.
+    let mut pending_scanout: Option<rdma_display_capture::DmabufScanout> = None;
+    // true once a scanout has been materialized at least once (guards a client
+    // that connects before the first capture)
+    let mut have_frame = false;
+    // display meta currently negotiated with the live session (change detect)
+    let mut session_meta: Option<DisplayMeta> = None;
     // input-connection session nonce (0 = no live session); set on control
     // accept and cleared when the session ends
     let session_nonce = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -405,7 +411,7 @@ fn run_capture(
                     handle_capture_event(
                         ev, &mut mat, &mut session, &mut pending_meta,
                         &mut t0_unix_us, &mut frame_dirty, &screen,
-                        &mut last_skipped_fourcc,
+                        &mut pending_scanout,
                     )?;
                 }
                 Err(_) => bail!("capture source ended"),
@@ -416,7 +422,7 @@ fn run_capture(
                     handle_capture_event(
                         ev, &mut mat, &mut session, &mut pending_meta,
                         &mut t0_unix_us, &mut frame_dirty, &screen,
-                        &mut last_skipped_fourcc,
+                        &mut pending_scanout,
                     )?;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -433,7 +439,7 @@ fn run_capture(
                     handle_capture_event(
                         ev, &mut mat, &mut session, &mut pending_meta,
                         &mut t0_unix_us, &mut frame_dirty, &screen,
-                        &mut last_skipped_fourcc,
+                        &mut pending_scanout,
                     )?;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -529,6 +535,7 @@ fn run_capture(
                             mat.mark_dirty();
                             frame_dirty = true;
                             pipelined = external.is_some();
+                            session_meta = Some(meta.clone());
                             session = Some(link);
                         }
                         Err(e) => {
@@ -551,6 +558,60 @@ fn run_capture(
         // work of the frame just issued.
         if frame_dirty && session.is_some() && gate_open {
             let link = session.as_mut().unwrap();
+            let slot_bytes = link.frame_bytes();
+            // Materialize the newest pending capture now — only now do we know
+            // it will actually be sent. Everything superseded while a slot was
+            // busy was already dropped by the latest-wins mailbox.
+            match pending_scanout.take() {
+                Some(d) => {
+                    let fmt = d.format.clone();
+                    let fb = fmt.frame_bytes() as usize;
+                    if fb > slot_bytes {
+                        eprintln!(
+                            "[server] scanout {}x{} fourcc={:#010x} '{}' ({} B) exceeds negotiated slot ({} B); dropped",
+                            fmt.width,
+                            fmt.height,
+                            fmt.fourcc,
+                            rdma_display_capture::fourcc_name(fmt.fourcc),
+                            fb,
+                            slot_bytes
+                        );
+                        frame_dirty = false;
+                    } else if let Err(e) = mat.prepare(&fmt, Some(&d)) {
+                        // never tear down a session over a bad capture: hold
+                        // the last frame and resume when the format returns
+                        eprintln!("[server] prepare scanout failed: {e:#}; holding last frame");
+                        frame_dirty = false;
+                    } else {
+                        have_frame = true;
+                    }
+                }
+                // a client connected before the first capture: wait for one
+                None if !have_frame => frame_dirty = false,
+                None => {}
+            }
+            // Push a changed display meta (separate message, only when it
+            // changes). Only same-size changes are safe without renegotiating
+            // slots; a size change is remembered so we don't re-log per frame.
+            if frame_dirty {
+                if let Some(nm) = pending_meta.as_ref() {
+                    if session_meta.as_ref() != Some(nm) {
+                        if nm.frame_bytes as usize <= slot_bytes {
+                            let mut m = nm.clone();
+                            m.gen = session_meta.as_ref().map(|o| o.gen + 1).unwrap_or(1);
+                            let _ = link.send_meta(&m);
+                            eprintln!(
+                                "[server] display meta gen {} ({}x{} stride {} fourcc {:#010x})",
+                                m.gen, m.width, m.height, m.stride, m.fourcc
+                            );
+                            session_meta = Some(m);
+                        } else {
+                            session_meta = Some(nm.clone());
+                        }
+                    }
+                }
+            }
+            if frame_dirty {
             if pipelined {
                 if let Some(slot) = link.try_claim_slot() {
                     let t0d = rdma_display_proto::unix_now_us();
@@ -590,6 +651,7 @@ fn run_capture(
                     }
                 }
             }
+            } // if frame_dirty
         }
         // 5. pipelined: finish + post the oldest issued frame (FIFO preserves
         // frame order; the fence wait is mostly elapsed because the GPU DMA
@@ -727,30 +789,15 @@ fn handle_capture_event(
     t0_unix_us: &mut u64,
     frame_dirty: &mut bool,
     screen: &Arc<ScreenSize>,
-    last_skipped_fourcc: &mut u32,
+    pending_scanout: &mut Option<rdma_display_capture::DmabufScanout>,
 ) -> Result<()> {
     match ev {
         CaptureEvent::Scanout(dmabuf) => {
             let fmt = dmabuf.format.clone();
-            if let Err(e) = mat.prepare(&fmt, Some(&dmabuf)) {
-                // An un-importable scanout must not tear down the server: log
-                // it, keep the previous frame/session, and resume when the
-                // compositor switches back. The DRM source re-announces on
-                // every new fb id, so dedup the message by format — otherwise
-                // a flipping buffer in an unsupported format floods the log.
-                if *last_skipped_fourcc != fmt.fourcc {
-                    *last_skipped_fourcc = fmt.fourcc;
-                    eprintln!(
-                        "[server] scanout {}x{} fourcc={:#010x} '{}': {e:#}; holding last frame",
-                        fmt.width,
-                        fmt.height,
-                        fmt.fourcc,
-                        rdma_display_capture::fourcc_name(fmt.fourcc),
-                    );
-                }
-                return Ok(());
-            }
-            *last_skipped_fourcc = u32::MAX;
+            // latest-wins mailbox: keep only the newest capture. The GPU
+            // import/blit/readback happens at send time (see the send step),
+            // so a frame that gets superseded by a newer capture costs nothing.
+            *pending_scanout = Some(dmabuf);
             screen.set(fmt.width, fmt.height);
             *pending_meta = Some(meta_linear(&fmt));
             *t0_unix_us = rdma_display_proto::unix_now_us();
