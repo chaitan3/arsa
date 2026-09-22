@@ -35,7 +35,9 @@ use rdma_display_proto::InputEvent;
 
 use crate::keymap;
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1};
-use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_locked_pointer_v1::ZwpLockedPointerV1;
+use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1;
+use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1::{self, ZwpKeyboardShortcutsInhibitorV1};
+use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_locked_pointer_v1::{self, ZwpLockedPointerV1};
 use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1::{Lifetime, ZwpPointerConstraintsV1};
 use wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1;
 use wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1::{self, ZwpRelativePointerV1};
@@ -79,6 +81,10 @@ struct St {
     /// pointer for grab mode)
     #[allow(dead_code)]
     pointer: Option<WlPointer>,
+    /// keep-alive: our wl_keyboard (focus comes from it; the grab's
+    /// shortcut inhibitor binds to the seat, not to this object)
+    #[allow(dead_code)]
+    keyboard: Option<WlKeyboard>,
     /// shape device for our wl_pointer (created with the pointer)
     #[allow(dead_code)]
     cursor_device: Option<WpCursorShapeDeviceV1>,
@@ -88,11 +94,21 @@ struct St {
     /// mode (None when the compositor lacks either global)
     rel_mgr: Option<ZwpRelativePointerManagerV1>,
     constraints: Option<ZwpPointerConstraintsV1>,
+    /// keyboard-shortcuts-inhibit: while grabbed, the local compositor must
+    /// hand us EVERY key — its own desktop shortcuts (alt-f4, alt-tab,
+    /// alt-f1, ...) included — instead of acting on them. None when the
+    /// compositor lacks the global (then grab only takes the mouse).
+    inhibit_mgr: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
+    /// the live inhibitor for our surface (Some ⇔ keyboard grabbed); kept
+    /// alive across focus shuffles so it re-engages on re-focus
+    inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
     /// grab-mode keep-alives (dropping them releases the constraint)
     rel_obj: Option<ZwpRelativePointerV1>,
     locked_obj: Option<ZwpLockedPointerV1>,
-    /// mouse grab (game) mode: pointer locked locally, deltas forwarded as
-    /// InputEvent::Rel, local cursor hidden. Toggled with Ctrl+Alt+M.
+    /// input grab (Ctrl+Alt+M): pointer locked locally (deltas forwarded as
+    /// InputEvent::Rel, local cursor hidden) AND the keyboard grabbed (the
+    /// compositor's own shortcuts inhibited, so alt-f4/alt-tab/alt-f1 reach
+    /// the guest). Ctrl+Alt+M is the only way out — see `set_grab`.
     grabbed: bool,
     /// fractional accumulator for relative deltas (logical pixels)
     grab_acc: (f64, f64),
@@ -217,6 +233,12 @@ impl Presenter {
             globals.bind(&qh, 1..=1, ()).ok();
         let constraints: Option<ZwpPointerConstraintsV1> =
             globals.bind(&qh, 1..=1, ()).ok();
+        // keyboard-shortcuts-inhibit: the keyboard half of the grab — the
+        // compositor must route its OWN shortcuts (alt-f4, alt-tab, alt-f1,
+        // ...) to us instead of acting on them. Absence is non-fatal: grab
+        // then only takes the mouse (and says so).
+        let inhibit_mgr: Option<ZwpKeyboardShortcutsInhibitManagerV1> =
+            globals.bind(&qh, 1..=1, ()).ok();
         // viewporter + fractional-scale: buffer stays at the NATIVE guest
         // frame size; the compositor maps it 1:1 onto physical pixels at
         // whatever output scale the desktop runs (no upscale/blur)
@@ -228,12 +250,13 @@ impl Presenter {
         let decoration_mgr: Option<ZxdgDecorationManagerV1> =
             globals.bind(&qh, 1..=1, ()).ok();
         eprintln!(
-            "[wl] bound compositor v{} wm_base v{} seat v{} cursor-shape {} fractional-scale {}",
+            "[wl] bound compositor v{} wm_base v{} seat v{} cursor-shape {} fractional-scale {} shortcuts-inhibit {}",
             compositor.version(),
             wmbase.version(),
             seat.version(),
             if cursor_mgr.is_some() { "v1" } else { "unavailable" },
             if fs_mgr.is_some() { "v1" } else { "unavailable" },
+            if inhibit_mgr.is_some() { "v1" } else { "unavailable" },
         );
 
         let surface = compositor.create_surface(&qh, ());
@@ -278,10 +301,13 @@ impl Presenter {
                 seat,
                 cursor_mgr,
                 pointer: None,
+                keyboard: None,
                 cursor_device: None,
                 pointer_serial: 0,
                 rel_mgr,
                 constraints,
+                inhibit_mgr,
+                inhibitor: None,
                 rel_obj: None,
                 locked_obj: None,
                 grabbed: false,
@@ -424,65 +450,148 @@ impl Presenter {
 }
 
 impl St {
-    /// Enter/leave mouse grab: lock the local pointer (compositor freezes the
-    /// cursor) and subscribe to relative motion; hide the local cursor since
-    /// the guest draws its own (FPS games especially). Releasing restores the
-    /// absolute cursor.
+    /// Enter/leave input grab (Ctrl+Alt+M). ON: the local compositor keeps
+    /// its hands off the KEYBOARD (shortcuts inhibited — every key, alt-f4,
+    /// alt-tab, alt-f1 and any other desktop binding included, arrives as a
+    /// plain key event and is forwarded to the guest) and off the MOUSE
+    /// (pointer locked in relative mode, local cursor hidden). OFF: the
+    /// compositor gets its shortcuts and the absolute cursor back.
+    ///
+    /// Ctrl+Alt+M is the ONLY way out. A focus shuffle deliberately does not
+    /// release the grab (that was the hole through which alt-tab and friends
+    /// dumped the user out of the game mid-play), so the pieces self-heal
+    /// instead — see the Enter (re-lock on pointer re-entry) and Unlocked
+    /// (re-lock after the compositor breaks the constraint) handlers. The
+    /// grab is also kept across keyboard focus loss: if the compositor yanks
+    /// focus (lock screen, popup), the grab re-engages when the window is
+    /// focused again and Ctrl+Alt+M works there.
     fn set_grab(&mut self, on: bool, qh: &QueueHandle<St>) {
         if on == self.grabbed {
             return;
         }
         if on {
-            let (Some(rel_mgr), Some(con), Some(pointer)) =
-                (self.rel_mgr.as_ref(), self.constraints.as_ref(), self.pointer.as_ref())
-            else {
+            let kb_ok = self.grab_keys(qh);
+            let ptr_ok = self.grab_pointer(qh);
+            if !kb_ok && !ptr_ok {
                 eprintln!(
-                    "[wl] grab unavailable: compositor lacks relative-pointer/pointer-constraints"
+                    "[wl] grab unavailable: compositor supports neither \
+                     keyboard-shortcuts-inhibit nor relative-pointer/pointer-constraints"
                 );
                 return;
-            };
-            let rel = rel_mgr.get_relative_pointer(pointer, qh, ());
-            let locked = con.lock_pointer(
-                &self.surface,
-                pointer,
-                None,
-                Lifetime::Persistent,
-                qh,
-                (),
-            );
-            // hide the local cursor (guest games draw their own; desktop
-            // users get the guest cursor back on release)
-            pointer.set_cursor(self.pointer_serial, None, 0, 0);
-            self.rel_obj = Some(rel);
-            self.locked_obj = Some(locked);
+            }
             self.grabbed = true;
-            self.grab_acc = (0.0, 0.0);
             self.dbg_n = 0;
             self.dbg_sum = (0.0, 0.0);
             self.dbg_window = Instant::now();
-            eprintln!("[wl] mouse grabbed (relative mode; Ctrl+Alt+M to release)");
+            eprintln!("[wl] input grabbed (Ctrl+Alt+M to release)");
         } else {
-            // destroy EXPLICITLY: both interfaces have a destructor request,
-            // and dropping the proxy alone never sends it — the compositor
-            // kept the constraint (and the frozen cursor) alive until the
-            // next focus change forced a constraint break (observed on KWin)
-            if let Some(p) = self.rel_obj.take() {
-                p.destroy();
-            }
-            if let Some(p) = self.locked_obj.take() {
-                p.destroy();
-            }
+            self.release_keys();
+            self.release_pointer();
             self.grabbed = false;
             self.grab_acc = (0.0, 0.0);
             eprintln!(
                 "[wl] grab session: {} relative events, Σx={:+.1} Σy={:+.1}",
                 self.dbg_n, self.dbg_sum.0, self.dbg_sum.1
             );
-            if self.pointer_active {
-                if let Some(dev) = self.cursor_device.as_ref() {
-                    dev.set_shape(self.pointer_serial, Shape::Default);
-                }
+            eprintln!("[wl] input released (compositor back in control)");
+        }
+    }
+
+    /// Keyboard grab: `keyboard-shortcuts-inhibit` makes the compositor pass
+    /// its OWN shortcuts to us as plain keys (alt-f4/alt-tab/alt-f1, ...),
+    /// which we forward to the guest. No client-side trick can take the
+    /// desktop's shortcuts away — without the global there is nothing to
+    /// grab, and we say so instead of pretending.
+    fn grab_keys(&mut self, qh: &QueueHandle<St>) -> bool {
+        if self.inhibitor.is_some() {
+            return true;
+        }
+        let Some(mgr) = self.inhibit_mgr.clone() else {
+            eprintln!(
+                "[wl] keyboard grab UNAVAILABLE: no keyboard-shortcuts-inhibit \
+                 global — desktop shortcuts (alt-f4/alt-tab/...) still hit the \
+                 local desktop"
+            );
+            return false;
+        };
+        self.inhibitor = Some(mgr.inhibit_shortcuts(&self.surface, &self.seat, qh, ()));
+        eprintln!("[wl] keyboard grabbed (compositor shortcuts inhibited)");
+        true
+    }
+
+    /// give the compositor its shortcuts back. The destructor request is
+    /// sent EXPLICITLY: dropping the proxy alone never sends it (same trap
+    /// as the pointer constraint below) and the desktop would stay mute.
+    fn release_keys(&mut self) {
+        if let Some(inh) = self.inhibitor.take() {
+            inh.destroy();
+            eprintln!("[wl] keyboard released (compositor shortcuts restored)");
+        }
+    }
+
+    /// Mouse grab: lock the local pointer (compositor freezes the cursor) and
+    /// subscribe to relative motion; hide the local cursor since the guest
+    /// draws its own (FPS games especially). Idempotent and safe to call
+    /// without hover: a lock requested for a surface without pointer focus
+    /// stays dormant until the pointer enters (pointer-constraints spec) —
+    /// which is also how a broken lock gets re-acquired.
+    fn grab_pointer(&mut self, qh: &QueueHandle<St>) -> bool {
+        if self.locked_obj.is_some() {
+            return true;
+        }
+        let (Some(rel_mgr), Some(con), Some(pointer)) = (
+            self.rel_mgr.clone(),
+            self.constraints.clone(),
+            self.pointer.clone(),
+        ) else {
+            eprintln!(
+                "[wl] mouse grab UNAVAILABLE: compositor lacks \
+                 relative-pointer/pointer-constraints"
+            );
+            return false;
+        };
+        let rel = rel_mgr.get_relative_pointer(&pointer, qh, ());
+        let locked =
+            con.lock_pointer(&self.surface, &pointer, None, Lifetime::Persistent, qh, ());
+        self.rel_obj = Some(rel);
+        self.locked_obj = Some(locked);
+        self.grab_acc = (0.0, 0.0);
+        if self.pointer_active {
+            // hide the local cursor (guest games draw their own; desktop
+            // users get the guest cursor back on release)
+            pointer.set_cursor(self.pointer_serial, None, 0, 0);
+            eprintln!("[wl] mouse grabbed (relative mode)");
+        } else {
+            eprintln!("[wl] mouse not over the window: it locks when it enters");
+        }
+        true
+    }
+
+    /// tear down the constraint objects only (no cursor/UI side effects) —
+    /// shared by the release path and the re-lock-after-break path
+    fn drop_pointer_constraint(&mut self) {
+        // destroy EXPLICITLY: both interfaces have a destructor request, and
+        // dropping the proxy alone never sends it — the compositor kept the
+        // constraint (and the frozen cursor) alive until the next focus
+        // change forced a constraint break (observed on KWin)
+        if let Some(p) = self.rel_obj.take() {
+            p.destroy();
+        }
+        if let Some(p) = self.locked_obj.take() {
+            p.destroy();
+        }
+    }
+
+    fn release_pointer(&mut self) {
+        let had_lock = self.locked_obj.is_some() || self.rel_obj.is_some();
+        self.drop_pointer_constraint();
+        self.grab_acc = (0.0, 0.0);
+        if self.pointer_active {
+            if let Some(dev) = self.cursor_device.as_ref() {
+                dev.set_shape(self.pointer_serial, Shape::Default);
             }
+        }
+        if had_lock {
             eprintln!("[wl] mouse released (absolute mode)");
         }
     }
@@ -603,7 +712,73 @@ quiet!(WpFractionalScaleManagerV1 => ());
 quiet!(ZxdgDecorationManagerV1 => ());
 quiet!(ZwpRelativePointerManagerV1 => ());
 quiet!(ZwpPointerConstraintsV1 => ());
-quiet!(ZwpLockedPointerV1 => ());
+quiet!(ZwpKeyboardShortcutsInhibitManagerV1 => ());
+
+/// Pointer-constraint lifecycle: the compositor may break the lock at any
+/// moment (focus change, its own UI, output churn). Ctrl+Alt+M is the only
+/// way OUT of the grab, so a break must not end it either — re-lock instead.
+impl Dispatch<ZwpLockedPointerV1, ()> for St {
+    fn event(
+        state: &mut St,
+        obj: &ZwpLockedPointerV1,
+        ev: <ZwpLockedPointerV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<St>,
+    ) {
+        match ev {
+            zwp_locked_pointer_v1::Event::Locked => {
+                eprintln!("[wl] pointer lock active (relative mode)");
+            }
+            zwp_locked_pointer_v1::Event::Unlocked => {
+                if !state.grabbed {
+                    return;
+                }
+                // stale event from a constraint object we already replaced
+                if state.locked_obj.as_ref().map(|p| p.id()) != Some(obj.id()) {
+                    return;
+                }
+                eprintln!(
+                    "[wl] grab: compositor broke the pointer lock — re-locking \
+                     (Ctrl+Alt+M releases)"
+                );
+                state.drop_pointer_constraint();
+                state.grab_pointer(qh);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Shortcut-inhibitor lifecycle: `active` = the compositor's own shortcuts
+/// are off and alt-f4/alt-tab/alt-f1 reach us like any other key. `inactive`
+/// means the compositor took them back (the protocol lets it keep an escape
+/// combo of its own); there is no client-side way to force re-activation, so
+/// this only warns — the grab itself stays until Ctrl+Alt+M.
+impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for St {
+    fn event(
+        _state: &mut St,
+        _: &ZwpKeyboardShortcutsInhibitorV1,
+        ev: <ZwpKeyboardShortcutsInhibitorV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<St>,
+    ) {
+        match ev {
+            zwp_keyboard_shortcuts_inhibitor_v1::Event::Active => {
+                eprintln!("[wl] keyboard grab active (compositor shortcuts inhibited)");
+            }
+            zwp_keyboard_shortcuts_inhibitor_v1::Event::Inactive => {
+                eprintln!(
+                    "[wl] keyboard grab INACTIVE: the compositor took its shortcuts \
+                     back (reserved escape combo?) — desktop keys may hit the local \
+                     desktop again"
+                );
+            }
+            _ => {}
+        }
+    }
+}
 
 /// Relative motion while grabbed: forward the UNACCELERATED delta (games want
 /// raw motion, not the compositor's acceleration curve) as InputEvent::Rel,
@@ -726,8 +901,8 @@ impl Dispatch<WlSeat, ()> for St {
                 }
                 state.pointer = Some(pointer);
             }
-            if caps.contains(Capability::Keyboard) {
-                seat.get_keyboard(qh, ());
+            if caps.contains(Capability::Keyboard) && state.keyboard.is_none() {
+                state.keyboard = Some(seat.get_keyboard(qh, ()));
             }
         }
     }
@@ -753,7 +928,17 @@ impl Dispatch<WlKeyboard, ()> for St {
                 state.kb_active = true;
                 state.held_keys.clear();
                 state.hotkey_m_down = false;
-                eprintln!("[wl] kb enter (kb_active=true)");
+                // modifier state is per-focus: a chord left half-pressed in
+                // the previous focus must not make the next plain M toggle
+                // the grab (the fresh Modifiers event will re-set it)
+                state.mods_ctrl_alt = false;
+                if state.grabbed {
+                    // the inhibitor re-engages by itself on keyboard focus
+                    // (protocol: active ⇔ our surface has keyboard focus)
+                    eprintln!("[wl] kb enter (grab still on: Ctrl+Alt+M releases)");
+                } else {
+                    eprintln!("[wl] kb enter (kb_active=true)");
+                }
             }
             wl_keyboard::Event::Leave { .. } => {
                 state.kb_active = false;
@@ -764,7 +949,19 @@ impl Dispatch<WlKeyboard, ()> for St {
                     let _ = state.input_tx.send(InputEvent::Key { code, down: false });
                 }
                 state.hotkey_m_down = false;
-                eprintln!("[wl] kb leave (kb_active=false, held keys flushed)");
+                state.mods_ctrl_alt = false;
+                if state.grabbed {
+                    // NOT released here on purpose: Ctrl+Alt+M is the only
+                    // exit. The compositor taking focus away (lock screen,
+                    // popup) must not dump the user out of the grab — it
+                    // re-engages on re-focus (see Enter above).
+                    eprintln!(
+                        "[wl] kb leave (grab stays on; Ctrl+Alt+M releases once \
+                         the window is focused again)"
+                    );
+                } else {
+                    eprintln!("[wl] kb leave (kb_active=false, held keys flushed)");
+                }
             }
             wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
                 // depressed modifier mask: Control = bit2, Alt = bit3 (xkb)
@@ -787,23 +984,19 @@ impl Dispatch<WlKeyboard, ()> for St {
                 if !state.kb_active {
                     return;
                 }
-                // grab hotkey: Ctrl+Alt+M toggles relative mouse grab —
-                // client-local, never forwarded to the guest. Both the press
-                // and the release of the chorded M are swallowed; only the
-                // INITIAL press toggles, so a key repeat (KWin sends state=2,
-                // surfaced as "down") must not re-toggle the grab.
+                // grab hotkey: Ctrl+Alt+M toggles the input grab (keyboard
+                // shortcut inhibition + relative mouse) — client-local,
+                // never forwarded to the guest, and the ONLY way in or out.
+                // Both the press and the release of the chorded M are
+                // swallowed; only the INITIAL press toggles, so a key repeat
+                // (KWin sends state=2, surfaced as "down") must not re-toggle
+                // the grab.
                 if key == 0x32 {
                     if !released {
                         if state.mods_ctrl_alt {
                             if !state.hotkey_m_down {
                                 state.hotkey_m_down = true;
-                                if state.pointer_active {
-                                    state.set_grab(!state.grabbed, qh);
-                                } else {
-                                    eprintln!(
-                                        "[wl] grab: hover the window first (pointer not over it)"
-                                    );
-                                }
+                                state.set_grab(!state.grabbed, qh);
                             }
                             return; // chorded press/repeat: never forwarded
                         }
@@ -820,6 +1013,12 @@ impl Dispatch<WlKeyboard, ()> for St {
                 // `key` is the Linux evdev keycode (no xkb +8 offset needed
                 // because we never interpret the keymap)
                 let Some(code) = keymap::linux_to_qnum(key) else {
+                    if state.grabbed {
+                        eprintln!(
+                            "[wl] key {key:#04x} has no qnum mapping — dropped \
+                             (while grabbed, neither the guest nor the desktop sees it)"
+                        );
+                    }
                     return; // unmapped key
                 };
                 if released {
@@ -856,6 +1055,11 @@ impl Dispatch<WlPointer, ()> for St {
                 state.pointer_active = true;
                 state.pointer_serial = serial;
                 if state.grabbed {
+                    // self-heal: the lock can be missing here (grab started
+                    // without hover, or the compositor broke the constraint
+                    // while the pointer was away) — re-acquire it rather
+                    // than end the grab (Ctrl+Alt+M is the only exit)
+                    state.grab_pointer(qh);
                     // keep the local cursor hidden while grabbed (re-enter)
                     pointer.set_cursor(serial, None, 0, 0);
                 } else {
@@ -877,9 +1081,15 @@ impl Dispatch<WlPointer, ()> for St {
                     let _ = state.input_tx.send(InputEvent::Btn { button: btn, down: false });
                 }
                 if state.grabbed {
-                    // focus lost while grabbed (alt-tab, other output):
-                    // release so the user isn't stuck in relative mode
-                    state.set_grab(false, qh);
+                    // NOT released here on purpose: Ctrl+Alt+M is the only
+                    // exit (the old auto-release meant any focus churn — a
+                    // desktop shortcut, an OSD, another output — dumped the
+                    // user out of relative mode mid-play). The lock is
+                    // re-acquired on re-enter / on the Unlocked event.
+                    eprintln!(
+                        "[wl] grab: pointer left the window — grab stays on \
+                         (Ctrl+Alt+M releases)"
+                    );
                 }
             }
             wl_pointer::Event::Motion { surface_x, surface_y, .. } => {

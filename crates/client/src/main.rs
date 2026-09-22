@@ -60,6 +60,9 @@ fn main() -> Result<()> {
                 println!("  --no-controller       don't forward attached gamepads");
                 println!("  --no-controller-grab  leave the gamepad exclusive-grabbable by the local compositor too (default: EVIOCGRAB while streaming)");
                 println!("  --fake-gamepad        synthesize a controller (slot 0) for testing without hardware");
+                println!("  Ctrl+Alt+M            (--output egl) grab keyboard+mouse for the guest: the local compositor's");
+                println!("                        own shortcuts (alt-f4, alt-tab, alt-f1, ...) reach the guest too; Ctrl+Alt+M again");
+                println!("                        is the ONLY way to give control back to the desktop");
                 return Ok(());
             }
             other if other.starts_with("--") => anyhow::bail!("unknown arg: {other}"),
