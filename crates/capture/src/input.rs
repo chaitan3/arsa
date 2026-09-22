@@ -277,12 +277,12 @@ struct UinputDev {
 }
 
 impl UinputDev {
-    fn setup(self, name: &str, ff_effects_max: u32) -> Result<Self> {
+    fn setup(self, name: &str, ff_effects_max: u32, bus: u16, vendor: u16, product: u16, version: u16) -> Result<Self> {
         let mut s = UinputSetup {
-            bustype: BUS_VIRTUAL,
-            vendor: 0x1ab0,
-            product: 0x5250, // "RD"
-            version: 1,
+            bustype: bus,
+            vendor,
+            product,
+            version,
             name: [0; 80],
             ff_effects_max,
         };
@@ -442,7 +442,8 @@ impl InputSink for UinputSink {
 /// Create a keyboard device registering every EV_KEY code so the compositor
 /// sees the full keysym space (matching what xkb expects).
 fn uinput_keyboard() -> Result<UinputDev> {
-    let d = UinputDev { fd: open_uinput(false)? }.setup("rdma-display keyboard", 0)?;
+    let d = UinputDev { fd: open_uinput(false)? }
+        .setup("rdma-display keyboard", 0, BUS_VIRTUAL, 0x1ab0, 0x5250, 1)?;
     d.set_evbit(EV_SYN)?;
     d.set_evbit(EV_KEY)?;
     for k in 1..=KEY_MAX {
@@ -456,7 +457,8 @@ fn uinput_keyboard() -> Result<UinputDev> {
 /// axes — libinput must classify this as a plain mouse for 1:1 relative
 /// motion into pointer-locked games.
 fn uinput_pointer_rel() -> Result<UinputDev> {
-    let d = UinputDev { fd: open_uinput(false)? }.setup("rdma-display mouse", 0)?;
+    let d = UinputDev { fd: open_uinput(false)? }
+        .setup("rdma-display mouse", 0, BUS_VIRTUAL, 0x1ab0, 0x5250, 1)?;
     d.set_evbit(EV_SYN)?;
     d.set_evbit(EV_KEY)?;
     d.set_evbit(EV_REL)?;
@@ -472,7 +474,8 @@ fn uinput_pointer_rel() -> Result<UinputDev> {
 /// Absolute pointer (inputtino's create_mouse_abs): INPUT_PROP_POINTER +
 /// buttons + wheel + ABS X/Y over the giant fixed ranges. No REL_X/REL_Y.
 fn uinput_pointer_abs() -> Result<UinputDev> {
-    let d = UinputDev { fd: open_uinput(false)? }.setup("rdma-display mouse (absolute)", 0)?;
+    let d = UinputDev { fd: open_uinput(false)? }
+        .setup("rdma-display mouse (absolute)", 0, BUS_VIRTUAL, 0x1ab0, 0x5250, 1)?;
     d.set_propbit(INPUT_PROP_POINTER)?;
     d.set_evbit(EV_SYN)?;
     d.set_evbit(EV_KEY)?;
@@ -488,30 +491,53 @@ fn uinput_pointer_abs() -> Result<UinputDev> {
     d.create()
 }
 
-/// Virtual gamepad, inputtino's Xbox joypad profile (create_xbox_controller):
-/// the 11 action/system buttons (south..thumbr range covers them; BTN_Z and
-/// the BTN_DPAD_* extras are registered too so controllers whose kernel
-/// driver reports dpad/latches as buttons still map), ABS hat ±1, sticks
-/// ±32767 fuzz 16 flat 128, triggers 0..255. EV_FF + ff_effects_max so the
-/// host game can submit rumble effects; the FF handshake (upload/erase
-/// requests, playback notifications) is relayed to the client's physical pad.
+/// Virtual gamepad — deliberately indistinguishable from a REAL Xbox One pad
+/// on Linux (xpad driver, Xbox One identity per inputtino's XboxOneJoypad
+/// defaults): USB bus, VID 0x045E / PID 0x02EA / version 0x0408, the exact
+/// 11-button keybit set (south/east/north/west/tl/tr/select/start/mode/
+/// thumbl/thumbr), sticks ±32767 fuzz 16 flat 128, triggers 0..255, dpad via
+/// ABS_HAT0X/Y. Faithfulness is load-bearing:
+/// - the kernel orders evdev button indices by keybit code, so ANY extra bit
+///   (BTN_C/BTN_Z/BTN_TL2/BTN_TR2/BTN_DPAD_*) shifts indices and desyncs
+///   every game calibrated against real hardware — observed live: an
+///   Xbox-"press X" prompt triggering on the top (north) button instead of
+///   the left (west);
+/// - SDL's GameControllerDB matches by (bus, vid, pid, version), so the Xbox
+///   identity is what makes games load the proper Xbox mapping.
+/// Controllers whose driver reports extra codes (e.g. the DualSense's BTN_TL2
+/// for the L2 latch) simply have those events dropped by the kernel on the
+/// virtual pad — the analog axes carry the same input. FF via the pad fd's
+/// rumble handshake, relayed to the client's physical pad.
 fn uinput_gamepad() -> Result<UinputDev> {
-    let d = UinputDev { fd: open_uinput(true)? }.setup("rdma-display gamepad", 4)?;
+    const BUS_USB: u16 = 0x03;
+    let d = UinputDev { fd: open_uinput(true)? }.setup(
+        "rdma-display X-Box One (virtual) pad",
+        4,
+        BUS_USB,
+        0x045e,
+        0x02ea,
+        0x0408,
+    )?;
     d.set_evbit(EV_SYN)?;
     d.set_evbit(EV_KEY)?;
     d.set_evbit(EV_ABS)?;
     d.set_evbit(EV_FF)?;
-    // the whole gamepad button range + the digital dpad (individual bits may
-    // reject; harmless)
-    for b in proto::gamepad::BTN_SOUTH..=proto::gamepad::BTN_THUMBR {
+    for b in [
+        proto::gamepad::BTN_SOUTH,
+        proto::gamepad::BTN_EAST,
+        proto::gamepad::BTN_NORTH,
+        proto::gamepad::BTN_WEST,
+        proto::gamepad::BTN_TL,
+        proto::gamepad::BTN_TR,
+        proto::gamepad::BTN_SELECT,
+        proto::gamepad::BTN_START,
+        proto::gamepad::BTN_MODE,
+        proto::gamepad::BTN_THUMBL,
+        proto::gamepad::BTN_THUMBR,
+    ] {
         // NOTE: a failed keybit makes the kernel silently drop that button's
         // events (input core filters EV_KEY by keybit) — so failures are
         // logged, not swallowed
-        if let Err(e) = d.set_keybit(b) {
-            eprintln!("[input] gamepad UI_SET_KEYBIT({b:#x}) failed: {e}");
-        }
-    }
-    for b in proto::gamepad::BTN_DPAD_UP..=proto::gamepad::BTN_DPAD_RIGHT {
         if let Err(e) = d.set_keybit(b) {
             eprintln!("[input] gamepad UI_SET_KEYBIT({b:#x}) failed: {e}");
         }
