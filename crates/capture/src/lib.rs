@@ -48,6 +48,29 @@ impl FrameFormat {
     }
 }
 
+/// Decode a DRM fourcc into its 4-character name (e.g. 0x3432_5258 → "XR24").
+/// The low byte is the first character (`fourcc_code`). Non-printable bytes
+/// become `.` so log lines stay readable.
+pub fn fourcc_name(fourcc: u32) -> String {
+    fourcc
+        .to_le_bytes()
+        .iter()
+        .map(|&b| if b.is_ascii_graphic() { b as char } else { '.' })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fourcc_name;
+
+    #[test]
+    fn fourcc_names() {
+        assert_eq!(fourcc_name(0x3432_5258), "XR24");
+        assert_eq!(fourcc_name(0x3033_4241), "AB30"); // DRM_FORMAT_ABGR2101010
+        assert_eq!(fourcc_name(0), "....");
+    }
+}
+
 /// A dmabuf scanout with owned (duplicated) plane fds.
 #[derive(Debug)]
 pub struct DmabufScanout {

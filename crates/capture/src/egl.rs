@@ -323,6 +323,44 @@ void main() { frag = texture(tex, v_uv); }
 // happen inside the RDMA sender loop, which owns the materializer).
 unsafe impl Send for EglMaterializer {}
 
+/// Single-plane, 4-byte-per-pixel RGB formats the EGL blit can normalize.
+///
+/// The blit samples the imported `GL_TEXTURE_EXTERNAL_OES` texture and writes
+/// an RGBA8 target, so the driver handles channel order and bit depth — we only
+/// require that EGL can import the dmabuf and that it is 4 bytes/pixel (the
+/// wire format is always XR24 regardless). Two families qualify:
+///
+///   * 8888 (8 bits/channel): AR24 AB24 RA24 BA24 XR24 XB24 RX24 BX24
+///   * 2101010 / 1010102 (10 bits/channel): AR30 AB30 RA30 BA30
+///     XR30 XB30 RX30 BX30
+///
+/// The 10-bit formats appear when the compositor switches the primary plane to
+/// a wide-gamut/HDR scanout — e.g. KWin while mpv plays HDR video. An
+/// `XR24`-only whitelist made that switch a fatal error and stopped capture.
+fn is_supported_rgb_fourcc(fourcc: u32) -> bool {
+    const SUPPORTED: &[u32] = &[
+        // 32bpp 8888: ARGB ABGR RGBA BGRA XRGB XBGR RGBX BGRX
+        0x3432_5241,
+        0x3432_4241,
+        0x3432_4152,
+        0x3432_4142,
+        0x3432_5258,
+        0x3432_4258,
+        0x3432_5852,
+        0x3432_5842,
+        // 32bpp 10-bit 2101010/1010102: the same eight orders ('?30')
+        0x3033_5241,
+        0x3033_4241,
+        0x3033_4152,
+        0x3033_4142,
+        0x3033_5258,
+        0x3033_4258,
+        0x3033_5852,
+        0x3033_5842,
+    ];
+    SUPPORTED.contains(&fourcc)
+}
+
 pub struct EglMaterializer {
     egl: Egl,
     gl: Gl,
@@ -581,12 +619,11 @@ impl EglMaterializer {
         if d.fds.len() != 1 || fmt.num_planes != 1 {
             bail!("multi-plane dmabuf not supported yet (planes={})", d.fds.len());
         }
-        // all single-plane 4bpp RGB variants: XRGB('XR24'), XBGR('XB24'),
-        // ARGB('AR24'), ABGR('AB24') — the blit normalizes memory order, and
-        // readback always produces XR24 (BGRX) bytes
-        match fmt.fourcc {
-            0x3432_5258 | 0x3432_4258 | 0x3432_5241 | 0x3432_4241 => {}
-            other => bail!("EGL materializer: unsupported fourcc {other:#010x}"),
+        // all supported single-plane 4bpp RGB variants (see
+        // is_supported_rgb_fourcc); the blit normalizes memory order and bit
+        // depth, and readback always produces XR24 (BGRX) bytes
+        if !is_supported_rgb_fourcc(fmt.fourcc) {
+            bail!("EGL materializer: unsupported fourcc {:#010x}", fmt.fourcc);
         }
         // destroy the previous import: unbind BOTH targets the blit touches
         // (the OES binding is what the blit leaves bound — a deleted texture
@@ -700,12 +737,11 @@ impl crate::FrameMaterializer for EglMaterializer {
 
 
     fn prepare(&mut self, fmt: &FrameFormat, dmabuf: Option<&DmabufScanout>) -> Result<()> {
-        // all single-plane 4bpp RGB variants: XRGB('XR24'), XBGR('XB24'),
-        // ARGB('AR24'), ABGR('AB24') — the blit normalizes memory order, and
-        // readback always produces XR24 (BGRX) bytes
-        match fmt.fourcc {
-            0x3432_5258 | 0x3432_4258 | 0x3432_5241 | 0x3432_4241 => {}
-            other => bail!("EGL materializer: unsupported fourcc {other:#010x}"),
+        // all supported single-plane 4bpp RGB variants (see
+        // is_supported_rgb_fourcc); the blit normalizes memory order and bit
+        // depth, and readback always produces XR24 (BGRX) bytes
+        if !is_supported_rgb_fourcc(fmt.fourcc) {
+            bail!("EGL materializer: unsupported fourcc {:#010x}", fmt.fourcc);
         }
         if fmt.stride % 4 != 0 {
             bail!(
@@ -2355,4 +2391,22 @@ pub fn run_readback_bench(
     drainer.join().ok();
     println!("[bench] done");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_supported_rgb_fourcc;
+
+    #[test]
+    fn supported_rgb_fourccs() {
+        // KWin's normal desktop scanout
+        assert!(is_supported_rgb_fourcc(0x3432_5258)); // XR24
+        // ...and the 10-bit wide-gamut plane it switches to for HDR video
+        // (the format that used to stop capture)
+        assert!(is_supported_rgb_fourcc(0x3033_4241)); // AB30
+        assert!(is_supported_rgb_fourcc(0x3033_5241)); // AR30
+        // a single-plane packed-YUV format must NOT be treated as RGB
+        assert!(!is_supported_rgb_fourcc(0x5655_5958)); // XYUV
+        assert!(!is_supported_rgb_fourcc(0x3231_564e)); // NV12
+    }
 }

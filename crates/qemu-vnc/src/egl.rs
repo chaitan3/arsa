@@ -529,9 +529,15 @@ impl Grabber {
         if fd < 0 {
             bail!("dmabuf scanout without plane fd");
         }
-        // all single-plane 4bpp RGB variants: XRGB/XBGR/ARGB/ABGR
+        // single-plane 4-byte RGB: the 8888 family and the 10-bit
+        // 2101010/1010102 family (compositors switch the primary plane to the
+        // latter for wide-gamut/HDR content); the blit normalizes channel
+        // order and depth, so only 4 bytes/pixel matters
         match fmt.fourcc {
-            0x3432_5258 | 0x3432_4258 | 0x3432_5241 | 0x3432_4241 => {}
+            0x3432_5241 | 0x3432_4241 | 0x3432_4152 | 0x3432_4142
+            | 0x3432_5258 | 0x3432_4258 | 0x3432_5852 | 0x3432_5842
+            | 0x3033_5241 | 0x3033_4241 | 0x3033_4152 | 0x3033_4142
+            | 0x3033_5258 | 0x3033_4258 | 0x3033_5852 | 0x3033_5842 => {}
             other => bail!("unsupported fourcc {other:#010x}"),
         }
         // destroy the previous import: unbind BOTH targets the blit touches

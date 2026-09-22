@@ -553,10 +553,11 @@ fn run(card_pref: Option<&str>, tx: Sender<CaptureEvent>) -> Result<()> {
                 match import_fb(&card.as_ref().unwrap().0, id) {
                     Ok(dmabuf) => {
                         eprintln!(
-                            "[capture-drm] fb {id} {}x{} fourcc={:#010x} modifier={:#x} stride={}",
+                            "[capture-drm] fb {id} {}x{} fourcc={:#010x} '{}' modifier={:#x} stride={}",
                             dmabuf.format.width,
                             dmabuf.format.height,
                             dmabuf.format.fourcc,
+                            crate::fourcc_name(dmabuf.format.fourcc),
                             dmabuf.format.modifier,
                             dmabuf.format.stride,
                         );

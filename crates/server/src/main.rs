@@ -329,6 +329,9 @@ fn run_capture(
     let mut frame_dirty = false;
     // t0 of the most recent frame event (pipeline stamp origin)
     let mut t0_unix_us: u64 = 0;
+    // format of the last scanout we failed to import (skip-log dedup; u32::MAX
+    // = "none"), so a flipping unsupported buffer logs once, not per frame
+    let mut last_skipped_fourcc: u32 = u32::MAX;
     let started = std::time::Instant::now();
 
     // pipelined (PBO staging) state: frames issued to the materializer whose
@@ -387,6 +390,7 @@ fn run_capture(
                     handle_capture_event(
                         ev, &mut mat, &mut session, &mut pending_meta,
                         &mut t0_unix_us, &mut frame_dirty, &screen,
+                        &mut last_skipped_fourcc,
                     )?;
                 }
                 Err(_) => bail!("capture source ended"),
@@ -397,6 +401,7 @@ fn run_capture(
                     handle_capture_event(
                         ev, &mut mat, &mut session, &mut pending_meta,
                         &mut t0_unix_us, &mut frame_dirty, &screen,
+                        &mut last_skipped_fourcc,
                     )?;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -413,6 +418,7 @@ fn run_capture(
                     handle_capture_event(
                         ev, &mut mat, &mut session, &mut pending_meta,
                         &mut t0_unix_us, &mut frame_dirty, &screen,
+                        &mut last_skipped_fourcc,
                     )?;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -608,12 +614,30 @@ fn handle_capture_event(
     t0_unix_us: &mut u64,
     frame_dirty: &mut bool,
     screen: &Arc<ScreenSize>,
+    last_skipped_fourcc: &mut u32,
 ) -> Result<()> {
     match ev {
         CaptureEvent::Scanout(dmabuf) => {
             let fmt = dmabuf.format.clone();
-            mat.prepare(&fmt, Some(&dmabuf))
-                .context("prepare scanout")?;
+            if let Err(e) = mat.prepare(&fmt, Some(&dmabuf)) {
+                // An un-importable scanout must not tear down the server: log
+                // it, keep the previous frame/session, and resume when the
+                // compositor switches back. The DRM source re-announces on
+                // every new fb id, so dedup the message by format — otherwise
+                // a flipping buffer in an unsupported format floods the log.
+                if *last_skipped_fourcc != fmt.fourcc {
+                    *last_skipped_fourcc = fmt.fourcc;
+                    eprintln!(
+                        "[server] scanout {}x{} fourcc={:#010x} '{}': {e:#}; holding last frame",
+                        fmt.width,
+                        fmt.height,
+                        fmt.fourcc,
+                        rdma_display_capture::fourcc_name(fmt.fourcc),
+                    );
+                }
+                return Ok(());
+            }
+            *last_skipped_fourcc = u32::MAX;
             screen.set(fmt.width, fmt.height);
             *pending_meta = Some(meta_linear(&fmt));
             *t0_unix_us = rdma_display_proto::unix_now_us();
