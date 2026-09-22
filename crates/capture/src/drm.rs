@@ -202,6 +202,28 @@ const fn iowr_ioctl(nr: u16, size: usize) -> u64 {
     (1 << 30) | ((size as u64) << 16) | (D << 8) | nr as u64
 }
 
+// --- dma-buf UAPI (include/uapi/linux/dma-buf.h) ----------------------------
+// DMA_BUF_IOCTL_EXPORT_SYNC_FILE (kernel >= 5.20) exports the reservation's
+// read-side fence as a sync_file, so a non-master observer can wait for the
+// producer's GPU work before reading a buffer. This is the probe for whether
+// KMS capture can read the CURRENT scanout fb with no tearing and no
+// one-frame lag (i.e. drop the one-behind workaround).
+const DMA_BUF_BASE: u64 = 'b' as u64;
+const fn iowr_buf(nr: u16, size: usize) -> u64 {
+    (3 << 30) | ((size as u64) << 16) | (DMA_BUF_BASE << 8) | nr as u64
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct DmaBufExportSyncFile {
+    flags: u32,
+    fd: i32,
+}
+
+const DMA_BUF_SYNC_READ: u32 = 1 << 0;
+const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: u64 =
+    iowr_buf(2, std::mem::size_of::<DmaBufExportSyncFile>());
+
 // DRM_FORMAT_MOD_INVALID = fourcc_mod_code(NONE, 0x00ffffff...); EGL refuses
 // it, and it means "driver gave no real modifier" — treat as linear.
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
@@ -484,6 +506,108 @@ fn import_fb(card: &OwnedFd, fb_id: u32) -> Result<DmabufScanout> {
     })
 }
 
+/// Export the dma-buf's read-side reservation fence as a sync_file fd. Waiting
+/// on it (`poll`) before reading means the producer finished writing.
+fn export_sync_file(dmabuf_fd: i32) -> Result<OwnedFd> {
+    let mut a = DmaBufExportSyncFile {
+        flags: DMA_BUF_SYNC_READ,
+        fd: -1,
+    };
+    ioctl(
+        dmabuf_fd,
+        DMA_BUF_IOCTL_EXPORT_SYNC_FILE,
+        &mut a as *mut _ as *mut _,
+    )
+    .context("DMA_BUF_IOCTL_EXPORT_SYNC_FILE")?;
+    if a.fd < 0 {
+        bail!("DMA_BUF_IOCTL_EXPORT_SYNC_FILE returned fd {}", a.fd);
+    }
+    // SAFETY: the kernel returned a fresh fd we own
+    Ok(unsafe { OwnedFd::from_raw_fd(a.fd) })
+}
+
+/// A sync_file is signaled once `poll(POLLIN)` reports readable.
+fn sync_file_signaled(fd: i32) -> bool {
+    let mut p = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let r = unsafe { libc::poll(&mut p, 1, 0) };
+    r > 0 && (p.revents & libc::POLLIN) != 0
+}
+
+/// Diagnostic: for every new scanout, export the dma-buf reservation fence and
+/// report whether it is already signaled. If the fence is frequently *pending*
+/// at commit, KMS capture can `poll` it before reading and thus use the
+/// CURRENT fb — no tearing and no one-frame lag (the one-behind workaround
+/// becomes unnecessary). Read-only; run under sudo and interact with the
+/// desktop (move the mouse / type) so there is GPU work to fence.
+pub fn sync_probe(card_pref: Option<&str>) -> Result<()> {
+    eprintln!(
+        "[syncprobe] opening card {}",
+        card_pref.unwrap_or("(probe /dev/dri/card0..8)")
+    );
+    let (card, target) = open_card(card_pref)?;
+    eprintln!("[syncprobe] target: {target:?}; move the mouse / type to exercise it");
+    let fdi = card.as_raw_fd();
+    let mut last_fb = 0u32;
+    let mut commits = 0u64;
+    let mut pending = 0u64;
+    let mut max_wait_us = 0u64;
+    let mut exported_ok = 0u64;
+    let mut export_err = 0u64;
+    let started = std::time::Instant::now();
+    loop {
+        let fb = match target {
+            Target::Crtc(id) => get_crtc(fdi, id)?.fb_id,
+            Target::Plane(id) => get_plane(fdi, id)?.fb_id,
+        };
+        if fb == 0 || fb == last_fb {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            continue;
+        }
+        last_fb = fb;
+        let d = import_fb(&card, fb)?;
+        let dmabuf_fd = d.fds[0].as_raw_fd();
+        match export_sync_file(dmabuf_fd) {
+            Ok(sf) => {
+                exported_ok += 1;
+                commits += 1;
+                if sync_file_signaled(sf.as_raw_fd()) {
+                    eprintln!("[syncprobe] fb {fb}: reservation fence already signaled");
+                } else {
+                    pending += 1;
+                    let t0 = std::time::Instant::now();
+                    let mut p = libc::pollfd {
+                        fd: sf.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let r = unsafe { libc::poll(&mut p, 1, 100) };
+                    let waited = t0.elapsed().as_micros() as u64;
+                    max_wait_us = max_wait_us.max(waited);
+                    eprintln!(
+                        "[syncprobe] fb {fb}: fence PENDING at commit; signaled after {waited} us (poll={r})"
+                    );
+                }
+            }
+            Err(e) => {
+                export_err += 1;
+                eprintln!("[syncprobe] fb {fb}: EXPORT_SYNC_FILE failed: {e:#}");
+            }
+        }
+        if commits > 0 && commits % 60 == 0 {
+            eprintln!(
+                "[syncprobe] {commits} commits, {pending} pending-at-commit ({:.1}%), max wait {max_wait_us} us, export ok/err {exported_ok}/{export_err}, {:.1} s",
+                100.0 * pending as f64 / commits as f64,
+                started.elapsed().as_secs_f64()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 /// Settle window: once the current fb has been unchanged this long, flips have
 /// stopped and it is certainly fully rendered, so it is safe to capture it.
 const SETTLE_MS: u64 = 20;
@@ -688,6 +812,9 @@ mod tests {
         assert_eq!(DRM_IOCTL_MODE_GETFB2, 0xC06864CE);
         assert_eq!(DRM_IOCTL_PRIME_HANDLE_TO_FD, 0xC00C642D);
         assert_eq!(DRM_IOCTL_GEM_CLOSE, 0x40086409); // _IOW, dir=1
+        // dma-buf fence export: _IOWR('b', 2, struct {u32; s32}) = dir3, size8
+        assert_eq!(DMA_BUF_IOCTL_EXPORT_SYNC_FILE, 0xC0086202);
+        assert_eq!(std::mem::size_of::<DmaBufExportSyncFile>(), 8);
     }
 
     #[test]
