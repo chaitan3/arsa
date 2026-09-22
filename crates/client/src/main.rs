@@ -186,6 +186,15 @@ fn main() -> Result<()> {
             }
         }
         if let Some((p, win)) = presenter.as_mut() {
+            // Dispatch Wayland events (input callbacks, configure) BEFORE the
+            // blocking present, so a keystroke is handed to the input thread
+            // without waiting for a swap; the input thread does the socket send.
+            p.pump(1)?;
+            // apply compositor-driven buffer resizes (fullscreen toggles,
+            // fractional-scale changes) before the next frame is drawn
+            if let Some((w, h)) = p.take_resize() {
+                win.resize(w, h);
+            }
             // presenter mode: drain RDMA completions, upload+present, drain
             // the compositor. Bytes are never CPU-touched: the NIC wrote the
             // slot, the GPU reads it through the upload pointer. Credits
@@ -261,12 +270,6 @@ fn main() -> Result<()> {
             }
             // forward queued user-input events to the server
             // (input has its own thread + connection now — see input_thread)
-            p.pump(1)?; // short wait: bounds frame latency at ~1ms
-            // apply compositor-driven buffer resizes (fullscreen toggles,
-            // fractional-scale changes) before the next frame is drawn
-            if let Some((w, h)) = p.take_resize() {
-                win.resize(w, h);
-            }
             if p.closed() {
                 eprintln!("[client] window closed, ending");
                 break;
