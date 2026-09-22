@@ -11,7 +11,13 @@ pub mod gamepad;
 pub mod keymap;
 
 pub const MAGIC: u32 = 0x5244_4453; // "RDDS"
-pub const VERSION: u32 = 7; // v7: gamepad (InputEvent::Gamepad* + server→client Message::Rumble)
+pub const VERSION: u32 = 8; // v8: routing tags, session nonce, per-frame meta generation
+
+/// First byte of every connection, so the server routes by an explicit tag
+/// rather than by guessing protocol bytes. Audio uses
+/// `rdma_display_audio::wire::TAG_AUDIO` (0x02); control and input are here.
+pub const TAG_CONTROL: u8 = 0x01;
+pub const TAG_INPUT: u8 = 0x03;
 
 /// Wall-clock microseconds since the unix epoch. Cross-host comparable
 /// (that is the point): per-frame server stamps and ping-pong clock-sync
@@ -71,6 +77,10 @@ pub struct FrameStamp {
     pub blit_us: u64,
     pub read_us: u64,
     pub fin_us: u64,
+    /// which `DisplayMeta` generation this frame was produced with (see
+    /// `Message::Meta`). Mid-session meta changes are not yet negotiated, so
+    /// this is 0 today; it makes the frame↔meta association explicit.
+    pub meta_gen: u32,
 }
 
 /// Materializer stage times for one frame (µs, server-local wall clock,
@@ -98,10 +108,14 @@ impl MatTimes {
 pub struct Hello {
     pub magic: u32,
     pub version: u32,
+    /// Session nonce. The client sends 0; the server replies with a random
+    /// value that the client must present on its input connection so a stale
+    /// input socket can't feed a later session.
+    pub nonce: u64,
 }
 
 /// Display format metadata, sent by the server for the current scanout.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisplayMeta {
     pub width: u32,
     pub height: u32,
@@ -111,6 +125,9 @@ pub struct DisplayMeta {
     pub y0_top: bool,
     /// total bytes of one full frame (stride * height for single-plane formats)
     pub frame_bytes: u32,
+    /// generation: bumped whenever the format changes, so a frame's
+    /// [`FrameStamp::meta_gen`] identifies which meta produced it.
+    pub gen: u32,
 }
 
 /// One client receive slot the server may RDMA-WRITE into.
@@ -269,16 +286,17 @@ pub fn send_msg<T: Write>(io: &mut T, msg: &Message) -> std::io::Result<()> {
         Message::Hello(h) => (
             MsgType::Hello as u32,
             {
-                let mut v = Vec::with_capacity(8);
+                let mut v = Vec::with_capacity(16);
                 v.extend_from_slice(&h.magic.to_le_bytes());
                 v.extend_from_slice(&h.version.to_le_bytes());
+                v.extend_from_slice(&h.nonce.to_le_bytes());
                 v
             },
         ),
         Message::Meta(m) => (
             MsgType::Meta as u32,
             {
-                let mut v = Vec::with_capacity(29);
+                let mut v = Vec::with_capacity(33);
                 v.extend_from_slice(&m.width.to_le_bytes());
                 v.extend_from_slice(&m.height.to_le_bytes());
                 v.extend_from_slice(&m.stride.to_le_bytes());
@@ -286,6 +304,7 @@ pub fn send_msg<T: Write>(io: &mut T, msg: &Message) -> std::io::Result<()> {
                 v.extend_from_slice(&m.modifier.to_le_bytes());
                 v.push(m.y0_top as u8);
                 v.extend_from_slice(&m.frame_bytes.to_le_bytes());
+                v.extend_from_slice(&m.gen.to_le_bytes());
                 v
             },
         ),
@@ -310,7 +329,7 @@ pub fn send_msg<T: Write>(io: &mut T, msg: &Message) -> std::io::Result<()> {
         Message::Stamp(s) => (
             MsgType::Stamp as u32,
             {
-                let mut v = Vec::with_capacity(80);
+                let mut v = Vec::with_capacity(84);
                 v.extend_from_slice(&s.seq.to_le_bytes());
                 v.extend_from_slice(&s.t0.to_le_bytes());
                 v.extend_from_slice(&s.t0d.to_le_bytes());
@@ -321,6 +340,7 @@ pub fn send_msg<T: Write>(io: &mut T, msg: &Message) -> std::io::Result<()> {
                 v.extend_from_slice(&s.blit_us.to_le_bytes());
                 v.extend_from_slice(&s.read_us.to_le_bytes());
                 v.extend_from_slice(&s.fin_us.to_le_bytes());
+                v.extend_from_slice(&s.meta_gen.to_le_bytes());
                 v
             },
         ),
@@ -394,6 +414,18 @@ impl<T: Read + Write> Conn<T> {
             t if t == MsgType::Hello as u32 => Message::Hello(Hello {
                 magic: u32_at(&payload, 0)?,
                 version: u32_at(&payload, 4)?,
+                nonce: u64::from_le_bytes(
+                    payload
+                        .get(8..16)
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "short hello payload",
+                            )
+                        })?
+                        .try_into()
+                        .unwrap(),
+                ),
             }),
             t if t == MsgType::Meta as u32 => {
                 let width = u32_at(&payload, 0)?;
@@ -403,6 +435,7 @@ impl<T: Read + Write> Conn<T> {
                 let modifier = u64::from_le_bytes(payload[16..24].try_into().unwrap());
                 let y0_top = payload[24] != 0;
                 let frame_bytes = u32_at(&payload, 25)?;
+                let gen = u32_at(&payload, 29)?;
                 Message::Meta(DisplayMeta {
                     width,
                     height,
@@ -411,6 +444,7 @@ impl<T: Read + Write> Conn<T> {
                     modifier,
                     y0_top,
                     frame_bytes,
+                    gen,
                 })
             }
             t if t == MsgType::QpEndpoint as u32 => {
@@ -448,7 +482,7 @@ impl<T: Read + Write> Conn<T> {
             t if t == MsgType::Bye as u32 => Message::Bye(u32_at(&payload, 0)?),
             t if t == MsgType::Input as u32 => Message::Input(InputEvent::decode(&payload)?),
             t if t == MsgType::Stamp as u32 => {
-                if payload.len() < 80 {
+                if payload.len() < 84 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "short stamp payload",
@@ -465,6 +499,7 @@ impl<T: Read + Write> Conn<T> {
                     blit_us: u64::from_le_bytes(payload[56..64].try_into().unwrap()),
                     read_us: u64::from_le_bytes(payload[64..72].try_into().unwrap()),
                     fin_us: u64::from_le_bytes(payload[72..80].try_into().unwrap()),
+                    meta_gen: u32::from_le_bytes(payload[80..84].try_into().unwrap()),
                 })
             }
             t if t == MsgType::Ping as u32 => {
@@ -508,6 +543,16 @@ mod tests {
     #[test]
     fn stamp_ping_pong_roundtrip() {
         let msgs = [
+            Message::Meta(DisplayMeta {
+                width: 3840,
+                height: 2160,
+                stride: 15360,
+                fourcc: 0x3432_5258,
+                modifier: 0x0300_0000_0060_6014,
+                y0_top: false,
+                frame_bytes: 3840 * 4 * 2160,
+                gen: 2,
+            }),
             Message::Stamp(FrameStamp {
                 seq: 0x00ff_ffff,
                 t0: 1_700_000_000_000_123,
@@ -519,6 +564,7 @@ mod tests {
                 blit_us: 980,
                 read_us: 11_120,
                 fin_us: 680,
+                meta_gen: 2,
             }),
             Message::Ping(1_700_000_000_003_111),
             Message::Pong(1_700_000_000_003_111, 1_700_000_000_003_500),

@@ -76,8 +76,14 @@ fn main() -> Result<()> {
         .next()
         .with_context(|| format!("bad --server {server:?}"))?;
     let stream = TcpStream::connect(addr).with_context(|| format!("connect {addr}"))?;
-    // input events are latency-sensitive; the control channel must not batch
+    // control channel must not batch, and it must identify itself with the
+    // routing tag before the RDMA handshake
     stream.set_nodelay(true)?;
+    {
+        use std::io::Write as _;
+        (&stream).write_all(&[rdma_display_proto::TAG_CONTROL])?;
+        (&stream).flush()?;
+    }
     eprintln!("connected to {server}");
 
     let ctx = rdma_display_rdma::open_device(device.as_deref())?;
@@ -134,6 +140,17 @@ fn main() -> Result<()> {
         }
         other => bail!("--output must be none|egl, got {other:?}"),
     };
+
+    // input runs on its own thread + TCP connection (tagged `TAG_INPUT` plus
+    // the session nonce), so a present or a control burst can never delay a
+    // keystroke. Audio does the same on its own connection (tag 0x02).
+    {
+        let nonce = link.session_nonce;
+        std::thread::Builder::new()
+            .name("input".into())
+            .spawn(move || input_thread(addr, nonce, input_rx))
+            .context("spawn input thread")?;
+    }
 
     // --metrics collector: consumes server Stamps + Pongs via the control
     // reader, samples t3/t4/t5 around the GL calls, pings every PING_SECS
@@ -239,9 +256,7 @@ fn main() -> Result<()> {
                 }
             }
             // forward queued user-input events to the server
-            while let Ok(ev) = input_rx.try_recv() {
-                link.send_input(ev)?;
-            }
+            // (input has its own thread + connection now — see input_thread)
             p.pump(1)?; // short wait: bounds frame latency at ~1ms
             // apply compositor-driven buffer resizes (fullscreen toggles,
             // fractional-scale changes) before the next frame is drawn
@@ -311,6 +326,54 @@ fn main() -> Result<()> {
     }
     eprintln!("done: {} frames in {:?}", frames, started.elapsed());
     Ok(())
+}
+
+/// Input sender thread: owns its own control-port connection (routing tag
+/// `TAG_INPUT` + session nonce) and drains the shared input channel into it.
+/// This keeps user input off both the video present loop and the control
+/// socket. Reconnects with backoff on transient failures.
+fn input_thread(
+    addr: std::net::SocketAddr,
+    nonce: u64,
+    rx: std::sync::mpsc::Receiver<rdma_display_proto::InputEvent>,
+) {
+    use std::io::Write as _;
+    let mut backoff = std::time::Duration::from_millis(200);
+    loop {
+        let sock = match TcpStream::connect(addr) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[input] connect {addr} failed: {e}");
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+                continue;
+            }
+        };
+        let _ = sock.set_nodelay(true);
+        if (&sock).write_all(&[rdma_display_proto::TAG_INPUT]).is_err()
+            || (&sock).write_all(&nonce.to_le_bytes()).is_err()
+        {
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+            continue;
+        }
+        eprintln!("[input] connected ({addr})");
+        backoff = std::time::Duration::from_millis(200);
+        let mut conn = Conn::new(sock);
+        loop {
+            match rx.recv() {
+                Ok(ev) => {
+                    if conn.send(&rdma_display_proto::Message::Input(ev)).is_err() {
+                        eprintln!("[input] send failed; reconnecting");
+                        break;
+                    }
+                }
+                Err(_) => return, // presenter gone: stop the thread
+            }
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
+    }
 }
 
 fn route_control(

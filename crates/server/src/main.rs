@@ -124,17 +124,28 @@ fn run_testcard_server(
         modifier: 0,
         y0_top: false,
         frame_bytes: W * 4 * H,
+        gen: 0,
     };
     let listener = TcpListener::bind(listen)?;
     eprintln!("listening on {listen}, mode=testcard");
     for stream in listener.incoming() {
-        let stream = stream?;
+        let mut stream = stream?;
         let _ = stream.set_nodelay(true);
-        // tag routing (testcard has no audio capture): an audio-tagged
-        // connection is dropped; control proceeds as usual
-        let mut probe = [0u8; 1];
-        if stream.peek(&mut probe).map_or(false, |n| n == 1 && probe[0] == rdma_display_audio::wire::TAG_AUDIO) {
+        // explicit first-byte tag routing; a short timeout keeps a silent
+        // connection from stalling the loop
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+        let mut tag = [0u8; 1];
+        let tag_ok = std::io::Read::read_exact(&mut stream, &mut tag).is_ok();
+        let _ = stream.set_read_timeout(None);
+        if !tag_ok {
+            continue;
+        }
+        if tag[0] == rdma_display_audio::wire::TAG_AUDIO {
             eprintln!("[server] audio connection in testcard mode: dropped");
+            continue;
+        }
+        if tag[0] == rdma_display_proto::TAG_INPUT {
+            eprintln!("[server] input connection in testcard mode: dropped");
             continue;
         }
         eprintln!("client connected: {}", stream.peer_addr()?);
@@ -154,6 +165,7 @@ fn run_testcard_server(
             input_tx,
             None,
             &rumble_hub,
+            rdma_display_rdma::random_nonce(),
         )?;
         eprintln!("session up: {slots} slots, {} frame bytes", link.frame_bytes());
         run_testcard(&mut link, fps)?;
@@ -332,6 +344,9 @@ fn run_capture(
     // format of the last scanout we failed to import (skip-log dedup; u32::MAX
     // = "none"), so a flipping unsupported buffer logs once, not per frame
     let mut last_skipped_fourcc: u32 = u32::MAX;
+    // input-connection session nonce (0 = no live session); set on control
+    // accept and cleared when the session ends
+    let session_nonce = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let started = std::time::Instant::now();
 
     // pipelined (PBO staging) state: frames issued to the materializer whose
@@ -429,14 +444,17 @@ fn run_capture(
         // 3. accept new connections and route by tag byte (audio uses a
         // SECOND connection to the same port; the control connection is
         // byte-compatible as before)
-        if let Ok((stream, addr)) = listener.accept() {
+        if let Ok((mut stream, addr)) = listener.accept() {
             let _ = stream.set_nodelay(true);
-            let mut probe = [0u8; 1];
-            let tag = stream
-                .peek(&mut probe)
-                .map(|n| if n == 1 { probe[0] } else { 0 })
-                .unwrap_or(0);
-            if tag == rdma_display_audio::wire::TAG_AUDIO {
+            // explicit first-byte routing tag (control/input/audio); a short
+            // timeout keeps a silent connection from stalling the capture loop
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let mut tag = [0u8; 1];
+            let tag_ok = std::io::Read::read_exact(&mut stream, &mut tag).is_ok();
+            let _ = stream.set_read_timeout(None);
+            if !tag_ok {
+                eprintln!("[server] connection with no routing tag dropped ({addr})");
+            } else if tag[0] == rdma_display_audio::wire::TAG_AUDIO {
                 match audio_mbox.as_ref() {
                     Some(mbox) => {
                         if audio_busy
@@ -462,9 +480,19 @@ fn run_capture(
                         eprintln!("[server] audio connection but --audio is off: dropped ({addr})");
                     }
                 }
+            } else if tag[0] == rdma_display_proto::TAG_INPUT {
+                // input has its own connection + thread, independent of the
+                // video/control path; the nonce binds it to the live session
+                let nonce_cell = session_nonce.clone();
+                let input_tx = input_tx.clone();
+                let _ = std::thread::Builder::new()
+                    .name("input-reader".into())
+                    .spawn(move || serve_input(stream, nonce_cell, input_tx, addr));
             } else if session.is_none() {
                 if let Some(meta) = pending_meta.clone() {
                     eprintln!("client connected: {}", stream.peer_addr()?);
+                    let nonce = rdma_display_rdma::random_nonce();
+                    session_nonce.store(nonce, std::sync::atomic::Ordering::SeqCst);
                     // zero-copy staging (PBO readback): bind the materializer's
                     // persistent-mapped PBOs as the staging slots; None = fall
                     // back to verbs-allocated slots + direct readback
@@ -490,6 +518,7 @@ fn run_capture(
                         input_tx.clone(),
                         external.as_deref(),
                         &rumble_hub,
+                        nonce,
                     ) {
                         Ok(link) => {
                             eprintln!("session up: {slots} slots, {} frame bytes", link.frame_bytes());
@@ -502,7 +531,10 @@ fn run_capture(
                             pipelined = external.is_some();
                             session = Some(link);
                         }
-                        Err(e) => eprintln!("[server] session setup failed: {e:#}"),
+                        Err(e) => {
+                            eprintln!("[server] session setup failed: {e:#}");
+                            session_nonce.store(0, std::sync::atomic::Ordering::SeqCst);
+                        }
                     }
                 }
             } else {
@@ -603,6 +635,87 @@ fn run_capture(
     }
 }
 
+/// Input-connection worker: validate the session nonce, forward input events
+/// to the injection sink, and release everything the client held when the
+/// socket dies — a network blip must never leave a key stuck down.
+fn serve_input(
+    mut stream: std::net::TcpStream,
+    nonce_cell: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    input_tx: mpsc::Sender<rdma_display_proto::InputEvent>,
+    addr: std::net::SocketAddr,
+) {
+    let mut nb = [0u8; 8];
+    if std::io::Read::read_exact(&mut stream, &mut nb).is_err() {
+        return;
+    }
+    let nonce = u64::from_le_bytes(nb);
+    let expect = nonce_cell.load(std::sync::atomic::Ordering::SeqCst);
+    if expect == 0 || nonce != expect {
+        eprintln!("[input] rejected input connection with stale/invalid nonce ({addr})");
+        return;
+    }
+    eprintln!("[input] client input stream connected ({addr})");
+    let mut conn = Conn::new(stream);
+    let mut keys: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut btns: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut gp_btns: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    let mut gp_axes: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    loop {
+        use rdma_display_proto::InputEvent as I;
+        match conn.recv() {
+            Ok(rdma_display_proto::Message::Input(ev)) => {
+                match ev {
+                    I::Key { code, down } => {
+                        if down {
+                            keys.insert(code);
+                        } else {
+                            keys.remove(&code);
+                        }
+                    }
+                    I::Btn { button, down } => {
+                        if down {
+                            btns.insert(button);
+                        } else {
+                            btns.remove(&button);
+                        }
+                    }
+                    I::GamepadBtn { slot, code, down } => {
+                        if down {
+                            gp_btns.insert((slot, code));
+                        } else {
+                            gp_btns.remove(&(slot, code));
+                        }
+                    }
+                    I::GamepadAxis { slot, code, .. } => {
+                        gp_axes.insert((slot, code));
+                    }
+                    I::Abs { .. } | I::Rel { .. } => {}
+                }
+                if input_tx.send(ev).is_err() {
+                    break;
+                }
+            }
+            Ok(rdma_display_proto::Message::Bye(_)) => break,
+            Ok(other) => eprintln!("[input] unexpected message {other:?}"),
+            Err(_) => break,
+        }
+    }
+    use rdma_display_proto::InputEvent as I;
+    for code in keys {
+        let _ = input_tx.send(I::Key { code, down: false });
+    }
+    for button in btns {
+        let _ = input_tx.send(I::Btn { button, down: false });
+    }
+    for (slot, code) in gp_btns {
+        let _ = input_tx.send(I::GamepadBtn { slot, code, down: false });
+    }
+    for (slot, code) in gp_axes {
+        let _ = input_tx.send(I::GamepadAxis { slot, code, value: 0 });
+    }
+    eprintln!("[input] client input stream ended ({addr}); released held input");
+}
+
 /// Latch one capture event into materializer/session state. Shared by the
 /// blocking wait and the backlog drain (newest frame event wins for t0).
 #[allow(clippy::too_many_arguments)]
@@ -688,6 +801,7 @@ fn handle_capture_event(
 }
 
 /// DisplayMeta for materialized (linear) output: fourcc XR24, no modifier.
+/// `gen` is assigned by the sender when a new generation is pushed.
 fn meta_linear(fmt: &FrameFormat) -> DisplayMeta {
     DisplayMeta {
         width: fmt.width,
@@ -697,6 +811,7 @@ fn meta_linear(fmt: &FrameFormat) -> DisplayMeta {
         modifier: 0,
         y0_top: false,
         frame_bytes: fmt.width * 4 * fmt.height,
+        gen: 0,
     }
 }
 
@@ -710,5 +825,6 @@ fn meta_plain(fmt: &FrameFormat) -> DisplayMeta {
         modifier: 0,
         y0_top: false,
         frame_bytes: fmt.frame_bytes(),
+        gen: 0,
     }
 }

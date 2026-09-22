@@ -107,10 +107,23 @@ fn create_prepared_qp(
     Ok((prepared, send_cq, recv_cq))
 }
 
-fn hello_exchange<T: std::io::Read + std::io::Write>(conn: &mut Conn<T>) -> Result<()> {
+/// A per-session nonce (LAN-grade, not cryptographic): the server hands it to
+/// the client in the Hello reply; the client presents it on its input
+/// connection so a stale input socket can't feed a later session.
+pub fn random_nonce() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    proto::unix_now_us().hash(&mut h);
+    std::process::id().hash(&mut h);
+    (&h as *const _ as usize).hash(&mut h);
+    h.finish()
+}
+
+fn hello_exchange<T: std::io::Read + std::io::Write>(conn: &mut Conn<T>, our_nonce: u64) -> Result<u64> {
     conn.send(&Message::Hello(proto::Hello {
         magic: proto::MAGIC,
         version: proto::VERSION,
+        nonce: our_nonce,
     }))?;
     match conn.recv()? {
         Message::Hello(h) if h.magic == proto::MAGIC => {
@@ -121,7 +134,7 @@ fn hello_exchange<T: std::io::Read + std::io::Write>(conn: &mut Conn<T>) -> Resu
                     proto::VERSION
                 );
             }
-            Ok(())
+            Ok(h.nonce)
         }
         other => Err(anyhow!("expected Hello, got {other:?}")),
     }
@@ -218,6 +231,9 @@ pub struct ServerLink {
     remote: Vec<RemoteMemorySlice>,
     slot_free: Vec<bool>,
     seq: u64,
+    /// current `DisplayMeta` generation, stamped into every FrameStamp;
+    /// `send_meta` bumps it and pushes the new meta to the control reader
+    meta_gen: u32,
     /// cloned control stream: the send path writes per-frame `Stamp`s here
     /// while the control-reader thread owns the receive side
     stamp_w: Option<TcpStream>,
@@ -235,6 +251,7 @@ impl ServerLink {
         input_tx: mpsc::Sender<proto::InputEvent>,
         external: Option<&[(*mut u8, usize)]>,
         rumble: &proto::gamepad::RumbleHub,
+        session_nonce: u64,
     ) -> Result<ServerLink> {
         // split the stream: reader thread gets the receive half, the frame
         // send path keeps a write-only clone for per-frame Stamps
@@ -242,7 +259,7 @@ impl ServerLink {
         let stamp_w = stream.try_clone().context("clone stream for stamps")?;
         let rumble_w = stream.try_clone().context("clone stream for rumble")?;
         let mut conn = Conn::new(stream);
-        hello_exchange(&mut conn)?;
+        let _ = hello_exchange(&mut conn, session_nonce)?;
         let (qp, send_cq, _recv_cq) = endpoint_exchange(&mut conn, ctx, pd)?;
 
         let mut stage: Vec<StagingSlot> = Vec::with_capacity(slots);
@@ -395,6 +412,7 @@ impl ServerLink {
             remote,
             slot_free: vec![true; n],
             seq: 0,
+            meta_gen: meta.gen,
             stamp_w: Some(stamp_w),
         })
     }
@@ -564,6 +582,7 @@ impl ServerLink {
                 blit_us: mat_times.blit_us,
                 read_us: mat_times.read_us,
                 fin_us: mat_times.fin_us,
+                meta_gen: self.meta_gen,
             };
             if let Err(e) = proto::send_msg(w, &Message::Stamp(s)) {
                 eprintln!("[rdma] stamp send failed: {e}");
@@ -630,6 +649,7 @@ impl ServerLink {
                 blit_us: mat_times.blit_us,
                 read_us: mat_times.read_us,
                 fin_us: mat_times.fin_us,
+                meta_gen: self.meta_gen,
             };
             if let Err(e) = proto::send_msg(w, &Message::Stamp(s)) {
                 eprintln!("[rdma] stamp send failed: {e}");
@@ -637,6 +657,24 @@ impl ServerLink {
             }
         }
         Ok(Some(seq))
+    }
+
+    /// Push a new `DisplayMeta` to the client (generation bumped by the
+    /// caller) and use it for subsequent FrameStamps. Returns false when the
+    /// control stream is gone.
+    pub fn send_meta(&mut self, meta: &proto::DisplayMeta) -> bool {
+        match self.stamp_w.as_mut() {
+            Some(w) => {
+                if let Err(e) = proto::send_msg(w, &Message::Meta(meta.clone())) {
+                    eprintln!("[rdma] meta send failed: {e}");
+                    self.stamp_w = None;
+                    return false;
+                }
+                self.meta_gen = meta.gen;
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn frame_bytes(&self) -> usize {
@@ -729,6 +767,8 @@ impl Slot {
 pub struct ClientLink {
     pub conn: Conn<TcpStream>,
     pub meta: DisplayMeta,
+    /// session nonce the server assigned; presented on the input connection
+    pub session_nonce: u64,
     qp: QueuePair<Rc>,
     recv_cq: CompletionQueue,
     slots: Vec<Slot>,
@@ -760,7 +800,7 @@ impl ClientLink {
         let stream = conn.into_inner();
         let reader_stream = stream.try_clone().context("clone stream for control reader")?;
         let mut conn = Conn::new(stream);
-        hello_exchange(&mut conn)?;
+        let session_nonce = hello_exchange(&mut conn, 0)?;
         let (qp, _send_cq, recv_cq) = endpoint_exchange(&mut conn, ctx, pd)?;
 
         let meta = match conn.recv()? {
@@ -812,6 +852,7 @@ impl ClientLink {
         let mut link = ClientLink {
             conn,
             meta,
+            session_nonce,
             qp,
             recv_cq,
             slots: slots_v,
