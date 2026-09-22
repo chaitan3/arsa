@@ -173,11 +173,22 @@ fn main() -> Result<()> {
             // the compositor. Bytes are never CPU-touched: the NIC wrote the
             // slot, the GPU reads it through the upload pointer. Credits
             // fire at upload time (glTexImage2D consumed the pointer).
+            // Drain every ready frame but present only the NEWEST: the display
+            // should show the latest content, not replay a backlog (a FIFO
+            // present adds one display interval of latency per queued frame).
+            // Superseded frames are re-armed and credited immediately without
+            // uploading them.
+            let mut newest: Option<(u64, usize)> = None;
             while let Some((seq, slot)) = link.try_next_frame()? {
-                let t3 = rdma_display_proto::unix_now_us();
                 link.rearm_slot(slot)?;
+                if let Some((_, old)) = newest.replace((seq, slot)) {
+                    link.credit_slot(old)?; // superseded: never presented
+                }
+            }
+            if let Some((seq, slot)) = newest {
+                let t3 = rdma_display_proto::unix_now_us();
                 // refresh the overlay raster at the metrics cadence only;
-                // every frame still draws the last one (no flicker)
+                // every presented frame still draws the last one (no flicker)
                 let overlay = match metrics.as_mut() {
                     Some(m) => {
                         if last_overlay.elapsed().as_millis() as u64
