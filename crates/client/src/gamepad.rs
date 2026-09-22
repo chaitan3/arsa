@@ -386,6 +386,20 @@ fn reader_loop(
             };
             let (ty, code) = (e.ty as u32, e.code as u32);
             if ty == EV_KEY && proto::gamepad::is_button(code) {
+                // face buttons are swapped north↔west BY DEFAULT: the kernel's
+                // BTN_X/BTN_Y macros are name-based aliases (BTN_X = BTN_NORTH
+                // = the top button, BTN_Y = BTN_WEST = the left button), and
+                // games that map their face buttons through those aliases
+                // expect top = Xbox X, left = Xbox Y — the reverse of the
+                // physical-position codes the driver reports. Swapping here
+                // makes the physical top button emit BTN_WEST and the left
+                // one BTN_NORTH, so both alias-mapped and position-based
+                // games see the Xbox-labeled buttons where their prompts say.
+                let code = match code {
+                    proto::gamepad::BTN_NORTH => proto::gamepad::BTN_WEST,
+                    proto::gamepad::BTN_WEST => proto::gamepad::BTN_NORTH,
+                    other => other,
+                };
                 let down = e.value != 0;
                 // forward only on state change (some drivers resend states).
                 // NOTE: HashSet::insert returns true iff the value was NEWLY

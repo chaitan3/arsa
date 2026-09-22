@@ -652,7 +652,9 @@ fn gamepad_loop(
             while let Ok(ev) = rx.try_recv() {
                 let (slot, code, down, axis, value) = match ev {
                     InputEvent::GamepadBtn { slot, code, down } => (slot, code, down, false, 0),
-                    InputEvent::GamepadAxis { slot, code, value } => (slot, code, false, true, value),
+                    InputEvent::GamepadAxis { slot, code, value } => {
+                        (slot, code, false, true, value)
+                    }
                     _ => continue,
                 };
                 let dev = match pads.get_mut(&slot) {
