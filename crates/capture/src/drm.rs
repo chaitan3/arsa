@@ -224,6 +224,39 @@ const DMA_BUF_SYNC_READ: u32 = 1 << 0;
 const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: u64 =
     iowr_buf(2, std::mem::size_of::<DmaBufExportSyncFile>());
 
+// --- sync_file UAPI (include/uapi/linux/sync_file.h) ------------------------
+// SYNC_IOC_FILE_INFO lets us inspect the exported sync_file: the number of
+// fences and, per fence, the driver name and status. This is how we tell a
+// *real* producer fence from the always-signaled **stub** fence the kernel
+// substitutes when there is no fence on the reservation (driver name "stub").
+#[repr(C)]
+#[derive(Default)]
+struct SyncFileInfo {
+    name: [u8; 32],
+    status: i32,
+    flags: u32,
+    num_fences: u32,
+    pad: u32,
+    sync_fence_info: u64,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct SyncFenceInfo {
+    obj_name: [u8; 32],
+    driver_name: [u8; 32],
+    /// 0 = active/pending, 1 = signaled, <0 = error
+    status: i32,
+    flags: u32,
+    timestamp_ns: u64,
+}
+
+const SYNC_MAGIC: u64 = '>' as u64;
+const fn iowr_sync(nr: u16, size: usize) -> u64 {
+    (3 << 30) | ((size as u64) << 16) | (SYNC_MAGIC << 8) | nr as u64
+}
+const SYNC_IOC_FILE_INFO: u64 = iowr_sync(4, std::mem::size_of::<SyncFileInfo>());
+
 // DRM_FORMAT_MOD_INVALID = fourcc_mod_code(NONE, 0x00ffffff...); EGL refuses
 // it, and it means "driver gave no real modifier" — treat as linear.
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
@@ -526,86 +559,241 @@ fn export_sync_file(dmabuf_fd: i32) -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(a.fd) })
 }
 
-/// A sync_file is signaled once `poll(POLLIN)` reports readable.
-fn sync_file_signaled(fd: i32) -> bool {
-    let mut p = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let r = unsafe { libc::poll(&mut p, 1, 0) };
-    r > 0 && (p.revents & libc::POLLIN) != 0
+/// Inspect a sync_file: the first fence's `(driver_name, status)`.
+/// `status`: 0 active/pending, 1 signaled, <0 error. Driver name `"stub"`
+/// means the kernel substituted the always-signaled stub because the
+/// reservation had no writer fence.
+fn sync_file_first_fence(fd: i32) -> Option<(String, i32)> {
+    // call 1: fence count
+    let mut info = SyncFileInfo::default();
+    ioctl(fd, SYNC_IOC_FILE_INFO, &mut info as *mut _ as *mut _).ok()?;
+    let n = info.num_fences as usize;
+    if n == 0 {
+        return None;
+    }
+    // call 2: fence details
+    let mut fences = vec![SyncFenceInfo::default(); n];
+    info.sync_fence_info = fences.as_mut_ptr() as u64;
+    info.num_fences = n as u32;
+    ioctl(fd, SYNC_IOC_FILE_INFO, &mut info as *mut _ as *mut _).ok()?;
+    let n = (info.num_fences as usize).min(fences.len());
+    if n == 0 {
+        return None;
+    }
+    let f = &fences[0];
+    let end = f.driver_name.iter().position(|&c| c == 0).unwrap_or(32);
+    Some((
+        String::from_utf8_lossy(&f.driver_name[..end]).into_owned(),
+        f.status,
+    ))
 }
 
-/// Diagnostic: for every new scanout, export the dma-buf reservation fence and
-/// report whether it is already signaled. If the fence is frequently *pending*
-/// at commit, KMS capture can `poll` it before reading and thus use the
-/// CURRENT fb — no tearing and no one-frame lag (the one-behind workaround
-/// becomes unnecessary). Read-only; run under sudo and interact with the
-/// desktop (move the mouse / type) so there is GPU work to fence.
-pub fn sync_probe(card_pref: Option<&str>) -> Result<()> {
-    eprintln!(
-        "[syncprobe] opening card {}",
-        card_pref.unwrap_or("(probe /dev/dri/card0..8)")
-    );
-    let (card, target) = open_card(card_pref)?;
-    eprintln!("[syncprobe] target: {target:?}; move the mouse / type to exercise it");
+#[derive(Default)]
+struct PhaseStats {
+    commits: u64,
+    /// real producer fences (driver != "stub")
+    real: u64,
+    /// real fences still pending at observation
+    pending: u64,
+    /// real fences already signaled at observation
+    signaled: u64,
+    /// kernel stub fence => no reservation fence exists
+    stub: u64,
+    export_err: u64,
+    waits_us: Vec<u64>,
+}
+
+fn probe_phase(
+    card: &OwnedFd,
+    target: Target,
+    name: &str,
+    dur: std::time::Duration,
+) -> Result<PhaseStats> {
     let fdi = card.as_raw_fd();
     let mut last_fb = 0u32;
-    let mut commits = 0u64;
-    let mut pending = 0u64;
-    let mut max_wait_us = 0u64;
-    let mut exported_ok = 0u64;
-    let mut export_err = 0u64;
+    let mut st = PhaseStats::default();
     let started = std::time::Instant::now();
-    loop {
+    let mut last_report = std::time::Instant::now();
+    while started.elapsed() < dur {
         let fb = match target {
             Target::Crtc(id) => get_crtc(fdi, id)?.fb_id,
             Target::Plane(id) => get_plane(fdi, id)?.fb_id,
         };
         if fb == 0 || fb == last_fb {
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::thread::sleep(std::time::Duration::from_micros(1000));
             continue;
         }
         last_fb = fb;
-        let d = import_fb(&card, fb)?;
-        let dmabuf_fd = d.fds[0].as_raw_fd();
-        match export_sync_file(dmabuf_fd) {
-            Ok(sf) => {
-                exported_ok += 1;
-                commits += 1;
-                if sync_file_signaled(sf.as_raw_fd()) {
-                    eprintln!("[syncprobe] fb {fb}: reservation fence already signaled");
-                } else {
-                    pending += 1;
+        let Ok(d) = import_fb(card, fb) else {
+            std::thread::sleep(std::time::Duration::from_micros(1000));
+            continue;
+        };
+        let Ok(sf) = export_sync_file(d.fds[0].as_raw_fd()) else {
+            st.export_err += 1;
+            continue;
+        };
+        st.commits += 1;
+        match sync_file_first_fence(sf.as_raw_fd()) {
+            Some((drv, status)) if drv != "stub" => {
+                st.real += 1;
+                if status == 0 {
+                    st.pending += 1;
                     let t0 = std::time::Instant::now();
                     let mut p = libc::pollfd {
                         fd: sf.as_raw_fd(),
                         events: libc::POLLIN,
                         revents: 0,
                     };
-                    let r = unsafe { libc::poll(&mut p, 1, 100) };
-                    let waited = t0.elapsed().as_micros() as u64;
-                    max_wait_us = max_wait_us.max(waited);
+                    // bound the wait so a stuck fence can't hang the probe
+                    unsafe { libc::poll(&mut p, 1, 50) };
+                    st.waits_us.push(t0.elapsed().as_micros() as u64);
+                } else {
+                    st.signaled += 1;
+                }
+                if st.real <= 3 {
                     eprintln!(
-                        "[syncprobe] fb {fb}: fence PENDING at commit; signaled after {waited} us (poll={r})"
+                        "[syncprobe] {name}: fb {fb} REAL fence driver='{drv}' status={status} ({})",
+                        if status == 0 { "pending" } else { "signaled" }
                     );
                 }
             }
-            Err(e) => {
-                export_err += 1;
-                eprintln!("[syncprobe] fb {fb}: EXPORT_SYNC_FILE failed: {e:#}");
+            Some((drv, _)) => {
+                st.stub += 1;
+                if st.stub <= 2 {
+                    eprintln!("[syncprobe] {name}: fb {fb} fence driver='{drv}' (no producer fence)");
+                }
             }
+            None => {}
         }
-        if commits > 0 && commits % 60 == 0 {
+        if last_report.elapsed() >= std::time::Duration::from_secs(5) {
+            last_report = std::time::Instant::now();
             eprintln!(
-                "[syncprobe] {commits} commits, {pending} pending-at-commit ({:.1}%), max wait {max_wait_us} us, export ok/err {exported_ok}/{export_err}, {:.1} s",
-                100.0 * pending as f64 / commits as f64,
-                started.elapsed().as_secs_f64()
+                "[syncprobe] {name}: {} commits | real {} (pending {}, signaled {}) | stub {} | export_err {}",
+                st.commits, st.real, st.pending, st.signaled, st.stub, st.export_err
             );
         }
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::thread::sleep(std::time::Duration::from_micros(1000));
     }
+    Ok(st)
+}
+
+/// Self-driving diagnostic. For `idle_secs` it watches the scanout with no
+/// input; for `active_secs` it drives a synthetic uinput mouse in a bounded
+/// circle (real cursor repaints, no physical input device) while sampling the
+/// producer fences. It then prints a verdict: a real reservation fence means
+/// the KMS capture can read the CURRENT fb with no tearing and no one-frame
+/// lag (the one-behind workaround can go); a kernel stub fence means there is
+/// nothing to wait for. Read-only apart from the virtual mouse; run under root.
+pub fn sync_probe(
+    card_pref: Option<&str>,
+    idle_secs: u64,
+    active_secs: u64,
+    inject: bool,
+) -> Result<()> {
+    eprintln!(
+        "[syncprobe] opening card {}",
+        card_pref.unwrap_or("(probe /dev/dri/card0..8)")
+    );
+    let (card, target) = open_card(card_pref)?;
+    eprintln!("[syncprobe] target: {target:?}");
+
+    let move_on = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mover = if inject {
+        let m = move_on.clone();
+        let s = stop.clone();
+        Some(
+            std::thread::Builder::new()
+                .name("syncprobe-mouse".into())
+                .spawn(move || {
+                    let mouse = match crate::input::UinputMouse::open() {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("[syncprobe] synthetic mouse unavailable: {e:#}");
+                            return;
+                        }
+                    };
+                    eprintln!("[syncprobe] synthetic uinput mouse up");
+                    let mut theta = 0.0f64;
+                    while !s.load(std::sync::atomic::Ordering::Relaxed) {
+                        if m.load(std::sync::atomic::Ordering::Relaxed) {
+                            // bounded lissajous: zero-mean velocity, the cursor
+                            // traces a small circle and never runs off-screen
+                            let dx = (16.0 * theta.cos()).round() as i32;
+                            let dy = (16.0 * theta.sin()).round() as i32;
+                            if dx != 0 || dy != 0 {
+                                mouse.move_rel(dx, dy);
+                            }
+                            theta += 0.25;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(8));
+                    }
+                })
+                .context("spawn synthetic mouse")?,
+        )
+    } else {
+        None
+    };
+
+    eprintln!("[syncprobe] phase 1/2: {idle_secs}s idle baseline");
+    let idle = probe_phase(&card, target, "idle", std::time::Duration::from_secs(idle_secs.max(1)))?;
+
+    eprintln!("[syncprobe] phase 2/2: {active_secs}s synthetic mouse movement");
+    move_on.store(true, std::sync::atomic::Ordering::Relaxed);
+    let active =
+        probe_phase(&card, target, "moving", std::time::Duration::from_secs(active_secs.max(1)))?;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(h) = mover {
+        let _ = h.join();
+    }
+
+    let pct = |s: &PhaseStats| {
+        if s.commits == 0 {
+            0.0
+        } else {
+            100.0 * s.pending as f64 / s.commits as f64
+        }
+    };
+    let rate = |s: &PhaseStats, secs: u64| s.commits as f64 / secs.max(1) as f64;
+    let mut waits = active.waits_us.clone();
+    waits.sort_unstable();
+    let p50 = waits.get(waits.len() / 2).copied().unwrap_or(0);
+    let pmax = waits.last().copied().unwrap_or(0);
+
+    eprintln!("[syncprobe] ===== summary =====");
+    eprintln!(
+        "[syncprobe] idle:   {} commits ({:.1}/s), real {} (pending {}), stub {}, export_err {}",
+        idle.commits, rate(&idle, idle_secs), idle.real, idle.pending, idle.stub, idle.export_err
+    );
+    eprintln!(
+        "[syncprobe] moving: {} commits ({:.1}/s), real {} (pending {} = {:.1}%, signaled {}), stub {}, export_err {}",
+        active.commits, rate(&active, active_secs), active.real, active.pending,
+        pct(&active), active.signaled, active.stub, active.export_err
+    );
+    if !waits.is_empty() {
+        eprintln!("[syncprobe] pending-fence wait: p50 {p50} us, max {pmax} us (n={})", waits.len());
+    }
+
+    if active.commits == 0 && idle.commits == 0 {
+        eprintln!("[syncprobe] VERDICT: no primary-plane commits at all.");
+        eprintln!("[syncprobe]   No active compositor scanout, or the screen is static and the cursor is a");
+        eprintln!("[syncprobe]   hardware overlay plane (not part of the captured fb).");
+    } else if active.real == 0 && active.stub > 0 {
+        eprintln!("[syncprobe] VERDICT: NO producer fence on the reservation (kernel stub fence observed).");
+        eprintln!("[syncprobe]   The compositor fences only the KMS commit, not the dma-buf, so there is nothing");
+        eprintln!("[syncprobe]   to wait on. Keep the one-behind, or move to the compositor capture protocol");
+        eprintln!("[syncprobe]   (ext-image-copy-capture), which is synchronized by construction.");
+    } else if active.real > 0 {
+        eprintln!(
+            "[syncprobe] VERDICT: REAL producer fence present ({} of {} commits sampled; pending {:.1}%).",
+            active.real, active.commits, pct(&active)
+        );
+        eprintln!("[syncprobe]   Implement a fence-checked read: export the reservation fence, poll it when pending,");
+        eprintln!("[syncprobe]   then read the CURRENT fb. Tearing-free with NO one-frame lag — drop the one-behind.");
+    } else {
+        eprintln!("[syncprobe] VERDICT: inconclusive (no fences sampled).");
+    }
+    Ok(())
 }
 
 /// Settle window: once the current fb has been unchanged this long, flips have
@@ -815,6 +1003,10 @@ mod tests {
         // dma-buf fence export: _IOWR('b', 2, struct {u32; s32}) = dir3, size8
         assert_eq!(DMA_BUF_IOCTL_EXPORT_SYNC_FILE, 0xC0086202);
         assert_eq!(std::mem::size_of::<DmaBufExportSyncFile>(), 8);
+        // sync_file info: _IOWR('>', 4, struct sync_file_info) = dir3, size56
+        assert_eq!(SYNC_IOC_FILE_INFO, 0xC0383E04);
+        assert_eq!(std::mem::size_of::<SyncFileInfo>(), 56);
+        assert_eq!(std::mem::size_of::<SyncFenceInfo>(), 80);
     }
 
     #[test]

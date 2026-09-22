@@ -471,6 +471,29 @@ fn uinput_pointer_rel() -> Result<UinputDev> {
     d.create()
 }
 
+/// A synthetic relative mouse for diagnostics and self-driving probes (see
+/// `drm::sync_probe`). Create under root, then [`move_rel`](Self::move_rel) to
+/// generate real cursor movement and compositor repaints — no physical input
+/// device needed.
+pub struct UinputMouse {
+    dev: UinputDev,
+}
+
+impl UinputMouse {
+    pub fn open() -> Result<Self> {
+        Ok(Self {
+            dev: uinput_pointer_rel()?,
+        })
+    }
+
+    /// Emit a relative move and commit it with SYN_REPORT.
+    pub fn move_rel(&self, dx: i32, dy: i32) {
+        self.dev.emit(EV_REL, REL_X, dx);
+        self.dev.emit(EV_REL, REL_Y, dy);
+        self.dev.syn();
+    }
+}
+
 /// Absolute pointer (inputtino's create_mouse_abs): INPUT_PROP_POINTER +
 /// buttons + wheel + ABS X/Y over the giant fixed ranges. No REL_X/REL_Y.
 fn uinput_pointer_abs() -> Result<UinputDev> {
