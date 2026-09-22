@@ -35,6 +35,8 @@ pub enum ControlEvent {
     Pong { c0: u64, s1: u64, c2: u64 },
     /// server → client: force-feedback event for the physical controller
     Rumble(proto::gamepad::Rumble),
+    /// server → client: the display meta changed (new generation)
+    Meta(proto::DisplayMeta),
 }
 
 pub mod cuda;
@@ -719,6 +721,11 @@ fn spawn_control_reader(stream: TcpStream) -> mpsc::Receiver<ControlEvent> {
                     }
                     Ok(proto::Message::Rumble(r)) => {
                         if tx.send(ControlEvent::Rumble(r)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(proto::Message::Meta(m)) => {
+                        if tx.send(ControlEvent::Meta(m)).is_err() {
                             break;
                         }
                     }

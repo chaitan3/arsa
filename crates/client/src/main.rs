@@ -243,7 +243,9 @@ fn main() -> Result<()> {
             // sync warm
             if let Some(m) = metrics.as_mut() {
                 while let Some(ev) = link.try_control() {
-                    route_control(ev, rumble_tx.as_ref(), Some(m));
+                    if let Some(meta) = route_control(ev, rumble_tx.as_ref(), Some(m)) {
+                        apply_meta(&mut link, &meta);
+                    }
                 }
                 if m.maybe_ping() {
                     link.send_ping()?;
@@ -252,7 +254,9 @@ fn main() -> Result<()> {
                 // without metrics there is no server→client traffic expected;
                 // still drain so nothing accumulates
                 while let Some(ev) = link.try_control() {
-                    route_control(ev, rumble_tx.as_ref(), None);
+                    if let Some(meta) = route_control(ev, rumble_tx.as_ref(), None) {
+                        apply_meta(&mut link, &meta);
+                    }
                 }
             }
             // forward queued user-input events to the server
@@ -310,7 +314,9 @@ fn main() -> Result<()> {
             );
             if let Some(m) = metrics.as_mut() {
                 while let Some(ev) = link.try_control() {
-                    route_control(ev, rumble_tx.as_ref(), Some(m));
+                    if let Some(meta) = route_control(ev, rumble_tx.as_ref(), Some(m)) {
+                        apply_meta(&mut link, &meta);
+                    }
                 }
                 if m.maybe_ping() {
                     link.send_ping()?;
@@ -380,19 +386,41 @@ fn route_control(
     ev: rdma_display_rdma::ControlEvent,
     rumble_tx: Option<&std::sync::mpsc::Sender<rdma_display_proto::gamepad::Rumble>>,
     metrics: Option<&mut metrics::Metrics>,
-) {
+) -> Option<rdma_display_proto::DisplayMeta> {
     match ev {
         rdma_display_rdma::ControlEvent::Rumble(r) => {
             if let Some(tx) = rumble_tx {
                 let _ = tx.send(r);
             }
+            None
         }
+        // the presenter applies the new meta to the link/window
+        rdma_display_rdma::ControlEvent::Meta(m) => Some(m),
         other => {
             if let Some(m) = metrics {
                 m.on_control(other);
             }
+            None
         }
     }
+}
+
+/// Apply a server-pushed display meta change. Only same-size changes are
+/// applied (slots are sized at handshake); the wire format is always XR24, so
+/// a fourcc/stride change at the same frame size does not affect the upload.
+fn apply_meta(link: &mut rdma_display_rdma::ClientLink, meta: &rdma_display_proto::DisplayMeta) {
+    eprintln!(
+        "[client] display meta gen {} ({}x{} stride {} fourcc {:#010x})",
+        meta.gen, meta.width, meta.height, meta.stride, meta.fourcc
+    );
+    if meta.frame_bytes != link.meta.frame_bytes {
+        eprintln!(
+            "[client] WARNING: frame size changed mid-session ({} -> {} bytes); reconnect to apply",
+            link.meta.frame_bytes, meta.frame_bytes
+        );
+        return;
+    }
+    link.meta = meta.clone();
 }
 
 fn dump_ppm(path: &str, link: &rdma_display_rdma::ClientLink, slot: usize) -> Result<()> {
