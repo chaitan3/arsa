@@ -109,8 +109,12 @@ struct St {
     dbg_window: std::time::Instant,
     /// Ctrl+Alt both held (from wl_keyboard.modifiers) — grab hotkey chord
     mods_ctrl_alt: bool,
-    /// the hotkey's M key release must not be forwarded after a toggle
-    swallow_m_release: bool,
+    /// the M key currently down was swallowed by the grab chord (never
+    /// forwarded), so its release must be swallowed too. Tracked separately
+    /// from `held_keys` because the release arrives after Ctrl/Alt are
+    /// usually already up — it cannot be recognised from the chord state, and
+    /// it must swallow ONLY M, never whatever key is released next.
+    hotkey_m_down: bool,
     /// output scale (120ths; 120 = 1.0) — the compositor's render scale.
     /// The buffer is always the NATIVE guest frame (no resampling, sharp
     /// pixels); the logical window size is native/scale via wp_viewporter.
@@ -154,6 +158,10 @@ struct St {
     /// and focus-loss flushes); KWin repeats keys with state=2
     /// (WL_KEYBOARD_KEY_STATE_REPEATED) which surfaces as WEnum::Raw
     held_keys: std::collections::HashSet<u32>,
+    /// forwarded pointer buttons currently believed held (dbtn values);
+    /// flushed on pointer leave so a constraint break / focus churn while
+    /// dragging cannot leave a button stuck down in the guest
+    held_buttons: std::collections::HashSet<u32>,
     pointer_active: bool,
     last_abs: Option<(u32, u32)>,
     width: u32,
@@ -291,7 +299,7 @@ impl Presenter {
                 dbg_sum: (0.0, 0.0),
                 dbg_window: Instant::now(),
                 mods_ctrl_alt: false,
-                swallow_m_release: false,
+                hotkey_m_down: false,
                 decoration_mgr,
                 decoration,
                 scale120: 120,
@@ -314,6 +322,7 @@ impl Presenter {
                 input_tx,
                 kb_active: false,
                 held_keys: std::collections::HashSet::new(),
+                held_buttons: std::collections::HashSet::new(),
                 pointer_active: false,
                 last_abs: None,
                 width,
@@ -791,6 +800,7 @@ impl Dispatch<WlKeyboard, ()> for St {
             wl_keyboard::Event::Enter { .. } => {
                 state.kb_active = true;
                 state.held_keys.clear();
+                state.hotkey_m_down = false;
                 eprintln!("[wl] kb enter (kb_active=true)");
             }
             wl_keyboard::Event::Leave { .. } => {
@@ -801,6 +811,7 @@ impl Dispatch<WlKeyboard, ()> for St {
                 for code in state.held_keys.drain() {
                     let _ = state.input_tx.send(InputEvent::Key { code, down: false });
                 }
+                state.hotkey_m_down = false;
                 eprintln!("[wl] kb leave (kb_active=false, held keys flushed)");
             }
             wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
@@ -825,24 +836,34 @@ impl Dispatch<WlKeyboard, ()> for St {
                     return;
                 }
                 // grab hotkey: Ctrl+Alt+M toggles relative mouse grab —
-                // client-local, never forwarded to the guest. Toggle only on
-                // the INITIAL press; a repeat must not re-toggle the grab.
-                if key == 0x32 && state.mods_ctrl_alt {
-                    if !released && !state.held_keys.contains(&key) {
-                        if state.pointer_active {
-                            state.set_grab(!state.grabbed, qh);
-                        } else {
-                            eprintln!("[wl] grab: hover the window first (pointer not over it)");
+                // client-local, never forwarded to the guest. Both the press
+                // and the release of the chorded M are swallowed; only the
+                // INITIAL press toggles, so a key repeat (KWin sends state=2,
+                // surfaced as "down") must not re-toggle the grab.
+                if key == 0x32 {
+                    if !released {
+                        if state.mods_ctrl_alt {
+                            if !state.hotkey_m_down {
+                                state.hotkey_m_down = true;
+                                if state.pointer_active {
+                                    state.set_grab(!state.grabbed, qh);
+                                } else {
+                                    eprintln!(
+                                        "[wl] grab: hover the window first (pointer not over it)"
+                                    );
+                                }
+                            }
+                            return; // chorded press/repeat: never forwarded
                         }
-                        state.swallow_m_release = true;
-                        state.held_keys.insert(key);
+                        // plain M: fall through and forward normally
+                    } else if state.hotkey_m_down {
+                        // Release of a swallowed chord press. Ctrl/Alt are
+                        // usually already up by now, so this is recognised
+                        // from the flag alone — and it swallows only M, so
+                        // the modifiers' own releases still reach the guest.
+                        state.hotkey_m_down = false;
+                        return;
                     }
-                    return; // swallow the chord's press AND release
-                }
-                if released && state.swallow_m_release {
-                    // chord released before M itself (ctrl+alt up first)
-                    state.swallow_m_release = false;
-                    return;
                 }
                 // `key` is the Linux evdev keycode (no xkb +8 offset needed
                 // because we never interpret the keymap)
@@ -896,6 +917,13 @@ impl Dispatch<WlPointer, ()> for St {
             wl_pointer::Event::Leave { .. } => {
                 state.pointer_active = false;
                 state.pending_axis = None;
+                // same reasoning as the keyboard flush: if the pointer leaves
+                // mid-press (the compositor can break the locked-pointer
+                // constraint at any moment), the release may never arrive and
+                // the guest would keep dragging a window with no button held
+                for btn in state.held_buttons.drain() {
+                    let _ = state.input_tx.send(InputEvent::Btn { button: btn, down: false });
+                }
                 if state.grabbed {
                     // focus lost while grabbed (alt-tab, other output):
                     // release so the user isn't stuck in relative mode
@@ -948,6 +976,11 @@ impl Dispatch<WlPointer, ()> for St {
                     }
                 };
                 let down = matches!(st, WEnum::Value(ButtonState::Pressed));
+                if down {
+                    state.held_buttons.insert(dbtn);
+                } else {
+                    state.held_buttons.remove(&dbtn);
+                }
                 let _ = state.input_tx.send(InputEvent::Btn { button: dbtn, down });
             }
             wl_pointer::Event::AxisValue120 { axis, value120 } => {

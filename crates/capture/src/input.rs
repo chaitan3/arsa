@@ -798,6 +798,47 @@ fn zeroed_ff() -> FfEffect {
     unsafe { std::mem::zeroed() }
 }
 
+/// Routes pointer buttons to the ABS or REL virtual mouse (`true` = ABS).
+/// Buttons follow the device that saw the most recent motion — inputtino's
+/// active_mouse_device — but the choice is PINNED for the whole press/release
+/// pair. The kernel tracks key state per device and drops a release for a key
+/// that device never saw pressed, so a press landing on one mouse and its
+/// release on the other (exactly what a grab toggle between click-down and
+/// click-up does) would leave the button stuck down; the desktop then reads
+/// the next motion as a window drag. Pure so it is unit-testable without
+/// /dev/uinput.
+#[derive(Default)]
+struct ButtonRouter {
+    last_abs: bool,
+    down: u32,
+    pinned_abs: bool,
+}
+
+impl ButtonRouter {
+    fn on_motion(&mut self, abs: bool) {
+        self.last_abs = abs;
+    }
+
+    /// Device for a button press/release, arming the pin on the first press.
+    fn on_button(&mut self, down: bool) -> bool {
+        let abs = if self.down > 0 { self.pinned_abs } else { self.last_abs };
+        if down {
+            if self.down == 0 {
+                self.pinned_abs = self.last_abs;
+            }
+            self.down += 1;
+        } else {
+            self.down = self.down.saturating_sub(1);
+        }
+        abs
+    }
+
+    /// Momentary events (wheel) have no pairing to keep: last-motion device.
+    fn momentary(&self) -> bool {
+        self.last_abs
+    }
+}
+
 fn uinput_loop(
     rx: mpsc::Receiver<InputEvent>,
     screen: Arc<ScreenSize>,
@@ -822,9 +863,9 @@ fn uinput_loop(
             None
         }
     };
-    // buttons route to whichever device saw the last motion (inputtino's
-    // active_mouse_device); rel is the default
-    let mut last_abs = false;
+    // buttons route to whichever mouse saw the last motion, pinned across
+    // each press/release pair (see ButtonRouter)
+    let mut router = ButtonRouter::default();
     // rel diagnostics: per-2s aggregate (event rate + total counts) to
     // locate motion attenuation between client and injection
     let mut agg_n: u64 = 0;
@@ -844,17 +885,19 @@ fn uinput_loop(
                 d.syn();
             }
             InputEvent::Btn { button, down } => {
-                // wheel lives on both mice; buttons go to the active one
-                let Some(active) = (if last_abs {
-                    abs_ptr.as_ref()
-                } else {
-                    rel_ptr.as_ref()
-                }) else {
-                    continue;
-                };
                 match button {
                     // Left=0 Middle=1 Right=2 WheelUp=3 WheelDown=4 Side=5 Extra=6
                     0 | 1 | 2 | 5 | 6 => {
+                        // pinned while held: a press takes the current active
+                        // device and its release must go back to the same one
+                        let abs = router.on_button(down);
+                        let Some(active) = (if abs {
+                            abs_ptr.as_ref()
+                        } else {
+                            rel_ptr.as_ref()
+                        }) else {
+                            continue;
+                        };
                         let code = match button {
                             0 => BTN_LEFT,
                             1 => BTN_MIDDLE,
@@ -865,14 +908,20 @@ fn uinput_loop(
                         active.emit(EV_KEY, code, down as i32);
                         active.syn();
                     }
-                    3 => {
-                        active.emit(EV_REL, REL_WHEEL, 1);
-                        active.emit(EV_REL, REL_WHEEL_HI_RES, 120);
-                        active.syn();
-                    }
-                    4 => {
-                        active.emit(EV_REL, REL_WHEEL, -1);
-                        active.emit(EV_REL, REL_WHEEL_HI_RES, -120);
+                    3 | 4 => {
+                        // wheel is momentary: it can follow the last-motion
+                        // device without any press/release pairing to keep
+                        let abs = router.momentary();
+                        let Some(active) = (if abs {
+                            abs_ptr.as_ref()
+                        } else {
+                            rel_ptr.as_ref()
+                        }) else {
+                            continue;
+                        };
+                        let (notch, hi) = if button == 3 { (1, 120) } else { (-1, -120) };
+                        active.emit(EV_REL, REL_WHEEL, notch);
+                        active.emit(EV_REL, REL_WHEEL_HI_RES, hi);
                         active.syn();
                     }
                     other => eprintln!("[input] unknown button {other}"),
@@ -892,7 +941,7 @@ fn uinput_loop(
                 a.emit(EV_ABS, ABS_X, ax);
                 a.emit(EV_ABS, ABS_Y, ay);
                 a.syn();
-                last_abs = true;
+                router.on_motion(true);
             }
             InputEvent::Rel { dx, dy } => {
                 agg_n += 1;
@@ -911,7 +960,7 @@ fn uinput_loop(
                 r.emit(EV_REL, REL_X, dx);
                 r.emit(EV_REL, REL_Y, dy);
                 r.syn();
-                last_abs = false;
+                router.on_motion(false);
             }
             ev @ (InputEvent::GamepadBtn { .. } | InputEvent::GamepadAxis { .. }) => {
                 if pad_tx.send(ev).is_ok() {
@@ -958,5 +1007,36 @@ mod tests {
         );
         assert_eq!(io(UI_DEV_CREATE), 0x5501);
         assert_eq!(io(UI_DEV_DESTROY), 0x5502);
+    }
+
+    #[test]
+    fn button_router_pins_device_across_a_motion_mode_switch() {
+        let mut r = ButtonRouter::default();
+        r.on_motion(true); // absolute motion (desktop mode)
+        // click-down takes the abs mouse, then the client grabs and sends a
+        // relative delta before the release: the release must STILL go to abs,
+        // or the kernel drops it and the left button sticks down forever
+        assert!(r.on_button(true));
+        r.on_motion(false); // grab: relative motion
+        assert!(r.on_button(false));
+        // next click follows the new (rel) device
+        assert!(!r.on_button(true));
+        assert!(!r.on_button(false));
+    }
+
+    #[test]
+    fn button_router_follows_motion_when_no_button_is_held() {
+        let mut r = ButtonRouter::default();
+        r.on_motion(true);
+        assert!(r.momentary());
+        r.on_motion(false);
+        assert!(!r.momentary());
+        // multiple buttons held: all pinned to the press device
+        r.on_motion(true);
+        assert!(r.on_button(true));
+        r.on_motion(false);
+        assert!(r.on_button(true));
+        assert!(r.on_button(false));
+        assert!(r.on_button(false));
     }
 }
