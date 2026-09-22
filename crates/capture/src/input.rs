@@ -504,10 +504,17 @@ fn uinput_gamepad() -> Result<UinputDev> {
     // the whole gamepad button range + the digital dpad (individual bits may
     // reject; harmless)
     for b in proto::gamepad::BTN_SOUTH..=proto::gamepad::BTN_THUMBR {
-        let _ = d.set_keybit(b);
+        // NOTE: a failed keybit makes the kernel silently drop that button's
+        // events (input core filters EV_KEY by keybit) — so failures are
+        // logged, not swallowed
+        if let Err(e) = d.set_keybit(b) {
+            eprintln!("[input] gamepad UI_SET_KEYBIT({b:#x}) failed: {e}");
+        }
     }
     for b in proto::gamepad::BTN_DPAD_UP..=proto::gamepad::BTN_DPAD_RIGHT {
-        let _ = d.set_keybit(b);
+        if let Err(e) = d.set_keybit(b) {
+            eprintln!("[input] gamepad UI_SET_KEYBIT({b:#x}) failed: {e}");
+        }
     }
     d.set_absinfo(proto::gamepad::ABS_X as u16, -32768, 32767, 16, 128, 0)?;
     d.set_absinfo(proto::gamepad::ABS_Y as u16, -32768, 32767, 16, 128, 0)?;
@@ -581,6 +588,17 @@ fn gamepad_loop(
     wake: OwnedFd,
 ) {
     let mut pads: std::collections::HashMap<u32, UinputDev> = std::collections::HashMap::new();
+    // slot 0 eager: the pad exists as soon as the server starts, so host-side
+    // games and evtest see it before any client connects (a lazy pad also
+    // only appears after the first event, which reads as "the gamepad
+    // vanished" between sessions). Higher slots stay lazy.
+    match uinput_gamepad() {
+        Ok(d) => {
+            eprintln!("[input] virtual gamepad slot 0 ready (eager)");
+            pads.insert(0, d);
+        }
+        Err(e) => eprintln!("[input] eager uinput gamepad create failed (events will retry lazily): {e:#}"),
+    }
     loop {
         // poll set: [0] = eventfd, [1..] = one entry per live pad
         let set: Vec<(u32, i32)> = pads

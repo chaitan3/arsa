@@ -387,17 +387,20 @@ fn reader_loop(
             let (ty, code) = (e.ty as u32, e.code as u32);
             if ty == EV_KEY && proto::gamepad::is_button(code) {
                 let down = e.value != 0;
-                // forward only on state change (some drivers resend states)
+                // forward only on state change (some drivers resend states).
+                // NOTE: HashSet::insert returns true iff the value was NEWLY
+                // present — the true branch is "newly pressed", not "already
+                // down"; inverting it drops every first press (seen live:
+                // DS5 ABXY dead while sticks flowed).
                 if down {
                     if btn_down.insert(code) {
-                        // already down: no change
-                    } else {
                         let _ = input_tx.send(rdma_display_proto::InputEvent::GamepadBtn {
                             slot,
                             code,
                             down: true,
                         });
                     }
+                    // already down: no change
                 } else if btn_down.remove(&code) {
                     let _ = input_tx.send(rdma_display_proto::InputEvent::GamepadBtn {
                         slot,
