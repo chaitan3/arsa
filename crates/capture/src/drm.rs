@@ -484,33 +484,113 @@ fn import_fb(card: &OwnedFd, fb_id: u32) -> Result<DmabufScanout> {
     })
 }
 
+/// Settle window: once the current fb has been unchanged this long, flips have
+/// stopped and it is certainly fully rendered, so it is safe to capture it.
+const SETTLE_MS: u64 = 20;
+
+/// One poll's decision.
+#[derive(Debug, PartialEq, Eq)]
+enum FbAction {
+    /// Nothing new worth capturing.
+    None,
+    /// No scanout (DPMS off).
+    Disabled,
+    /// Capture this fb id — already known to be complete.
+    Capture(u32),
+}
+
+/// KMS flip tracker implementing the "one-behind" read.
+///
+/// `GETCRTC`/`GETPLANE` report the *pending* fb: the compositor may have
+/// committed it with an in-fence that has not signaled yet, so reading it races
+/// the GPU still rendering into it (blank/torn regions). The fb it just
+/// replaced, however, was scanned out for a full interval and is therefore
+/// complete. So on every change we capture the *previous* fb; when flips stop,
+/// we capture the settled current fb once it has been stable for [`SETTLE_MS`].
+/// Cost: one frame of capture latency. Benefit: never sample a buffer mid-render.
+#[derive(Default)]
+struct FbTracker {
+    /// most recent fb id seen on the CRTC/plane (the pending one)
+    seen: u32,
+    /// last fb id handed to the importer
+    last_captured: u32,
+    /// when `seen` last changed (ms since capture start)
+    changed_ms: u64,
+}
+
+impl FbTracker {
+    fn update(&mut self, now_ms: u64, fb: u32) -> FbAction {
+        if fb == 0 {
+            if self.seen == 0 {
+                return FbAction::None;
+            }
+            self.seen = 0;
+            self.last_captured = 0;
+            return FbAction::Disabled;
+        }
+        if fb != self.seen {
+            let prev = self.seen;
+            self.seen = fb;
+            self.changed_ms = now_ms;
+            // The previous fb was on screen for a full interval -> complete. On
+            // the very first observation there is no previous, so take the
+            // current one immediately (a one-time possible tear) to get a
+            // picture up; it is corrected on the next flip.
+            let candidate = if prev != 0 { prev } else { fb };
+            if candidate != self.last_captured {
+                self.last_captured = candidate;
+                return FbAction::Capture(candidate);
+            }
+            return FbAction::None;
+        }
+        // Flips stopped: the current fb has been stable long enough to be
+        // certainly rendered -> capture it so the settled frame is shown.
+        if self.last_captured != self.seen
+            && now_ms.saturating_sub(self.changed_ms) >= SETTLE_MS
+        {
+            self.last_captured = self.seen;
+            return FbAction::Capture(self.seen);
+        }
+        FbAction::None
+    }
+
+    /// The import failed: forget the claim so a later poll can retry.
+    fn capture_failed(&mut self) {
+        self.last_captured = 0;
+    }
+}
+
 fn run(card_pref: Option<&str>, tx: Sender<CaptureEvent>) -> Result<()> {
     eprintln!(
         "[capture-drm] opening card {}",
         card_pref.unwrap_or("(probe /dev/dri/card0..8)")
     );
     let mut card: Option<(OwnedFd, Target)> = None;
-    let mut last_fb: u32 = 0;
     let mut disabled_reported = false;
-    let mut last_rescan = std::time::Instant::now();
+    let mut tracker = FbTracker::default();
+    let started = std::time::Instant::now();
+    // throttles card (re)opens to once a second after a failure
+    let mut last_open_attempt: Option<std::time::Instant> = None;
     loop {
         if card.is_none() {
-            if last_fb == 0 || last_fb == u32::MAX {
-                // (re)scan at most once a second while hunting for a display
-                if last_fb == u32::MAX && last_rescan.elapsed() < std::time::Duration::from_secs(1) {
+            if let Some(t) = last_open_attempt {
+                if t.elapsed() < std::time::Duration::from_secs(1) {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     continue;
                 }
-                last_rescan = std::time::Instant::now();
             }
+            last_open_attempt = Some(std::time::Instant::now());
             match open_card(card_pref) {
                 Ok(c) => {
                     eprintln!("[capture-drm] target: {:?}", c.1);
                     card = Some(c);
+                    // a (re)opened card means a fresh scanout: reset the flip
+                    // tracker so the first frame is captured immediately
+                    tracker = FbTracker::default();
+                    disabled_reported = false;
                 }
                 Err(e) => {
                     eprintln!("[capture-drm] {e:#}; retrying…");
-                    last_fb = u32::MAX;
                     continue;
                 }
             }
@@ -523,7 +603,7 @@ fn run(card_pref: Option<&str>, tx: Sender<CaptureEvent>) -> Result<()> {
                 Err(e) => {
                     eprintln!("[capture-drm] GETCRTC: {e}; rescanning");
                     card = None;
-                    last_fb = 0;
+                    last_open_attempt = Some(std::time::Instant::now());
                     std::thread::sleep(std::time::Duration::from_secs(1));
                     continue;
                 }
@@ -533,23 +613,25 @@ fn run(card_pref: Option<&str>, tx: Sender<CaptureEvent>) -> Result<()> {
                 Err(e) => {
                     eprintln!("[capture-drm] GETPLANE: {e}; rescanning");
                     card = None;
-                    last_fb = 0;
+                    last_open_attempt = Some(std::time::Instant::now());
                     std::thread::sleep(std::time::Duration::from_secs(1));
                     continue;
                 }
             },
         };
-        match fb {
-            0 => {
+        // one-behind read: capture the fb that was just superseded (complete),
+        // and the settled current fb once flips stop — never the pending one
+        let now_ms = started.elapsed().as_millis() as u64;
+        match tracker.update(now_ms, fb) {
+            FbAction::None => {}
+            FbAction::Disabled => {
                 // DPMS off / no scanout — tell the server once
                 if !disabled_reported {
                     disabled_reported = true;
                     let _ = tx.send(CaptureEvent::Disabled);
                 }
-                last_fb = 0;
             }
-            id if id == last_fb => {} // no flip — nothing to send
-            id => {
+            FbAction::Capture(id) => {
                 match import_fb(&card.as_ref().unwrap().0, id) {
                     Ok(dmabuf) => {
                         eprintln!(
@@ -562,13 +644,13 @@ fn run(card_pref: Option<&str>, tx: Sender<CaptureEvent>) -> Result<()> {
                             dmabuf.format.stride,
                         );
                         let _ = tx.send(CaptureEvent::Scanout(dmabuf));
-                        last_fb = id;
                         disabled_reported = false;
                     }
                     Err(e) => {
-                        // retry next tick; keep last_fb so we don't spam
+                        // the one-behind fb may already have been freed/reused:
+                        // forget the claim and let a later poll pick another
                         eprintln!("[capture-drm] fb {id} import failed: {e:#}");
-                        last_fb = id;
+                        tracker.capture_failed();
                     }
                 }
             }
@@ -606,5 +688,38 @@ mod tests {
         assert_eq!(DRM_IOCTL_MODE_GETFB2, 0xC06864CE);
         assert_eq!(DRM_IOCTL_PRIME_HANDLE_TO_FD, 0xC00C642D);
         assert_eq!(DRM_IOCTL_GEM_CLOSE, 0x40086409); // _IOW, dir=1
+    }
+
+    #[test]
+    fn fb_tracker_one_behind_and_settle() {
+        let mut t = FbTracker::default();
+        // first sight: capture the current fb immediately to get a picture up
+        assert_eq!(t.update(0, 10), FbAction::Capture(10));
+        // A->B: the previous (A) was already captured — nothing new yet
+        assert_eq!(t.update(2, 11), FbAction::None);
+        // B->C: capture the now-complete B
+        assert_eq!(t.update(4, 12), FbAction::Capture(11));
+        // C->D: capture C
+        assert_eq!(t.update(6, 13), FbAction::Capture(12));
+        // flips stop: not yet settled
+        assert_eq!(t.update(10, 13), FbAction::None);
+        // settled: capture the final frame
+        assert_eq!(t.update(6 + SETTLE_MS, 13), FbAction::Capture(13));
+        // and never repeat it
+        assert_eq!(t.update(1000, 13), FbAction::None);
+        // DPMS off (once), then a fresh first frame on re-enable
+        assert_eq!(t.update(1002, 0), FbAction::Disabled);
+        assert_eq!(t.update(1004, 0), FbAction::None);
+        assert_eq!(t.update(1006, 20), FbAction::Capture(20));
+    }
+
+    #[test]
+    fn fb_tracker_failed_import_retries_after_settle() {
+        let mut t = FbTracker::default();
+        assert_eq!(t.update(0, 5), FbAction::Capture(5));
+        // the import failed -> the claim is dropped and the settled fb is
+        // captured again on a later poll
+        t.capture_failed();
+        assert_eq!(t.update(SETTLE_MS + 1, 5), FbAction::Capture(5));
     }
 }
