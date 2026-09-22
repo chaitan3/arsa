@@ -94,16 +94,10 @@ struct St {
     /// mouse grab (game) mode: pointer locked locally, deltas forwarded as
     /// InputEvent::Rel, local cursor hidden. Toggled with Ctrl+Alt+M.
     grabbed: bool,
-    /// fractional accumulator for relative deltas
+    /// fractional accumulator for relative deltas (logical pixels)
     grab_acc: (f64, f64),
-    /// wire-scale auto-detect: correct wl_fixed encodes count*256 (every
-    /// nonzero value divisible by 256); KWin (observed) transmits the raw
-    /// count instead. Vote on the first nonzero values, then lock the mode.
-    rel_fixed_votes: u32,
-    rel_raw_votes: u32,
-    /// grab diagnostics: raw wire values + per-2s aggregates (count,
-    /// Σunaccel counts) — settles where motion attenuation comes from
-    dbg_left: u32,
+    /// grab diagnostics: per-2s aggregate (event count, Σdelta) to spot
+    /// attenuation between compositor delivery and host injection
     dbg_n: u64,
     dbg_sum: (f64, f64),
     dbg_window: std::time::Instant,
@@ -292,9 +286,6 @@ impl Presenter {
                 locked_obj: None,
                 grabbed: false,
                 grab_acc: (0.0, 0.0),
-                rel_fixed_votes: 0,
-                rel_raw_votes: 0,
-                dbg_left: 0,
                 dbg_n: 0,
                 dbg_sum: (0.0, 0.0),
                 dbg_window: Instant::now(),
@@ -466,9 +457,6 @@ impl St {
             self.locked_obj = Some(locked);
             self.grabbed = true;
             self.grab_acc = (0.0, 0.0);
-            self.rel_fixed_votes = 0;
-            self.rel_raw_votes = 0;
-            self.dbg_left = 30;
             self.dbg_n = 0;
             self.dbg_sum = (0.0, 0.0);
             self.dbg_window = Instant::now();
@@ -487,10 +475,9 @@ impl St {
             self.grabbed = false;
             self.grab_acc = (0.0, 0.0);
             eprintln!(
-                "[wl] grab session: {} relative events, Σx={:+.1} Σy={:+.1} counts",
+                "[wl] grab session: {} relative events, Σx={:+.1} Σy={:+.1}",
                 self.dbg_n, self.dbg_sum.0, self.dbg_sum.1
             );
-            self.dbg_left = 0;
             if self.pointer_active {
                 if let Some(dev) = self.cursor_device.as_ref() {
                     dev.set_shape(self.pointer_serial, Shape::Default);
@@ -618,9 +605,18 @@ quiet!(ZwpRelativePointerManagerV1 => ());
 quiet!(ZwpPointerConstraintsV1 => ());
 quiet!(ZwpLockedPointerV1 => ());
 
-/// Relative motion while grabbed: forward UNACCELERATED deltas (games want
-/// raw counts, not the compositor's accelerated ones) as InputEvent::Rel,
-/// accumulating the wl_fixed (24.8) fraction between events.
+/// Relative motion while grabbed: forward the UNACCELERATED delta (games want
+/// raw motion, not the compositor's acceleration curve) as InputEvent::Rel,
+/// accumulating the fractional part between events.
+///
+/// wayland-rs decodes the protocol's wl_fixed (24.8) arguments itself: the
+/// RelativeMotion fields arrive as `f64` already divided by 256
+/// (wayland-scanner emits `(#arg as f64) / 256.`), i.e. the plain
+/// logical-pixel delta. Do NOT divide again — doing so was a 256x attenuation
+/// bug whose "raw counts (KWin-style)" diagnosis (commit 894de95) mistook the
+/// already-decoded f64 for the raw wire integer. The wire value really is
+/// count*256 on spec-compliant compositors, including KWin, whose
+/// relativepointer_v1.cpp encodes with wl_fixed_from_double().
 impl Dispatch<ZwpRelativePointerV1, ()> for St {
     fn event(
         state: &mut St,
@@ -637,59 +633,15 @@ impl Dispatch<ZwpRelativePointerV1, ()> for St {
             if !state.grabbed {
                 return;
             }
-            // Wire-scale auto-detect: the spec says wl_fixed (count*256), and
-            // libinput counts are integers — so a correct compositor always
-            // sends multiples of 256. KWin (observed live) transmits the raw
-            // count (1 for a 1-count move). Zero carries no evidence (0 is 0
-            // under both); 4 unanimous nonzero votes decide, then lock.
-            if state.rel_fixed_votes + state.rel_raw_votes < 4 {
-                for v in [dx_unaccel, dy_unaccel] {
-                    let v = v as i32;
-                    if v == 0 {
-                        continue;
-                    }
-                    if v % 256 == 0 {
-                        state.rel_fixed_votes += 1;
-                    } else {
-                        state.rel_raw_votes += 1;
-                    }
-                }
-                if state.rel_fixed_votes + state.rel_raw_votes >= 4 {
-                    let fixed = state.rel_fixed_votes > state.rel_raw_votes;
-                    eprintln!(
-                        "[wl] rel wire scale: {}",
-                        if fixed {
-                            "wl_fixed (count*256)"
-                        } else {
-                            "raw counts (KWin-style)"
-                        }
-                    );
-                }
-            }
-            let fixed_mode = state.rel_fixed_votes > state.rel_raw_votes;
-            let dx_f = if fixed_mode {
-                dx_unaccel as f64 / 256.0
-            } else {
-                dx_unaccel as f64
-            };
-            let dy_f = if fixed_mode {
-                dy_unaccel as f64 / 256.0
-            } else {
-                dy_unaccel as f64
-            };
-            // raw wire values and per-2s aggregates remain for diagnostics
-            if state.dbg_left > 0 {
-                state.dbg_left -= 1;
-                eprintln!("[wl] rel wire dx={dx_unaccel} dy={dy_unaccel}");
-            }
-            state.grab_acc.0 += dx_f;
-            state.grab_acc.1 += dy_f;
+            // dx_unaccel/dy_unaccel are already logical pixels (see above)
+            state.grab_acc.0 += dx_unaccel;
+            state.grab_acc.1 += dy_unaccel;
             state.dbg_n += 1;
-            state.dbg_sum.0 += dx_f;
-            state.dbg_sum.1 += dy_f;
+            state.dbg_sum.0 += dx_unaccel;
+            state.dbg_sum.1 += dy_unaccel;
             if state.dbg_window.elapsed().as_secs_f64() >= 2.0 {
                 eprintln!(
-                    "[wl] rel agg: {} ev Σx={:+.1} Σy={:+.1} counts in 2s",
+                    "[wl] rel agg: {} ev Σx={:+.1} Σy={:+.1} in 2s",
                     state.dbg_n, state.dbg_sum.0, state.dbg_sum.1
                 );
                 state.dbg_window = Instant::now();
