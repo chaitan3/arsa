@@ -80,15 +80,31 @@ pub fn virtual_range(code: u32) -> (i32, i32) {
 }
 
 /// Map a raw axis value from the real device's range into the virtual range.
-/// Identity when the ranges already match (DualSense sticks are within 1 LSB
-/// of the virtual range); saturating elsewhere (a DualSense 0..1023 trigger
-/// compresses into the virtual Xbox profile's 0..255). Endpoints map to
-/// endpoints.
+///
+/// A signed symmetric virtual axis (the four virtual sticks, -32768..32767)
+/// driven by an unsigned real axis (e.g. a DualSense stick, 0..255 per
+/// hid-playstation.c) is anchored on the real neutral: the neutral maps to 0
+/// and each half is scaled independently, so neutral→0 while both endpoints
+/// still land on the endpoints. A plain endpoint-to-endpoint map would leave
+/// the neutral at +128 on the virtual axis instead — a permanent ~0.4% stick
+/// deflection. Everything else (triggers, the ±1 hat, an already-signed real
+/// stick) is a plain linear map; identity when the ranges match.
 pub fn rescale(value: i32, real: (i32, i32), virt: (i32, i32)) -> i32 {
     let (rmin, rmax) = real;
     let (vmin, vmax) = virt;
     if rmax <= rmin || vmax <= vmin {
         return value.clamp(vmin, vmax);
+    }
+    // unsigned real axis → signed symmetric virtual axis: center on the
+    // hardware neutral (midpoint of the unsigned range; 128 for 0..255)
+    if rmin >= 0 && vmin < 0 && vmax > 0 {
+        let neutral = rmin + (rmax - rmin + 1) / 2;
+        let out = if value >= neutral {
+            (value - neutral) as f64 * vmax as f64 / (rmax - neutral).max(1) as f64
+        } else {
+            (value - neutral) as f64 * vmin as f64 / (rmin - neutral) as f64
+        };
+        return (out.round() as i32).clamp(vmin, vmax);
     }
     let clamped = (value - rmin).clamp(0, rmax - rmin) as f64;
     let out = vmin as f64 + clamped * (vmax - vmin) as f64 / (rmax - rmin) as f64;
@@ -176,20 +192,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rescale_identity_on_matching_ranges() {
-        // DualSense sticks (±32767) into the virtual ±32768..32767 range:
-        // endpoints map to endpoints, center stays center
-        let (real, virt) = ((-32767, 32767), (-32768, 32767));
-        assert_eq!(rescale(-32767, real, virt), -32768);
-        // center maps within 1 LSB (virtual range midpoint is -0.5)
-        assert!(rescale(0, real, virt).abs() <= 1);
-        assert_eq!(rescale(32767, real, virt), 32767);
-        // DualSense triggers 0..1023 → virtual 0..255
-        let (real, virt) = ((0, 1023), (0, 255));
-        assert_eq!(rescale(0, real, virt), 0);
-        assert_eq!(rescale(1023, real, virt), 255);
-        assert_eq!(rescale(512, real, virt), 128);
-        // Xbox triggers 0..255 → 0..255: identity
+    fn rescale_centers_unsigned_sticks() {
+        // DualSense sticks are 0..255 with the hardware neutral at 128
+        // (hid-playstation.c: ABS_X..ABS_RZ are all 0..255); the virtual Xbox
+        // stick is -32768..32767 centered at 0, so the neutral must land on 0
+        // rather than the +128 a plain endpoint map would produce.
+        let (real, virt) = ((0, 255), (-32768, 32767));
+        assert_eq!(rescale(128, real, virt), 0);
+        assert_eq!(rescale(0, real, virt), -32768);
+        assert_eq!(rescale(255, real, virt), 32767);
+        // each half scaled independently (neutral is not the real midpoint)
+        assert_eq!(rescale(96, real, virt), -8192);
+        assert_eq!(rescale(160, real, virt), 8256);
+        // a 10-bit 0..1023 stick (neutral 512) centers the same way
+        assert_eq!(rescale(512, (0, 1023), (-32768, 32767)), 0);
+        assert_eq!(rescale(0, (0, 1023), (-32768, 32767)), -32768);
+        assert_eq!(rescale(1023, (0, 1023), (-32768, 32767)), 32767);
+    }
+
+    #[test]
+    fn rescale_linear_on_matching_and_signed_ranges() {
+        // triggers: DualSense 0..255 → virtual 0..255: identity
         for v in [0, 127, 255] {
             assert_eq!(rescale(v, (0, 255), (0, 255)), v);
         }
@@ -197,6 +220,16 @@ mod tests {
         for v in [-1, 0, 1] {
             assert_eq!(rescale(v, (-1, 1), (-1, 1)), v);
         }
+        // an already-signed real stick → virtual stick: endpoints map,
+        // center within 1 LSB of 0
+        let (real, virt) = ((-32767, 32767), (-32768, 32767));
+        assert_eq!(rescale(-32767, real, virt), -32768);
+        assert_eq!(rescale(32767, real, virt), 32767);
+        assert!(rescale(0, real, virt).abs() <= 1);
+        // a generic 10-bit trigger → 0..255 stays a plain linear map
+        assert_eq!(rescale(0, (0, 1023), (0, 255)), 0);
+        assert_eq!(rescale(1023, (0, 1023), (0, 255)), 255);
+        assert_eq!(rescale(512, (0, 1023), (0, 255)), 128);
     }
 
     #[test]

@@ -6,10 +6,11 @@
 //! Wayland has no gamepad protocol, so this bypasses the compositor entirely
 //! — the pad is read straight from the kernel. The kernel gamepad standard
 //! (Documentation/input/gamepad.rst) covers every mainstream driver (xpad,
-//! hid-sony/hid-playstation, hid-nintendo): codes are forwarded verbatim, and
-//! axis values are rescaled from the real device's EVIOCGABS ranges into the
-//! virtual pad's fixed ranges (see proto::gamepad) so the host game sees sane
-//! axis semantics regardless of the physical controller.
+//! hid-sony/hid-playstation, hid-nintendo): button codes are forwarded as the
+//! driver reports them, except the deliberate face-button swap documented at
+//! the reader, and axis values are rescaled from the real device's EVIOCGABS
+//! ranges into the virtual pad's fixed ranges (see proto::gamepad) so the host
+//! game sees sane axis semantics regardless of the physical controller.
 //!
 //! The pad is grabbed exclusively (EVIOCGRAB) by default so the local
 //! compositor doesn't double-consume it; the kernel releases the grab
@@ -515,8 +516,10 @@ fn spawn_fake(input_tx: mpsc::Sender<rdma_display_proto::InputEvent>) {
 
 fn fake_loop(input_tx: mpsc::Sender<rdma_display_proto::InputEvent>) {
     let slot = 0u32;
-    // DualSense-style ranges (what the reader would rescale into the
-    // virtual pad): sticks ±32767, triggers 0..1023
+    // the fake bypasses the real reader and its rescale, emitting values
+    // straight onto the wire — so they must already be in the VIRTUAL pad's
+    // ranges: sticks ±32767, triggers 0..255 (DualSense-style raw values,
+    // e.g. sticks 0..255, would be out of range here)
     let mut t = 0.0f64;
     let mut btn_state = false;
     let hat_seq: [(i32, i32); 5] = [(0, 0), (1, 0), (0, 1), (-1, 0), (0, -1)];
@@ -537,8 +540,8 @@ fn fake_loop(input_tx: mpsc::Sender<rdma_display_proto::InputEvent>) {
                 });
             }
         }
-        // trigger: half-press pulsing
-        let z = (((t * 1.6).sin() + 1.0) / 2.0 * 1023.0).round() as i32;
+        // trigger: half-press pulsing (virtual 0..255)
+        let z = (((t * 1.6).sin() + 1.0) / 2.0 * 255.0).round() as i32;
         if sent_axis.get(&proto::gamepad::ABS_Z) != Some(&z) {
             sent_axis.insert(proto::gamepad::ABS_Z, z);
             let _ = input_tx.send(rdma_display_proto::InputEvent::GamepadAxis {
