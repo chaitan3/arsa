@@ -33,6 +33,7 @@ fn main() -> Result<()> {
     let mut controller_on = true;
     let mut controller_grab = true;
     let mut fake_gamepad = false;
+    let mut transport = rdma_display_rdma::TransportPref::Auto;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -51,6 +52,11 @@ fn main() -> Result<()> {
             "--no-controller" => controller_on = false,
             "--no-controller-grab" => controller_grab = false,
             "--fake-gamepad" => fake_gamepad = true,
+            "--transport" => {
+                let v = args.next().expect("--transport needs a value");
+                transport = rdma_display_rdma::TransportPref::parse(&v)
+                    .with_context(|| format!("--transport must be auto|rdma|tcp, got {v:?}"))?;
+            }
             "--help" | "-h" => {
                 println!("usage: rdma-display-client --server HOST:PORT [--device mlx5_0] [--slots 3] [--dump frame.ppm] [--seconds N]");
                 println!("  --slot-mem host|cuda  receive slots: host = pinned RAM (default); cuda = dormant GPU path");
@@ -62,6 +68,7 @@ fn main() -> Result<()> {
                 println!("  --no-controller       don't forward attached gamepads");
                 println!("  --no-controller-grab  leave the gamepad exclusive-grabbable by the local compositor too (default: EVIOCGRAB while streaming)");
                 println!("  --fake-gamepad        synthesize a controller (slot 0) for testing without hardware");
+                println!("  --transport auto|rdma|tcp  video transport (default auto: RDMA/RoCE when available, else TCP); negotiated with the server");
                 println!("  Ctrl+Alt+M            (--output egl) grab keyboard+mouse for the guest: the local compositor's");
                 println!("                        own shortcuts (alt-f4, alt-tab, alt-f1, ...) reach the guest too; Ctrl+Alt+M again");
                 println!("                        is the ONLY way to give control back to the desktop");
@@ -91,15 +98,38 @@ fn main() -> Result<()> {
     }
     eprintln!("connected to {server}");
 
-    let ctx = rdma_display_rdma::open_device(device.as_deref())?;
-    let pd = ctx.alloc_pd()?;
+    // video transport: auto prefers RDMA and falls back to TCP (matching the
+    // server); with TCP there is no RDMA device to open at all
+    let rdma_ctx = match transport {
+        rdma_display_rdma::TransportPref::Tcp => None,
+        _ => match rdma_display_rdma::open_device(device.as_deref()) {
+            Ok(ctx) => {
+                let pd = ctx.alloc_pd()?;
+                Some((ctx, pd))
+            }
+            Err(e) => {
+                if transport == rdma_display_rdma::TransportPref::Rdma {
+                    return Err(e).context("--transport rdma: open RDMA device");
+                }
+                eprintln!("[client] no RDMA device ({e:#}); using TCP video transport");
+                None
+            }
+        },
+    };
+    let rdma_ref = rdma_ctx.as_ref().map(|(c, p)| (c, p));
     let mem = match slot_mem.as_str() {
         "host" => rdma_display_rdma::SlotMem::Host,
         "cuda" => rdma_display_rdma::SlotMem::Cuda { device: cuda_device },
         other => anyhow::bail!("--slot-mem must be host|cuda, got {other:?}"),
     };
-    let mut link =
-        rdma_display_rdma::ClientLink::connect_with(Conn::new(stream), &ctx, &pd, slots, mem)?;
+    let mut link = rdma_display_rdma::ClientLink::connect_with(
+        Conn::new(stream),
+        transport,
+        rdma_ref,
+        Some(addr),
+        slots,
+        mem,
+    )?;
     if link.slots_gpu_only() {
         eprintln!("[client] GPU slots without CPU mapping: content checks use the verification-only device->host copy (the render path itself stays zero-copy)");
     }
