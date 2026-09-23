@@ -629,6 +629,9 @@ fn run_capture(
                                 meta.stride,
                                 meta.frame_bytes as usize,
                             )?;
+                            // configure may have created the GPU encoder's own
+                            // EGL context; restore ours before any GL work
+                            mat.activate()?;
                             frame_dirty = true;
                             pipelined = external.is_some();
                             session_meta = Some(meta.clone());
@@ -698,6 +701,7 @@ fn run_capture(
                                 fmt.stride,
                                 fmt.frame_bytes() as usize,
                             )?;
+                            mat.activate()?;
                         }
                     }
                 }
@@ -759,7 +763,12 @@ fn run_capture(
                         }
                         let n = match mat.coded_len() {
                             Some(n) => n,
-                            None => fc.encode_in_place(out)?,
+                            None => {
+                                let n = fc.encode_in_place(out)?;
+                                // GPU encode leaves its own EGL context current
+                                mat.activate()?;
+                                n
+                            }
                         };
                         Ok((true, n, t))
                     },
@@ -811,7 +820,11 @@ fn run_capture(
                 }
                 // compress the raw frame now that it is in the pinned slot
                 let post_len = match fc.encode_in_place(out) {
-                    Ok(n) => n,
+                    Ok(n) => {
+                        // GPU encode leaves its own EGL context current
+                        mat.activate()?;
+                        n
+                    }
                     Err(e) => {
                         eprintln!("[server] encode failed: {e:#}");
                         session = None;
@@ -851,29 +864,37 @@ fn run_capture(
 }
 
 /// In-place frame coding for the RDMA staging slot. `raw` is a pass-through
-/// (post the whole frame, no header). The encoder's reference is reset in
-/// `configure` (once per session) so the first frame a new client receives is
-/// always full.
+/// (post the whole frame, no header). `lossless` runs the tile-delta encoder
+/// on the GPU (`rdma-display-codec-gpu`, GLES 3.1 compute) against the frame
+/// the materializer just read back; the CPU reference encoder is kept as a
+/// fallback when the GPU codec can't be created. The encoder's reference is
+/// reset in `configure` (once per session, and on a geometry change) so the
+/// first frame a new client receives is always full.
 ///
-/// NOTE: the encode runs on the CPU here, after the GPU readback has landed
-/// the raw frame in the pinned slot. The next step is to move it into the
-/// materializer as a GLES 3.1 compute pass so it happens on the GPU and only
-/// the coded bytes are read back; the byte format (rdma-display-codec) is
-/// identical, so that is a drop-in replacement.
+/// The GPU encoder owns its own EGL context, so after it has run on the server
+/// thread the caller must restore the materializer's context via
+/// [`FrameMaterializer::activate`](rdma_display_capture::FrameMaterializer::activate).
 struct FrameCodec {
+    /// GPU lossless encoder (GLES compute); None = use the CPU encoder.
+    gpu: Option<rdma_display_codec_gpu::GpuCodec>,
+    /// CPU reference encoder: the fallback path.
     enc: Option<rdma_display_codec::Encoder>,
     buf: Vec<u8>,
     frame_bytes: usize,
     geom: Option<rdma_display_codec::Geometry>,
+    /// the next encode must be a full frame (new session / new geometry)
+    first: bool,
 }
 
 impl FrameCodec {
     fn new() -> Self {
         Self {
+            gpu: None,
             enc: None,
             buf: Vec::new(),
             frame_bytes: 0,
             geom: None,
+            first: true,
         }
     }
 
@@ -887,20 +908,33 @@ impl FrameCodec {
     ) -> Result<()> {
         self.frame_bytes = frame_bytes;
         self.geom = None;
-        self.enc = match codec {
-            rdma_display_codec::Codec::Raw => None,
+        self.gpu = None;
+        self.enc = None;
+        self.first = true;
+        match codec {
+            rdma_display_codec::Codec::Raw | rdma_display_codec::Codec::Lossy => {}
             rdma_display_codec::Codec::Lossless => {
                 let geom = rdma_display_codec::Geometry::new(width, height, stride);
                 self.buf.resize(geom.max_coded_len(), 0);
                 self.geom = Some(geom);
-                let mut e = rdma_display_codec::Encoder::new(geom)?;
-                // streaming path: the payload CRC costs tens of ms on a full
-                // frame and RC RDMA already guarantees delivery, so omit it
-                e.set_crc(false);
-                Some(e)
+                match rdma_display_codec_gpu::GpuCodec::new(geom) {
+                    Ok(g) => {
+                        eprintln!("[server] lossless encoder: GPU (GLES compute)");
+                        self.gpu = Some(g);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[server] lossless encoder: GPU unavailable ({e:#}); falling back to CPU"
+                        );
+                        let mut e = rdma_display_codec::Encoder::new(geom)?;
+                        // streaming path: the payload CRC costs tens of ms on a
+                        // full frame and RC RDMA already guarantees delivery
+                        e.set_crc(false);
+                        self.enc = Some(e);
+                    }
+                }
             }
-            rdma_display_codec::Codec::Lossy => None,
-        };
+        }
         Ok(())
     }
 
@@ -915,8 +949,28 @@ impl FrameCodec {
     }
 
     /// Encode `slot[..frame_bytes]` in place; returns the number of bytes to
-    /// post (coded length, or `frame_bytes` for raw).
+    /// post (coded length, or `frame_bytes` for raw). When the GPU encoder
+    /// ran, the materializer's GL context must be restored afterwards.
     fn encode_in_place(&mut self, slot: &mut [u8]) -> Result<usize> {
+        if let Some(gpu) = self.gpu.as_mut() {
+            let full = self.first;
+            gpu.activate()?;
+            gpu.upload(&slot[..self.frame_bytes])?;
+            let n = gpu.encode(full)?;
+            // advance the encoder's reference to the frame just coded, so the
+            // next encode deltas against it (the decode pass writes the coded
+            // tiles back into the reference buffer)
+            gpu.update_reference()?;
+            ensure!(
+                n <= slot.len(),
+                "coded frame {n} exceeds staging slot {}",
+                slot.len()
+            );
+            let coded = gpu.coded(n);
+            slot[..n].copy_from_slice(coded);
+            self.first = false;
+            return Ok(n);
+        }
         let Some(enc) = self.enc.as_mut() else {
             return Ok(self.frame_bytes);
         };
@@ -1109,5 +1163,50 @@ fn meta_plain(fmt: &FrameFormat) -> DisplayMeta {
         y0_top: false,
         frame_bytes: fmt.frame_bytes(),
         gen: 0,
+    }
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::FrameCodec;
+    use rdma_display_codec::{Codec, Decoder, Geometry};
+
+    fn synthetic(w: u32, h: u32, seed: u32) -> Vec<u8> {
+        let mut v = vec![0u8; (w * h * 4) as usize];
+        for (i, b) in v.iter_mut().enumerate() {
+            let x = (i as u32).wrapping_mul(2654435761).wrapping_add(seed);
+            *b = (x >> 13) as u8;
+        }
+        v
+    }
+
+    /// The server's lossless encode path: `FrameCodec::encode_in_place` (GPU
+    /// when available, CPU otherwise) must produce bytes the client's CPU
+    /// decoder turns back into the exact frame, across a full frame followed
+    /// by deltas — i.e. the reference is advanced correctly.
+    #[test]
+    fn lossless_encode_in_place_round_trips() {
+        let (w, h) = (256u32, 256u32);
+        let stride = w * 4;
+        let geom = Geometry::new(w, h, stride);
+        let fb = geom.frame_bytes();
+        let mut fc = FrameCodec::new();
+        fc.configure(Codec::Lossless, w, h, stride, fb).unwrap();
+        let mut dec = Decoder::new(geom).unwrap();
+        let mut slot = vec![0u8; geom.max_coded_len()];
+        let base = synthetic(w, h, 1);
+        for i in 0..4u32 {
+            let mut orig = base.clone();
+            let off = (i as usize * 4096) % orig.len();
+            for k in 0..96 {
+                let p = (off + k) % orig.len();
+                orig[p] ^= 0x5a;
+            }
+            slot[..fb].copy_from_slice(&orig);
+            let n = fc.encode_in_place(&mut slot).unwrap();
+            assert!(n <= slot.len());
+            let out = dec.decode(&slot[..n]).unwrap();
+            assert_eq!(out, &orig[..], "frame {i} round trip");
+        }
     }
 }

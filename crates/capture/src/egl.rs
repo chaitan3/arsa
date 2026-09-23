@@ -736,6 +736,17 @@ impl crate::FrameMaterializer for EglMaterializer {
     }
 
 
+    fn activate(&mut self) -> Result<()> {
+        // restore our GL context after the GPU codec made its own current
+        if unsafe { (self.egl.make_current)(self.dpy, self.pbuf, self.pbuf, self.ctx) } == 0 {
+            bail!(
+                "eglMakeCurrent(materializer) failed (err {:#06x})",
+                self.egl.get_error()
+            );
+        }
+        Ok(())
+    }
+
     fn prepare(&mut self, fmt: &FrameFormat, dmabuf: Option<&DmabufScanout>) -> Result<()> {
         // all supported single-plane 4bpp RGB variants (see
         // is_supported_rgb_fourcc); the blit normalizes memory order and bit

@@ -9,6 +9,7 @@ rdma-display-proto.workspace = true
 rdma-display-rdma = { path = "../rdma" }
 rdma-display-capture = { path = "../capture" }
 rdma-display-codec = { path = "../codec" }
+rdma-display-codec-gpu = { path = "../codec-gpu" }
 rdma-display-vkcore = { path = "../vkcore" }
 rdma-display-audio = { path = "../audio" }
 anyhow.workspace = true

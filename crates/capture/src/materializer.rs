@@ -41,6 +41,15 @@ pub trait FrameMaterializer: Send {
     /// send; the new client needs the current frame immediately).
     fn mark_dirty(&mut self);
 
+    /// Optional: re-make this materializer's GL context current after another
+    /// context (e.g. the GPU lossless codec) ran on the same thread. The
+    /// materializer's objects live in its own context, so any code that
+    /// switches contexts must restore it before the next materializer call.
+    /// Default: no GL context.
+    fn activate(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     /// Bind zero-copy staging: the materializer allocates `n` staging units
     /// of `frame_bytes` each and returns their (pointer, len) so the server
     /// can register them as RDMA staging slots (`register_from_raw`) — the
