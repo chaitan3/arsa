@@ -1,0 +1,16 @@
+[package]
+name = "rdma-display-vkcore"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "vkcore-smoke"
+path = "src/bin/smoke.rs"
+
+[dependencies]
+anyhow.workspace = true
+ash = "0.38"
+libc = "0.2"
+libloading = "0.8"
