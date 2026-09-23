@@ -1,0 +1,297 @@
+//! codecbench: CPU vs GPU (GLES compute) lossless codec on simulated 4K
+//! desktop frames.
+//!
+//! Two passes: a correctness pass (GPU output must be bit-identical to the
+//! source and decodable by the CPU reference) and a clean timing pass with no
+//! validation readbacks.
+
+use std::time::Instant;
+
+use anyhow::{bail, Result};
+use rdma_display_codec::{crc32, Decoder, Encoder, Geometry, Header};
+use rdma_display_codec_gpu::GpuCodec;
+
+const W: u32 = 3840;
+const H: u32 = 2160;
+
+fn words_bytes(w: &[u32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 4) }
+}
+
+fn rect(f: &mut [u32], x: i32, y: i32, rw: i32, rh: i32, color: u32) {
+    let (x0, y0) = (x.max(0), y.max(0));
+    let (x1, y1) = ((x + rw).min(W as i32), (y + rh).min(H as i32));
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    for yy in y0..y1 {
+        let row = yy as usize * W as usize;
+        for xx in x0..x1 {
+            f[row + xx as usize] = color;
+        }
+    }
+}
+
+/// A static-ish desktop: gradient wallpaper, window panels, "text" lines.
+fn base_frame() -> Vec<u32> {
+    let mut f = vec![0u32; (W * H) as usize];
+    for y in 0..H {
+        let row = y as usize * W as usize;
+        for x in 0..W {
+            let a = x * 255 / W;
+            let b = y * 255 / H;
+            f[row + x as usize] = 0xFF00_0000 | (a << 8) | b;
+        }
+    }
+    rect(&mut f, 120, 90, 1500, 1000, 0xFF20_2028);
+    rect(&mut f, 120, 90, 1500, 40, 0xFF3A_3A46);
+    rect(&mut f, 1700, 200, 1400, 1200, 0xFF18_1C22);
+    rect(&mut f, 1700, 200, 1400, 40, 0xFF3A_3A46);
+    let mut y = 160;
+    while y < 1000 {
+        let len = 200 + ((y * 37) % 900);
+        rect(&mut f, 160, y, len, 14, 0xFFC8_C8D0);
+        y += 28;
+    }
+    f
+}
+
+fn cursor(f: &mut [u32], x: i32, y: i32) {
+    rect(f, x, y, 40, 40, 0xFFFF_FFFF);
+    rect(f, x, y, 40, 5, 0xFF00_0000);
+    rect(f, x, y, 5, 40, 0xFF00_0000);
+}
+
+fn menu(f: &mut [u32], x: i32, y: i32) {
+    rect(f, x, y, 460, 400, 0xFF2E_2E38);
+    rect(f, x, y, 460, 4, 0xFF60_6070);
+    for i in 0..6 {
+        rect(f, x + 20, y + 40 + i * 52, 400, 18, 0xFFD0_D0D8);
+    }
+}
+
+/// 10 frames: a cursor sweeping, a menu opening (frame 4), a hover highlight
+/// (frame 6), the menu closing (frame 8).
+fn scenario() -> Vec<Vec<u32>> {
+    let base = base_frame();
+    let cursor_pos = [
+        (100, 100),
+        (150, 112),
+        (200, 124),
+        (250, 136),
+        (300, 168),
+        (330, 180),
+        (360, 196),
+        (400, 208),
+        (520, 240),
+        (560, 252),
+    ];
+    let mut frames = Vec::new();
+    for (i, (cx, cy)) in cursor_pos.iter().enumerate() {
+        let mut f = base.clone();
+        if (4..=7).contains(&i) {
+            menu(&mut f, 1500, 700);
+            if i == 6 {
+                rect(&mut f, 1520, 740 + 3 * 52, 400, 18, 0xFF50_80C0);
+            }
+        }
+        cursor(&mut f, *cx, *cy);
+        frames.push(f);
+    }
+    frames
+}
+
+struct PassStats {
+    sizes: Vec<usize>,
+    counts: Vec<usize>,
+    enc_us: Vec<f64>,
+    dec_us: Vec<f64>,
+}
+
+fn correctness(geom: Geometry, frames: &[Vec<u32>]) -> Result<PassStats> {
+    // CPU
+    let mut enc = Encoder::new(geom)?;
+    enc.set_crc(false); // streaming path omits the CRC
+    let mut dec = Decoder::new(geom)?;
+    let mut buf = vec![0u8; geom.max_coded_len()];
+    let mut cpu = PassStats { sizes: vec![], counts: vec![], enc_us: vec![], dec_us: vec![] };
+    for (i, frame) in frames.iter().enumerate() {
+        let fb = words_bytes(frame);
+        let n = enc.encode(fb, &mut buf)?;
+        if dec.decode(&buf[..n])? != fb {
+            bail!("CPU round trip mismatch at frame {i}");
+        }
+        cpu.counts.push(Header::parse(&buf[..n])?.count as usize);
+        cpu.sizes.push(n);
+        cpu.enc_us.push(0.0);
+        cpu.dec_us.push(0.0);
+    }
+
+    // GPU: output must match the source and be CPU-decodable
+    let mut gpu = GpuCodec::new(geom)?;
+    let mut dec_cross = Decoder::new(geom)?;
+    let mut g = PassStats { sizes: vec![], counts: vec![], enc_us: vec![], dec_us: vec![] };
+    for (i, frame) in frames.iter().enumerate() {
+        let fb = words_bytes(frame);
+        gpu.upload(fb)?;
+        gpu.sync();
+        let n = gpu.encode(i == 0)?;
+        let count = Header::parse(gpu.coded(n))?.count as usize;
+        gpu.decode(count)?;
+        if count != cpu.counts[i] || n != cpu.sizes[i] {
+            bail!(
+                "GPU counts/size differ at frame {i}: gpu {count}/{n} vs cpu {}/{}",
+                cpu.counts[i],
+                cpu.sizes[i]
+            );
+        }
+        if gpu.read_frame()? != fb {
+            bail!("GPU decode mismatch at frame {i}");
+        }
+        if dec_cross.decode(gpu.coded(n))? != fb {
+            bail!("CPU decode of GPU frame mismatch at frame {i}");
+        }
+        g.counts.push(count);
+        g.sizes.push(n);
+        g.enc_us.push(0.0);
+        g.dec_us.push(0.0);
+    }
+    eprintln!("[correctness] all {} frames bit-exact CPU↔GPU (both directions)", frames.len());
+    Ok(cpu)
+}
+
+fn cpu_timing(geom: Geometry, frames: &[Vec<u32>]) -> Result<PassStats> {
+    let mut enc = Encoder::new(geom)?;
+    enc.set_crc(false); // streaming path omits the CRC
+    let mut dec = Decoder::new(geom)?;
+    let mut buf = vec![0u8; geom.max_coded_len()];
+    let mut s = PassStats { sizes: vec![], counts: vec![], enc_us: vec![], dec_us: vec![] };
+    for (i, frame) in frames.iter().enumerate() {
+        let fb = words_bytes(frame);
+        let t = Instant::now();
+        let n = enc.encode(fb, &mut buf)?;
+        s.enc_us.push(t.elapsed().as_secs_f64() * 1e3);
+        let t = Instant::now();
+        let out = dec.decode(&buf[..n])?;
+        s.dec_us.push(t.elapsed().as_secs_f64() * 1e3);
+        debug_assert_eq!(out, fb);
+        s.counts.push(Header::parse(&buf[..n])?.count as usize);
+        s.sizes.push(n);
+        let _ = i;
+    }
+    Ok(s)
+}
+
+fn gpu_timing(geom: Geometry, frames: &[Vec<u32>]) -> Result<PassStats> {
+    let mut gpu = GpuCodec::new(geom)?;
+    let mut s = PassStats { sizes: vec![], counts: vec![], enc_us: vec![], dec_us: vec![] };
+    for (i, frame) in frames.iter().enumerate() {
+        let fb = words_bytes(frame);
+        gpu.upload(fb)?;
+        gpu.sync();
+        let t = Instant::now();
+        let n = gpu.encode(i == 0)?;
+        s.enc_us.push(t.elapsed().as_secs_f64() * 1e3);
+        let count = Header::parse(gpu.coded(n))?.count as usize;
+        let t = Instant::now();
+        gpu.decode(count)?;
+        s.dec_us.push(t.elapsed().as_secs_f64() * 1e3);
+        s.counts.push(count);
+        s.sizes.push(n);
+    }
+    Ok(s)
+}
+
+fn main() -> Result<()> {
+    let geom = Geometry::new(W, H, W * 4);
+    let raw = geom.frame_bytes();
+    eprintln!(
+        "geometry {}x{} stride {} tile {} → {} tiles | raw frame {:.2} MiB | slot {:.2} MiB",
+        W,
+        H,
+        W * 4,
+        1 << geom.tile_log2,
+        geom.tile_count(),
+        raw as f64 / (1024.0 * 1024.0),
+        geom.max_coded_len() as f64 / (1024.0 * 1024.0)
+    );
+
+    let frames = scenario();
+    let _ = correctness(geom, &frames)?;
+
+    let cpu = cpu_timing(geom, &frames)?;
+    let gpu = gpu_timing(geom, &frames)?;
+
+    // CRC cost, for context: it runs over the *coded* payload each frame.
+    let big = vec![0u8; raw];
+    let t = Instant::now();
+    let c = crc32(&big);
+    let crc_ms = t.elapsed().as_secs_f64() * 1e3;
+    eprintln!(
+        "[context] crc32 over a full {} MiB payload: {:.1} ms ({:08x})",
+        raw / (1024 * 1024),
+        crc_ms,
+        c
+    );
+
+    println!();
+    println!(
+        "{:>5} {:>6} {:>13} {:>9} {:>11} {:>11} {:>11} {:>11}",
+        "frame", "tiles", "coded bytes", "saving", "cpu enc", "gpu enc", "cpu dec", "gpu dec"
+    );
+    let mut tot_raw = 0u64;
+    let mut tot_coded = 0u64;
+    let mut sum = [0f64; 4];
+    for i in 0..frames.len() {
+        let coded = gpu.sizes[i];
+        println!(
+            "{:>5} {:>6} {:>13} {:>8.1}x {:>9.2}ms {:>9.2}ms {:>9.2}ms {:>9.2}ms",
+            i,
+            gpu.counts[i],
+            coded,
+            raw as f64 / coded as f64,
+            cpu.enc_us[i],
+            gpu.enc_us[i],
+            cpu.dec_us[i],
+            gpu.dec_us[i],
+        );
+        tot_raw += raw as u64;
+        tot_coded += coded as u64;
+        sum[0] += cpu.enc_us[i];
+        sum[1] += gpu.enc_us[i];
+        sum[2] += cpu.dec_us[i];
+        sum[3] += gpu.dec_us[i];
+    }
+    let n = frames.len() as f64;
+    // exclude the full first frame from the steady-state delta average
+    let deltas = &gpu.sizes[1..];
+    let avg_delta = deltas.iter().sum::<usize>() as f64 / deltas.len() as f64;
+    println!();
+    println!(
+        "10-frame total: raw {:.1} MiB → coded {:.1} MiB  ({:.1}x less over the wire)",
+        tot_raw as f64 / 1048576.0,
+        tot_coded as f64 / 1048576.0,
+        tot_raw as f64 / tot_coded as f64
+    );
+    println!(
+        "steady-state delta (frames 1..9): avg {:.0} B/frame vs {:.1} MiB raw  →  {:.0}x",
+        avg_delta,
+        raw as f64 / 1048576.0,
+        raw as f64 / avg_delta
+    );
+    println!(
+        "avg/frame: cpu enc {:.2}ms  gpu enc {:.2}ms  |  cpu dec {:.2}ms  gpu dec {:.2}ms",
+        sum[0] / n,
+        sum[1] / n,
+        sum[2] / n,
+        sum[3] / n
+    );
+    println!(
+        "avg/frame excluding full frame 0: cpu enc {:.2}ms  gpu enc {:.2}ms  |  cpu dec {:.2}ms  gpu dec {:.2}ms",
+        (sum[0] - cpu.enc_us[0]) / (n - 1.0),
+        (sum[1] - gpu.enc_us[0]) / (n - 1.0),
+        (sum[2] - cpu.dec_us[0]) / (n - 1.0),
+        (sum[3] - gpu.dec_us[0]) / (n - 1.0),
+    );
+    Ok(())
+}
