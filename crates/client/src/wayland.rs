@@ -46,6 +46,10 @@ use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::{self, WpFractionalScaleV1};
+use wayland_protocols::wp::presentation_time::client::wp_presentation::{self, WpPresentation};
+use wayland_protocols::wp::presentation_time::client::wp_presentation_feedback::{
+    self, WpPresentationFeedback,
+};
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use wayland_protocols::xdg::shell::client::xdg_surface::{self, XdgSurface};
@@ -56,6 +60,13 @@ pub struct Presenter {
     conn: Connection,
     queue: EventQueue<St>,
     state: St,
+}
+
+/// One in-flight wp_presentation feedback: `id` is our correlation handle,
+/// `proxy` is kept alive until the compositor answers presented/discarded.
+struct Fb {
+    id: u64,
+    proxy: WpPresentationFeedback,
 }
 
 struct St {
@@ -102,6 +113,17 @@ struct St {
     /// the live inhibitor for our surface (Some ⇔ keyboard grabbed); kept
     /// alive across focus shuffles so it re-engages on re-focus
     inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
+    /// wp_presentation: the compositor's true on-screen timestamp for the
+    /// commit that carried a frame — the `display`/end-to-end metrics stage
+    presentation: Option<WpPresentation>,
+    /// clock domain wp_presentation timestamps use (KWin: CLOCK_MONOTONIC)
+    pres_clock: i32,
+    /// feedback objects still awaiting presented/discarded
+    fbs: Vec<Fb>,
+    /// completed feedbacks, arrival order: (id, client-unix-us, presented)
+    fb_done: std::collections::VecDeque<(u64, u64, bool)>,
+    /// id to hand to the next feedback request
+    fb_next: u64,
     /// grab-mode keep-alives (dropping them releases the constraint)
     rel_obj: Option<ZwpRelativePointerV1>,
     locked_obj: Option<ZwpLockedPointerV1>,
@@ -196,6 +218,28 @@ const POLLHUP: i16 = 0x0010;
 const POLLERR: i16 = 0x0008;
 const LIBC_EINTR: i32 = 4;
 
+// --- presentation clock conversion -----------------------------------------
+// wp_presentation timestamps are expressed in the compositor's clock domain
+// (KWin: CLOCK_MONOTONIC). Sampling both clocks once gives the constant
+// realtime-monotonic offset; both tick at the same rate, so the conversion is
+// exact to clock-read granularity.
+#[allow(clippy::useless_conversion)] // time_t/c_long: i64 here, i32 elsewhere
+fn clock_us(clk: libc::clockid_t) -> i64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(clk, &mut ts) };
+    i64::from(ts.tv_sec) * 1_000_000 + i64::from(ts.tv_nsec) / 1000
+}
+
+/// `wp_presentation` timestamp (in clock `clk`) -> unix-epoch microseconds.
+fn presentation_to_unix_us(clk: libc::clockid_t, secs: u64, nsec: u32) -> u64 {
+    let delta = clock_us(libc::CLOCK_REALTIME) - clock_us(clk);
+    let ts = secs as i64 * 1_000_000 + nsec as i64 / 1000;
+    (ts + delta).max(0) as u64
+}
+
 impl Presenter {
     /// Connect to the compositor, build the window, map it with an early
     /// empty commit, and block until the initial xdg configure arrives.
@@ -239,6 +283,11 @@ impl Presenter {
         // then only takes the mouse (and says so).
         let inhibit_mgr: Option<ZwpKeyboardShortcutsInhibitManagerV1> =
             globals.bind(&qh, 1..=1, ()).ok();
+        // wp_presentation: the compositor reports the true on-screen time of
+        // each committed frame (KWin: the DRM page-flip timestamp), which is
+        // the only honest end of the video-latency chain. Absence only means
+        // the metrics `display` stage reads n/a.
+        let presentation: Option<WpPresentation> = globals.bind(&qh, 1..=2, ()).ok();
         // viewporter + fractional-scale: buffer stays at the NATIVE guest
         // frame size; the compositor maps it 1:1 onto physical pixels at
         // whatever output scale the desktop runs (no upscale/blur)
@@ -250,13 +299,17 @@ impl Presenter {
         let decoration_mgr: Option<ZxdgDecorationManagerV1> =
             globals.bind(&qh, 1..=1, ()).ok();
         eprintln!(
-            "[wl] bound compositor v{} wm_base v{} seat v{} cursor-shape {} fractional-scale {} shortcuts-inhibit {}",
+            "[wl] bound compositor v{} wm_base v{} seat v{} cursor-shape {} fractional-scale {} shortcuts-inhibit {} presentation {}",
             compositor.version(),
             wmbase.version(),
             seat.version(),
             if cursor_mgr.is_some() { "v1" } else { "unavailable" },
             if fs_mgr.is_some() { "v1" } else { "unavailable" },
             if inhibit_mgr.is_some() { "v1" } else { "unavailable" },
+            match presentation.as_ref().map(|p| p.version()) {
+                Some(v) => format!("v{v}"),
+                None => "unavailable".to_string(),
+            },
         );
 
         let surface = compositor.create_surface(&qh, ());
@@ -308,6 +361,11 @@ impl Presenter {
                 constraints,
                 inhibit_mgr,
                 inhibitor: None,
+                presentation,
+                pres_clock: libc::CLOCK_MONOTONIC,
+                fbs: Vec::new(),
+                fb_done: std::collections::VecDeque::new(),
+                fb_next: 0,
                 rel_obj: None,
                 locked_obj: None,
                 grabbed: false,
@@ -446,6 +504,31 @@ impl Presenter {
     /// caller routes it to `EglWindow::resize`.
     pub fn take_resize(&mut self) -> Option<(u32, u32)> {
         self.state.pending_resize.take()
+    }
+
+    /// Whether the compositor exposes wp_presentation (metrics `display`).
+    pub fn has_presentation(&self) -> bool {
+        self.state.presentation.is_some()
+    }
+
+    /// Request a presentation feedback for the NEXT commit of our surface.
+    /// MUST be called immediately before the commit that attaches the frame
+    /// (eglSwapBuffers). Returns the id to hand to `Metrics::record`; `None`
+    /// when wp_presentation is unavailable.
+    pub fn request_present_feedback(&mut self) -> Option<u64> {
+        let pres = self.state.presentation.clone()?;
+        let qh = self.queue.handle();
+        let id = self.state.fb_next;
+        self.state.fb_next += 1;
+        let proxy = pres.feedback(&self.state.surface, &qh, ());
+        self.state.fbs.push(Fb { id, proxy });
+        Some(id)
+    }
+
+    /// Drain completed feedbacks: `(id, client-unix-us, presented)`. Present
+    /// in commit order; the caller folds each into the matching metrics sample.
+    pub fn take_presented(&mut self) -> Vec<(u64, u64, bool)> {
+        self.state.fb_done.drain(..).collect()
     }
 }
 
@@ -655,6 +738,14 @@ impl St {
             self.pending_resize = Some((dw, dh));
         }
     }
+
+    /// Queue a presentation result for the main loop (bounded).
+    fn push_presented(&mut self, id: u64, unix_us: u64, presented: bool) {
+        if self.fb_done.len() >= 256 {
+            self.fb_done.pop_front();
+        }
+        self.fb_done.push_back((id, unix_us, presented));
+    }
 }
 
 // --- Dispatch implementations (wayland-client 0.31 requires them per object
@@ -776,6 +867,60 @@ impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for St {
                 );
             }
             _ => {}
+        }
+    }
+}
+
+/// wp_presentation: the compositor announces which clock its feedback
+/// timestamps use. KWin reports CLOCK_MONOTONIC; we honor whatever arrives so
+/// the unix conversion stays correct on compositors that use CLOCK_REALTIME.
+impl Dispatch<WpPresentation, ()> for St {
+    fn event(
+        state: &mut St,
+        _: &WpPresentation,
+        ev: <WpPresentation as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<St>,
+    ) {
+        if let wp_presentation::Event::ClockId { clk_id } = ev {
+            state.pres_clock = clk_id as i32;
+        }
+    }
+}
+
+/// One feedback per presented commit. `presented` carries the on-screen time
+/// (converted from the presentation clock to unix-epoch micros); `discarded`
+/// means the compositor never showed that commit. Either event finishes the
+/// object, so the kept-alive proxy is dropped here.
+impl Dispatch<WpPresentationFeedback, ()> for St {
+    fn event(
+        state: &mut St,
+        obj: &WpPresentationFeedback,
+        ev: <WpPresentationFeedback as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<St>,
+    ) {
+        let (unix_us, presented) = match ev {
+            wp_presentation_feedback::Event::Presented {
+                tv_sec_hi,
+                tv_sec_lo,
+                tv_nsec,
+                ..
+            } => {
+                let secs = ((tv_sec_hi as u64) << 32) | tv_sec_lo as u64;
+                (
+                    presentation_to_unix_us(state.pres_clock, secs, tv_nsec),
+                    true,
+                )
+            }
+            wp_presentation_feedback::Event::Discarded => (0, false),
+            _ => return, // sync_output: which output; not needed here
+        };
+        if let Some(i) = state.fbs.iter().position(|f| f.proxy.id() == obj.id()) {
+            let f = state.fbs.remove(i);
+            state.push_presented(f.id, unix_us, presented);
         }
     }
 }

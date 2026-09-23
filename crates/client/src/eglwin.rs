@@ -587,11 +587,14 @@ impl EglWindow {
                 GL_UNSIGNED_BYTE,
                 bytes.as_ptr() as *const c_void,
             );
+            // t4: the upload call itself. Stamp BEFORE glGetError: the error
+            // query forces the driver to process queued commands, so timing
+            // after it would bill the upload for the driver's flush.
+            t4 = rdma_display_proto::unix_now_us();
             let gl_err = (self.gl.get_error)();
             if gl_err != 0 {
                 bail!("upload glError 0x{gl_err:04x}");
             }
-            t4 = rdma_display_proto::unix_now_us();
             (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
             (self.gl.use_program)(self.prog);
             (self.gl.uniform_2f)(

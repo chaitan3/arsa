@@ -26,6 +26,43 @@ pub use qemu::QemuDbusSource;
 
 use anyhow::Result;
 
+/// How the DRM/KMS source chooses which framebuffer to capture relative to
+/// the compositor's flips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureSync {
+    /// Capture the fb that was just superseded. Always safe — that buffer
+    /// scanned out for a full interval and is complete — but the mirrored
+    /// image is one compositor frame old.
+    OneBehind,
+    /// Capture the current fb immediately when its commit is observed — no
+    /// vblank wait and no one-behind. **Testing only:** the buffer may still
+    /// be mid-render or not yet latched (this stack has no producer fence), so
+    /// the image can tear or be a frame early. Exists to measure the latency
+    /// floor and to see how badly this stack tears, not for regular use.
+    Zero,
+    /// Capture the current fb as soon as the vblank that latches it has
+    /// retired, so the mirrored image is the one actually on screen now.
+    /// Falls back to one-behind for a frame when no vblank arrives in time
+    /// (VRR idle, low refresh) and degrades permanently if vblank never
+    /// advances.
+    Vblank,
+    /// Try [`CaptureSync::Vblank`], degrade to [`CaptureSync::OneBehind`] if
+    /// vblank turns out to be unusable on this driver/display.
+    Auto,
+}
+
+impl CaptureSync {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "onbehind" | "one-behind" | "off" => Some(Self::OneBehind),
+            "zero" | "now" => Some(Self::Zero),
+            "vblank" => Some(Self::Vblank),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+}
+
 /// Format of one scanout (dmabuf-backed or plain).
 #[derive(Debug, Clone)]
 pub struct FrameFormat {
@@ -61,13 +98,24 @@ pub fn fourcc_name(fourcc: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::fourcc_name;
+    use super::{fourcc_name, CaptureSync};
 
     #[test]
     fn fourcc_names() {
         assert_eq!(fourcc_name(0x3432_5258), "XR24");
         assert_eq!(fourcc_name(0x3033_4241), "AB30"); // DRM_FORMAT_ABGR2101010
         assert_eq!(fourcc_name(0), "....");
+    }
+
+    #[test]
+    fn capture_sync_parse() {
+        assert_eq!(CaptureSync::parse("onbehind"), Some(CaptureSync::OneBehind));
+        assert_eq!(CaptureSync::parse("off"), Some(CaptureSync::OneBehind));
+        assert_eq!(CaptureSync::parse("zero"), Some(CaptureSync::Zero));
+        assert_eq!(CaptureSync::parse("now"), Some(CaptureSync::Zero));
+        assert_eq!(CaptureSync::parse("vblank"), Some(CaptureSync::Vblank));
+        assert_eq!(CaptureSync::parse("auto"), Some(CaptureSync::Auto));
+        assert_eq!(CaptureSync::parse("nope"), None);
     }
 }
 
@@ -98,7 +146,11 @@ pub struct DirtyRect {
 #[derive(Debug)]
 pub enum CaptureEvent {
     /// New dmabuf-backed scanout (fds owned by the event).
-    Scanout(DmabufScanout),
+    /// `t0_unix_us` = when the frame became visible at the source: for DRM the
+    /// flip that put it on screen (the one-behind read captures the previous
+    /// fb, so this is one flip earlier than the poll that noticed it), for
+    /// QEMU the D-Bus scanout event.
+    Scanout(DmabufScanout, u64),
     /// New plain (host-memory) scanout: format + full-frame bytes.
     /// `t0_unix_us` = when the D-Bus event arrived (latency t0 stamp).
     PlainScanout(FrameFormat, Vec<u8>, u64),

@@ -1,33 +1,51 @@
 //! Client-side latency/bandwidth diagnostics (`--metrics`).
 //!
-//! Measurement model:
+//! Measurement model
+//! =================
 //!
-//! ```text
-//! t0 (server) QEMU D-Bus event arrived in the capture thread
-//! t1 (server) materializer readback finished (glFinish done, slot populated)
-//! t2 (server) RDMA WRITE posted
-//! t3 (client) frame completion polled from the recv CQ
-//! t4 (client) glTexImage2D upload returned
-//! t5 (client) eglSwapBuffers returned
-//! ```
+//! Every reported stage is a duration measured on ONE host, so no stage
+//! depends on the two machines sharing a clock:
 //!
-//! Stages (rolling median/p95 over the last N frames):
-//!   capture = t1-t0, split into:
-//!     q   = t0d-t0  (pacing gate + event-queue wait in the server loop)
-//!     sw  = t1s-t0d (staging-slot credit wait; nonzero => client lagging)
-//!     mat = t1-t1s  (dmabuf import + blit + readback + glFinish)
-//!   xfer    = t2c-t2  (RDMA WRITE transfer; both stamps same-host, exact)
-//!   poll    = t3-t2c  (client poll granularity; uses the clock offset)
-//!   upload  = t4-t3  (texImage2D from pinned RAM over PCIe)
-//!   present = t5-t4  (blit + swap submission; compositor lag not included)
-//!   e2e     = t5-t0, corrected by the ping-pong clock offset estimate
+//! Server (all `unix_now_us` on the server; differences are exact):
+//!   t0  = capture event latched (QEMU D-Bus arrival / DRM scanout poll)
+//!   t0d = the sender picked the frame up (pacing + event-queue wait done)
+//!   t1s = a staging slot was free (after any credit wait)
+//!   t1  = materializer readback finished (slot holds the pixels)
+//!   t2  = RDMA WRITE posted to the NIC
+//!   t2c = send CQ reported the WRITE complete (frame written on the client)
 //!
-//! Cross-host comparability: the offset estimate comes from `Ping`/`Pong`
-//! on the control channel — offset = s1 - (c0+c2)/2 taken from the **min-RTT**
-//! sample of the recent window (least queuing => tightest ±rtt/2 bound),
-//! refreshed every couple of seconds so real drift is tracked. Only `e2e`
-//! and `poll` use it; `xfer` is same-host and exact. Known honesty limit:
-//! t5 is SwapBuffers return, not the monitor's scanout.
+//!   queue    = t0d - t0    capture queue / pacing
+//!   slot     = t1s - t0d   staging-slot credit wait
+//!   material = t1 - t1s    dmabuf import + blit + readback + fence
+//!   post     = t2 - t1     WQE build + post
+//!   transfer = t2c - t2    RDMA WRITE as the SENDER saw it (one-sided)
+//!
+//! Client (all `unix_now_us` on the client; differences are exact):
+//!   t3  = recv CQ completion observed for the frame
+//!   t4  = glTexImage2D returned (upload queued)
+//!   t5  = eglSwapBuffers returned (frame submitted to the compositor)
+//!   tp  = compositor's on-screen timestamp (wp_presentation, client clock)
+//!
+//!   upload  = t4 - t3      upload call
+//!   present = t5 - t4      draw + swap submission
+//!   display = tp - t5      compositor queue + scanout (0 = feedback pending)
+//!
+//! Network latency is measured independently on each side — the server
+//! brackets its own WRITE (t2 -> t2c) and the client measures a ping/pong
+//! round trip entirely on its own clock (one-way estimate = rtt/2). No
+//! network number subtracts timestamps taken on different machines.
+//!
+//! End to end is assembled from those per-host pieces rather than from a
+//! cross-host timestamp subtraction (so clock skew cannot poison it):
+//!
+//!   e2e = (t2c - t0) + (client_end - t3)
+//!       = queue+slot+material+post+transfer + upload+present+display
+//!
+//! The only unmeasured sliver is the client's CQE observation delay between
+//! the server's send completion and t3 (polling granularity, sub-ms). The
+//! min-RTT ping/pong offset is still tracked for diagnostics, but no reported
+//! stage depends on it. Known honesty limit: without wp_presentation
+//! (`display n/a`) the client span ends at SwapBuffers return, not scanout.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -38,11 +56,13 @@ use rdma_display_rdma::ControlEvent;
 const WINDOW: usize = 64;
 /// Max frames kept waiting for their server stamp (staleness guard).
 const PENDING_CAP: usize = 256;
-/// Overlay geometry: 8px font, COLS columns wide, LINES lines tall.
-const COLS: usize = 48;
-const LINES: usize = 8;
-pub const OVERLAY_W: u32 = (COLS * 8 + 8) as u32;
-pub const OVERLAY_H: u32 = (LINES * 8 + 8) as u32;
+/// Overlay geometry: 8x8 bitmap glyphs scaled by `FONT_SCALE` (2 = twice the
+/// old UI in each dimension), `COLS` columns, `LINES` lines.
+const FONT_SCALE: usize = 2;
+const COLS: usize = 50;
+const LINES: usize = 11;
+pub const OVERLAY_W: u32 = ((COLS * 8 + 8) * FONT_SCALE) as u32;
+pub const OVERLAY_H: u32 = ((LINES * 8 + 8) * FONT_SCALE) as u32;
 /// Milliseconds between overlay text refreshes.
 pub const REFRESH_MS: u64 = 250;
 /// Seconds between clock-sync pings.
@@ -52,25 +72,46 @@ const SPIKE_E2E_US: u64 = 40_000;
 
 #[derive(Clone, Copy)]
 struct Sample {
-    q: u64,    // pacing + event-queue wait (t0d - t0)
-    sw: u64,   // staging-slot credit wait (t1s - t0d)
-    mat: u64,  // materialize total (t1 - t1s)
-    blit: u64, // GPU executed our draw (fence wait) — from the server
-    read: u64, // readback DMA into the staging slot — from the materializer
-    fin: u64,  // residual glFinish — from the materializer
-    xfer: u64, // RDMA WRITE transfer (t2c - t2; same-host, exact)
-    poll: u64, // completion -> client poll (t3 - t2c, offset-corrected)
-    upl: u64,
-    pres: u64,
-    e2e: u64, // clock-corrected
+    seq: u64,
+    // --- server-side durations (same host, exact) ------------------------
+    q: u64,     // t0d - t0   capture queue / pacing
+    sw: u64,    // t1s - t0d  staging-slot credit wait
+    mat: u64,   // t1 - t1s   materialize
+    blit: u64,  // draw-call latency (from the materializer)
+    read: u64,  // readback DMA (from the materializer)
+    fin: u64,   // fence/glFinish residual (from the materializer)
+    post: u64,  // t2 - t1    WQE build + post
+    xfer: u64,  // t2c - t2   RDMA WRITE as the sender saw it
+    // --- client-side durations (same host, exact) ------------------------
+    t5: u64,    // swap return (client clock; anchor for `disp`)
+    upl: u64,   // t4 - t3    upload call
+    pres: u64,  // t5 - t4    draw + swap submission
+    disp: u64,  // tp - t5    compositor queue + scanout (0 = unknown)
+    // --- clock-free end to end -------------------------------------------
+    e2e: u64, // (t2c - t0) + (client_end - t3)
+    fb_id: Option<u64>,
+}
+
+/// One presented frame whose server stamp has not arrived yet.
+#[derive(Clone, Copy)]
+struct Local {
+    seq: u64,
+    t3: u64,
+    t4: u64,
+    t5: u64,
+    fb_id: Option<u64>,
+    /// presentation timestamp that beat the server stamp here
+    presented: Option<u64>,
 }
 
 pub struct Metrics {
     samples: VecDeque<Sample>,
-    /// presented frames awaiting their server stamp: (seq, t3, t4, t5)
-    local: VecDeque<(u64, u64, u64, u64)>,
+    /// presented frames awaiting their server stamp: see [`Local`]
+    local: VecDeque<Local>,
     /// server stamps that arrived before their frame was presented
     stamps: HashMap<u64, FrameStamp>,
+    /// presentation timestamps whose frame was already matched: fb_id -> us
+    presented: HashMap<u64, u64>,
     frame_bytes: usize,
     last_seq: Option<u64>,
     skipped: u64,
@@ -78,6 +119,8 @@ pub struct Metrics {
     last_refresh: Option<std::time::Instant>,
     last_ping: Option<std::time::Instant>,
     clock: ClockSync,
+    /// whether the presenter bound wp_presentation (display stage meaningful)
+    onscreen: bool,
     text: String,
 }
 
@@ -112,7 +155,8 @@ impl ClockSync {
             .map(|s| s.0)
     }
 
-    /// Smallest RTT seen recently (the offset's uncertainty bound: ±rtt/2).
+    /// Smallest RTT seen recently (the tightest bound on true propagation and
+    /// the basis of the offset estimate: ±rtt/2).
     fn rtt_min(&self) -> Option<u64> {
         self.samples.iter().map(|s| s.1).min()
     }
@@ -124,6 +168,7 @@ impl Metrics {
             samples: VecDeque::with_capacity(WINDOW),
             local: VecDeque::with_capacity(4),
             stamps: HashMap::new(),
+            presented: HashMap::new(),
             frame_bytes: 0,
             last_seq: None,
             skipped: 0,
@@ -131,6 +176,7 @@ impl Metrics {
             last_refresh: None,
             last_ping: None,
             clock: ClockSync::new(),
+            onscreen: false,
             text: String::new(),
         }
     }
@@ -139,10 +185,17 @@ impl Metrics {
         self.frame_bytes = bytes;
     }
 
+    /// Tell the overlay whether wp_presentation is bound, so the `display`
+    /// stage reads a real number instead of a misleading 0.00.
+    pub fn set_onscreen(&mut self, supported: bool) {
+        self.onscreen = supported;
+    }
+
     /// One presented frame: the presenter loop stamps t3 when the RDMA
-    /// completion is polled and t4/t5 inside the GL calls. The sample is
-    /// only counted once the server's stamp for `seq` arrives.
-    pub fn record(&mut self, seq: u64, t3: u64, t4: u64, t5: u64) {
+    /// completion is observed and t4/t5 inside the GL calls; `fb_id` is the
+    /// wp_presentation feedback requested for this commit. The sample is only
+    /// counted once the server's stamp for `seq` arrives.
+    pub fn record(&mut self, seq: u64, t3: u64, t4: u64, t5: u64, fb_id: Option<u64>) {
         // sequence gaps (imm carries seq mod 2^24) => dropped/skipped frames
         if let Some(last) = self.last_seq {
             let diff = seq.wrapping_sub(last) & 0x00ff_ffff;
@@ -156,7 +209,14 @@ impl Metrics {
         if self.local.len() >= PENDING_CAP {
             self.local.pop_front();
         }
-        self.local.push_back((seq, t3, t4, t5));
+        self.local.push_back(Local {
+            seq,
+            t3,
+            t4,
+            t5,
+            fb_id,
+            presented: None,
+        });
         self.try_match();
     }
 
@@ -178,60 +238,93 @@ impl Metrics {
         }
     }
 
+    /// Attach a wp_presentation result to its frame: the frame may still be
+    /// waiting for its server stamp (stash it) or already be matched (update
+    /// the `display` stage and the end-to-end total in place).
+    pub fn on_presented(&mut self, fb_id: u64, unix_us: u64, presented: bool) {
+        if !presented {
+            // discarded (superseded / not shown): leave `display` unknown
+            return;
+        }
+        if let Some(l) = self.local.iter_mut().find(|l| l.fb_id == Some(fb_id)) {
+            l.presented = Some(unix_us);
+            return;
+        }
+        if let Some(s) = self.samples.iter_mut().find(|s| s.fb_id == Some(fb_id)) {
+            set_disp(s, unix_us);
+            return;
+        }
+        if self.presented.len() >= PENDING_CAP {
+            self.presented.clear();
+        }
+        self.presented.insert(fb_id, unix_us);
+    }
+
     /// Emit samples whose stamp arrived. Frames are presented in order and
     /// stamps arrive in order, so the oldest unmatched local entry decides.
     fn try_match(&mut self) {
         while let Some(front) = self.local.front().copied() {
-            let (seq, t3, t4, t5) = front;
-            match self.stamps.remove(&seq) {
-                Some(s) => {
-                    self.local.pop_front();
-                    let off = self.clock.offset().unwrap_or(0);
-                    // poll: client saw the completion at t3 (client clock);
-                    // t2c is server clock, client clock = server clock - off,
-                    // so the true gap is t3 - (t2c - off) = t3 - t2c + off
-                    let poll = (t3 as i64 + off as i64 - s.t2c as i64).max(0) as u64;
-                    let sample = Sample {
-                        q: s.t0d.saturating_sub(s.t0),
-                        sw: s.t1s.saturating_sub(s.t0d),
-                        mat: s.t1.saturating_sub(s.t1s),
-                        blit: s.blit_us,
-                        read: s.read_us,
-                        fin: s.fin_us,
-                        xfer: s.t2c.saturating_sub(s.t2),
-                        poll,
-                        upl: t4.saturating_sub(t3),
-                        pres: t5.saturating_sub(t4),
-                        e2e: (t5 as i64 + off as i64 - s.t0 as i64).max(0) as u64,
-                    };
-                    // sanity filter: clock garbage or clamped-stale stamps
-                    // (shouldn't happen post-fix) must not poison medians
-                    if sample.e2e > 3_000_000 || sample.poll > 3_000_000 {
-                        continue;
-                    }
-                    if self.samples.len() == WINDOW {
-                        self.samples.pop_front();
-                    }
-                    self.samples.push_back(sample);
-                    if sample.e2e > SPIKE_E2E_US {
-                        eprintln!(
-                            "[metrics-spike] seq={} e2e {:.2} ms | q {:.2} sw {:.2} mat {:.2} (b {:.2} r {:.2} f {:.2}) | xfer {:.2} poll {:.2} upl {:.2} pre {:.2}",
-                            seq,
-                            sample.e2e as f64 / 1000.0,
-                            sample.q as f64 / 1000.0,
-                            sample.sw as f64 / 1000.0,
-                            sample.mat as f64 / 1000.0,
-                            sample.blit as f64 / 1000.0,
-                            sample.read as f64 / 1000.0,
-                            sample.fin as f64 / 1000.0,
-                            sample.xfer as f64 / 1000.0,
-                            sample.poll as f64 / 1000.0,
-                            sample.upl as f64 / 1000.0,
-                            sample.pres as f64 / 1000.0,
-                        );
-                    }
-                }
-                None => break,
+            let Some(s) = self.stamps.remove(&front.seq) else {
+                break;
+            };
+            self.local.pop_front();
+            // on-screen time may have beaten or trailed the server stamp
+            let tp = front
+                .presented
+                .or_else(|| front.fb_id.and_then(|id| self.presented.remove(&id)));
+            // Server span (t2c - t0) and client span (client_end - t3) are
+            // each same-host differences: no cross-clock subtraction.
+            let q = s.t0d.saturating_sub(s.t0);
+            let sw = s.t1s.saturating_sub(s.t0d);
+            let mat = s.t1.saturating_sub(s.t1s);
+            let post = s.t2.saturating_sub(s.t1);
+            let xfer = s.t2c.saturating_sub(s.t2);
+            let upl = front.t4.saturating_sub(front.t3);
+            let pres = front.t5.saturating_sub(front.t4);
+            let disp = tp.map(|us| us.saturating_sub(front.t5)).unwrap_or(0);
+            let e2e = q + sw + mat + post + xfer + upl + pres + disp;
+            let sample = Sample {
+                seq: front.seq,
+                q,
+                sw,
+                mat,
+                blit: s.blit_us,
+                read: s.read_us,
+                fin: s.fin_us,
+                post,
+                xfer,
+                t5: front.t5,
+                upl,
+                pres,
+                disp,
+                e2e,
+                fb_id: front.fb_id,
+            };
+            // sanity filter: a garbage sample must not poison the medians
+            if sample.e2e > 3_000_000 {
+                continue;
+            }
+            if self.samples.len() == WINDOW {
+                self.samples.pop_front();
+            }
+            self.samples.push_back(sample);
+            if sample.e2e > SPIKE_E2E_US {
+                eprintln!(
+                    "[metrics-spike] seq={} end-to-end {:.2} ms | queue {:.2} slot {:.2} material {:.2} (blit {:.2} read {:.2} finish {:.2}) | post {:.2} transfer {:.2} | upload {:.2} present {:.2} display {:.2}",
+                    sample.seq,
+                    sample.e2e as f64 / 1000.0,
+                    sample.q as f64 / 1000.0,
+                    sample.sw as f64 / 1000.0,
+                    sample.mat as f64 / 1000.0,
+                    sample.blit as f64 / 1000.0,
+                    sample.read as f64 / 1000.0,
+                    sample.fin as f64 / 1000.0,
+                    sample.post as f64 / 1000.0,
+                    sample.xfer as f64 / 1000.0,
+                    sample.upl as f64 / 1000.0,
+                    sample.pres as f64 / 1000.0,
+                    sample.disp as f64 / 1000.0,
+                );
             }
         }
     }
@@ -282,38 +375,74 @@ impl Metrics {
         let (b_m, _) = stat(|s| s.blit);
         let (r_m, _) = stat(|s| s.read);
         let (f_m, _) = stat(|s| s.fin);
-        let (net_m, net_p) = stat(|s| s.xfer + s.poll);
-        let (xf_m, xf_p) = stat(|s| s.xfer);
-        let (po_m, _) = stat(|s| s.poll);
-        let (upl_m, upl_p) = stat(|s| s.upl);
-        let (pre_m, pre_p) = stat(|s| s.pres);
+        let send = |s: &Sample| s.post + s.xfer;
+        let (send_m, send_p) = stat(send);
+        let (po_m, _) = stat(|s| s.post);
+        let (xf_m, _) = stat(|s| s.xfer);
+        let cli = |s: &Sample| s.upl + s.pres + s.disp;
+        let (cli_m, cli_p) = stat(cli);
+        let (upl_m, _) = stat(|s| s.upl);
+        let (pre_m, _) = stat(|s| s.pres);
+        let (disp_m, _) = stat(|s| s.disp);
+        // network: client-side ping/pong round trip (no cross-clock math);
+        // the min-RTT sample is the tightest bound on the true propagation
+        let rtt_min = self.clock.rtt_min().unwrap_or(0) as f64 / 1000.0;
 
         let mut t = String::with_capacity(COLS * LINES);
         t.push_str(&format!(
-            "seq {:>6}  fps {:>5.1}  {:>6.1} Mb/s",
+            "frame {:>6}   fps {:>5.1}   {:>6.1} Mbit/s",
             self.last_seq.unwrap_or(0) & 0x00ff_ffff,
             fps,
             mbps
         ));
-        t.push_str(&format!("\ne2e  {:>6.2} {:>6.2} ms", e2e_m, e2e_p));
-        t.push_str(&format!("\ncap  {:>6.2} {:>6.2}", cap_m, cap_p));
         t.push_str(&format!(
-            "\n  q {:>5.2} sw {:>5.2} mat {:>5.2}",
+            "\nend-to-end   p50 {:>6.2}   p95 {:>6.2} ms",
+            e2e_m, e2e_p
+        ));
+        t.push_str(&format!(
+            "\ncapture      p50 {:>6.2}   p95 {:>6.2} ms",
+            cap_m, cap_p
+        ));
+        t.push_str(&format!(
+            "\n  queue {:>5.2}  slot {:>5.2}  materialize {:>5.2}",
             q_m, sw_m, mat_m
         ));
         t.push_str(&format!(
-            "\n  b {:>5.2} r {:>5.2} f {:>5.2}",
+            "\n  blit {:>5.2}  readback {:>5.2}  finish {:>5.2}",
             b_m, r_m, f_m
         ));
         t.push_str(&format!(
-            "\nxfer {:>5.2} {:>5.2} poll {:>5.2} (net {:>5.2} {:>5.2})",
-            xf_m, xf_p, po_m, net_m, net_p
+            "\nserver send  p50 {:>6.2}   p95 {:>6.2} ms",
+            send_m, send_p
         ));
-        t.push_str(&format!("\nupl  {:>6.2} {:>6.2}", upl_m, upl_p));
-        t.push_str(&format!("\npre  {:>6.2} {:>6.2}", pre_m, pre_p));
-        let clk = match (self.clock.offset(), self.clock.rtt_min()) {
-            (Some(o), Some(r)) => format!("skip {}  clk {:+} us rttn {} us", self.skipped, o, r),
-            _ => format!("skip {}  clk syncing", self.skipped),
+        t.push_str(&format!(
+            "\n  post {:>5.2}  transfer {:>5.2}",
+            po_m, xf_m
+        ));
+        t.push_str(&format!(
+            "\nnetwork      rtt min {:>5.2}  one-way {:>5.2} ms",
+            rtt_min,
+            rtt_min / 2.0
+        ));
+        t.push_str(&format!(
+            "\nclient       p50 {:>6.2}   p95 {:>6.2} ms",
+            cli_m, cli_p
+        ));
+        let disp_field = if self.onscreen {
+            format!("{:>5.2}", disp_m)
+        } else {
+            "  n/a".to_string()
+        };
+        t.push_str(&format!(
+            "\n  upload {:>5.2}  present {:>5.2}  display {}",
+            upl_m, pre_m, disp_field
+        ));
+        let clk = match self.clock.offset() {
+            Some(o) => format!(
+                "session      skipped {}   clock {:+} us",
+                self.skipped, o
+            ),
+            None => format!("session      skipped {}   clock syncing", self.skipped),
         };
         t.push_str(&format!("\n{}", clk));
         // pad to the line budget so the raster size is stable
@@ -326,6 +455,16 @@ impl Metrics {
         } else {
             None
         }
+    }
+}
+
+/// Fold a presentation timestamp into a sample's `display` stage and keep the
+/// end-to-end total consistent.
+fn set_disp(s: &mut Sample, presented: u64) {
+    let d = presented.saturating_sub(s.t5);
+    if d != s.disp {
+        s.e2e = s.e2e.saturating_sub(s.disp).saturating_add(d);
+        s.disp = d;
     }
 }
 
@@ -345,9 +484,12 @@ pub fn snapshot(m: &Metrics) -> &str {
 // ---------------------------------------------------------------------------
 
 /// Rasterize `text` into an RGBA8 buffer of [`OVERLAY_W`]x[`OVERLAY_H`]:
-/// translucent black background, white glyphs, 8px monospace grid.
+/// translucent black background, white glyphs, 8px monospace grid scaled by
+/// [`FONT_SCALE`].
 pub fn rasterize(text: &str) -> Vec<u8> {
-    let mut buf = vec![0u8; (OVERLAY_W * OVERLAY_H * 4) as usize];
+    let w = OVERLAY_W as usize;
+    let h = OVERLAY_H as usize;
+    let mut buf = vec![0u8; w * h * 4];
     // background
     for px in buf.chunks_exact_mut(4) {
         px[0] = 0;
@@ -355,27 +497,35 @@ pub fn rasterize(text: &str) -> Vec<u8> {
         px[2] = 0;
         px[3] = 150;
     }
+    let s = FONT_SCALE;
     for (row, line) in text.split('\n').take(LINES).enumerate() {
         for (col, ch) in line.chars().take(COLS).enumerate() {
             let glyph = &FONT8X8[(ch as usize).min(127)];
-            let ox = 4 + col * 8;
-            let oy = 4 + row * 8;
+            let ox = (4 + col * 8) * s;
+            let oy = (4 + row * 8) * s;
             for gy in 0..8 {
                 let bits = glyph[gy];
                 for gx in 0..8 {
                     if (bits >> gx) & 1 == 0 {
                         continue;
                     }
-                    let x = ox + gx;
-                    let y = oy + gy;
-                    if x >= OVERLAY_W as usize || y >= OVERLAY_H as usize {
-                        continue;
+                    for sy in 0..s {
+                        let y = oy + gy * s + sy;
+                        if y >= h {
+                            continue;
+                        }
+                        for sx in 0..s {
+                            let x = ox + gx * s + sx;
+                            if x >= w {
+                                continue;
+                            }
+                            let o = (y * w + x) * 4;
+                            buf[o] = 255;
+                            buf[o + 1] = 255;
+                            buf[o + 2] = 255;
+                            buf[o + 3] = 255;
+                        }
                     }
-                    let o = (y * OVERLAY_W as usize + x) * 4;
-                    buf[o] = 255;
-                    buf[o + 1] = 255;
-                    buf[o + 2] = 255;
-                    buf[o + 3] = 255;
                 }
             }
         }
@@ -525,3 +675,108 @@ const RAW: [[u8; 8]; 128] = [
     [0x6E, 0x3B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // ~
     [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // DEL
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rdma_display_rdma::ControlEvent;
+
+    fn stamp(seq: u64) -> FrameStamp {
+        FrameStamp {
+            seq,
+            t0: 1_000,
+            t0d: 1_100,
+            t1s: 1_150,
+            t1: 3_000,
+            t2: 3_050,
+            t2c: 5_050,
+            blit_us: 100,
+            read_us: 1_500,
+            fin_us: 50,
+            meta_gen: 0,
+        }
+    }
+
+    /// server span = queue(100) + slot(50) + material(1850) + post(50)
+    /// + transfer(2000); client span = upload(200) + present(300)
+    const SERVER: u64 = 100 + 50 + 1850 + 50 + 2000;
+    const CLIENT: u64 = 200 + 300;
+
+    #[test]
+    fn e2e_is_sum_of_same_host_spans() {
+        let mut m = Metrics::new();
+        m.record(1, 10_000, 10_200, 10_500, Some(7));
+        m.on_control(ControlEvent::Stamp(stamp(1)));
+        assert_eq!(m.samples.len(), 1);
+        let s = m.samples.front().unwrap();
+        assert_eq!(s.e2e, SERVER + CLIENT);
+        assert_eq!(s.disp, 0);
+        assert_eq!(s.t5, 10_500);
+    }
+
+    #[test]
+    fn presented_before_stamp_is_folded_in() {
+        let mut m = Metrics::new();
+        m.record(1, 10_000, 10_200, 10_500, Some(7));
+        m.on_presented(7, 10_900, true); // arrives before the server stamp
+        m.on_control(ControlEvent::Stamp(stamp(1)));
+        let s = m.samples.front().unwrap();
+        assert_eq!(s.disp, 400);
+        assert_eq!(s.e2e, SERVER + CLIENT + 400);
+    }
+
+    #[test]
+    fn presented_after_match_updates_in_place() {
+        let mut m = Metrics::new();
+        m.record(1, 10_000, 10_200, 10_500, Some(7));
+        m.on_control(ControlEvent::Stamp(stamp(1)));
+        assert_eq!(m.samples.front().unwrap().e2e, SERVER + CLIENT);
+        m.on_presented(7, 11_000, true);
+        let s = m.samples.front().unwrap();
+        assert_eq!(s.disp, 500);
+        assert_eq!(s.e2e, SERVER + CLIENT + 500);
+    }
+
+    #[test]
+    fn discarded_leaves_display_unknown() {
+        let mut m = Metrics::new();
+        m.record(1, 10_000, 10_200, 10_500, Some(7));
+        m.on_presented(7, 0, false); // discarded: no timestamp
+        m.on_control(ControlEvent::Stamp(stamp(1)));
+        let s = m.samples.front().unwrap();
+        assert_eq!(s.disp, 0);
+        assert_eq!(s.e2e, SERVER + CLIENT);
+    }
+
+    /// Every rendered line must fit the overlay grid, or the UI truncates.
+    #[test]
+    fn overlay_lines_fit_columns() {
+        let mut m = Metrics::new();
+        m.set_onscreen(true);
+        // worst-ish case: 3-digit millisecond stages
+        for i in 0..4u64 {
+            m.record(
+                100 + i,
+                1_000_000 + i,
+                1_000_200 + i,
+                1_000_500 + i,
+                Some(i),
+            );
+            let mut s = stamp(100 + i);
+            s.t0 = 1_000_000;
+            s.t0d = 1_000_300;
+            s.t1s = 1_000_350;
+            s.t1 = 1_002_500;
+            s.t2 = 1_002_560;
+            s.t2c = 1_005_600;
+            m.on_presented(i, 1_001_100 + i, true);
+            m.on_control(ControlEvent::Stamp(s));
+        }
+        let t = m.refresh().expect("text changed");
+        for line in t.split('\n') {
+            let n = line.chars().count();
+            assert!(n <= COLS, "overlay line {n} > {COLS} cols: {line:?}");
+        }
+        assert_eq!(t.matches('\n').count(), LINES - 1);
+    }
+}

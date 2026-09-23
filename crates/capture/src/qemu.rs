@@ -90,7 +90,9 @@ impl qemu_display::ConsoleListenerHandler for Listener {
             strides: s.stride[..format.num_planes as usize].to_vec(),
             format,
         };
-        let _ = self.tx.send(CaptureEvent::Scanout(dmabuf));
+        let _ = self
+            .tx
+            .send(CaptureEvent::Scanout(dmabuf, rdma_display_proto::unix_now_us()));
     }
 
     async fn update_dmabuf(&mut self, u: qemu_display::UpdateDMABUF) {

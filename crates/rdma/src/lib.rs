@@ -606,15 +606,17 @@ impl ServerLink {
 
     /// Pipelined post: WRITE a slot that `issue_frame` already filled (the
     /// materializer completed it via `finish_frame`). `t0d` is the pickup
-    /// time (pacing/queue wait done); `t1` is the fence-completion time.
-    /// `post_len` is the number of bytes to send (the codec's coded length,
-    /// or the raw frame size).
+    /// time (pacing/queue wait done) and `t1s` the slot-claim time, so the
+    /// stamp keeps the same `queue`/`slot`/`material` split as the serial
+    /// path; `t1` is the fence-completion time. `post_len` is the number of
+    /// bytes to send (the codec's coded length, or the raw frame size).
     #[allow(clippy::too_many_arguments)]
     pub fn post_filled(
         &mut self,
         slot: usize,
         t0_unix_us: u64,
         t0d_unix_us: u64,
+        t1s_unix_us: u64,
         t1_unix_us: u64,
         post_len: usize,
         mat_times: proto::MatTimes,
@@ -658,7 +660,7 @@ impl ServerLink {
                 seq,
                 t0,
                 t0d: t0d_unix_us,
-                t1s: t0d_unix_us,
+                t1s: t1s_unix_us,
                 t1: t1_unix_us,
                 t2: t2_unix_us,
                 t2c: t2c_unix_us,

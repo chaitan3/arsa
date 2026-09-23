@@ -82,7 +82,7 @@ fn main() -> Result<()> {
     println!("waiting for a dmabuf scanout from QEMU (move the mouse in the guest to force one)…");
     let scanout = loop {
         match rx.recv().context("capture source ended")? {
-            CaptureEvent::Scanout(d) => break d,
+            CaptureEvent::Scanout(d, _) => break d,
             CaptureEvent::PlainScanout(..) | CaptureEvent::PlainUpdate(..) => {
                 bail!("guest produces plain (host-memory) scanouts; the readback bench needs dmabuf scanouts (virtio-gpu with dbus-display)")
             }

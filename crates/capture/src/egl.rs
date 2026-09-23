@@ -2201,7 +2201,7 @@ unsafe fn bench_event_mode(
             Err(_) => bail!("capture source ended"),
         };
         match ev {
-            CaptureEvent::Scanout(d) => {
+            CaptureEvent::Scanout(d, _t0) => {
                 if d.format.frame_bytes() != size as u32 {
                     bail!(
                         "scanout size changed ({} frame bytes, expected {size}) — \

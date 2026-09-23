@@ -58,7 +58,7 @@ fn main() -> Result<()> {
                 println!("  --output none|egl     egl = present in a Wayland window (needs --slot-mem host)");
                 println!("  --fullscreen          fullscreen on the current output; frame letterboxed/scaled to the screen with aspect kept (compositor's own fullscreen toggle also works)");
                 println!("  --audio               play the server's audio side-channel (default sink; server captures its own monitor source)");
-                println!("  --metrics             latency/bandwidth overlay (top-left) + clock-sync pings");
+                println!("  --metrics             per-stage latency overlay (capture, send, transfer, upload, present, on-screen) + clock-sync pings");
                 println!("  --no-controller       don't forward attached gamepads");
                 println!("  --no-controller-grab  leave the gamepad exclusive-grabbable by the local compositor too (default: EVIOCGRAB while streaming)");
                 println!("  --fake-gamepad        synthesize a controller (slot 0) for testing without hardware");
@@ -164,6 +164,11 @@ fn main() -> Result<()> {
         m.set_frame_bytes(link.meta.frame_bytes as usize);
         m
     });
+    // tell the overlay whether the compositor can report the true on-screen
+    // time (wp_presentation), so `display` reads a number instead of n/a
+    if let (Some((p, _)), Some(m)) = (presenter.as_ref(), metrics.as_mut()) {
+        m.set_onscreen(p.has_presentation());
+    }
     let mut last_overlay = Instant::now();
 
     // audio side-channel: second connection to the same port, tagged 0x02;
@@ -210,8 +215,12 @@ fn main() -> Result<()> {
             // present adds one display interval of latency per queued frame).
             // Superseded frames are re-armed and credited immediately without
             // uploading them.
-            let mut newest: Option<(u64, usize)> = None;
+            let mut newest: Option<(u64, usize, u64)> = None;
             while let Some((seq, slot)) = link.try_next_frame()? {
+                // t3: the instant THIS completion was observed. Stamped before
+                // the re-arm/credit below (those are TCP sends and would
+                // otherwise be billed to the client's receive side).
+                let t3 = rdma_display_proto::unix_now_us();
                 link.rearm_slot(slot)?;
                 // Lossless deltas reference the previous frame, so every
                 // received frame must be decoded in order (skipping one
@@ -219,12 +228,11 @@ fn main() -> Result<()> {
                 if link.codec != rdma_display_codec::Codec::Lossy {
                     link.frame(slot)?;
                 }
-                if let Some((_, old)) = newest.replace((seq, slot)) {
+                if let Some((_, old, _)) = newest.replace((seq, slot, t3)) {
                     link.credit_slot(old)?; // superseded: never presented
                 }
             }
-            if let Some((seq, slot)) = newest {
-                let t3 = rdma_display_proto::unix_now_us();
+            if let Some((seq, slot, t3)) = newest {
                 // refresh the overlay raster at the metrics cadence only;
                 // every presented frame still draws the last one (no flicker)
                 let overlay = match metrics.as_mut() {
@@ -245,6 +253,14 @@ fn main() -> Result<()> {
                         }
                     }
                     None => None,
+                };
+                // ask the compositor for the on-screen time of this commit
+                // BEFORE the swap (feedback must be armed pre-commit); only
+                // when the overlay is actually collecting metrics
+                let fb = if metrics.is_some() {
+                    p.request_present_feedback()
+                } else {
+                    None
                 };
                 let (t4, t5) = if link.codec == rdma_display_codec::Codec::Lossy {
                     if lossy_dec.is_none() {
@@ -269,7 +285,7 @@ fn main() -> Result<()> {
                 };
                 link.credit_slot(slot)?; // upload consumed the pointer
                 if let Some(m) = metrics.as_mut() {
-                    m.record(seq, t3, t4, t5);
+                    m.record(seq, t3, t4, t5, fb);
                 }
                 last_seq = seq;
                 frames += 1;
@@ -278,8 +294,14 @@ fn main() -> Result<()> {
                 }
             }
             // metrics: drain control events (stamps/pongs) + keep the clock
-            // sync warm
+            // sync warm; fold in any on-screen timestamps the compositor
+            // reported (dispatched by the pump at the top of this iteration)
             if let Some(m) = metrics.as_mut() {
+                for (id, us, presented) in p.take_presented() {
+                    if presented {
+                        m.on_presented(id, us, true);
+                    }
+                }
                 while let Some(ev) = link.try_control() {
                     if let Some(meta) = route_control(ev, rumble_tx.as_ref(), Some(m)) {
                         apply_meta(&mut link, &meta);
@@ -308,8 +330,9 @@ fn main() -> Result<()> {
             let (seq, slot) = link.next_frame()?;
             let t3 = rdma_display_proto::unix_now_us();
             if let Some(m) = metrics.as_mut() {
-                // no GL here: t4=t5=t3 (upload/present rows read 0.00)
-                m.record(seq, t3, t3, t3);
+                // no GL and no compositor here: t4=t5=t3 and no presentation
+                // feedback (upload/present/display rows read 0.00 / n/a)
+                m.record(seq, t3, t3, t3, None);
             }
             let want_stats = seq % 60 == 0 || seq == 0;
             let want_dump = !dumped && dump.is_some();

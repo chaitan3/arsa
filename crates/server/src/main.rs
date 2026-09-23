@@ -27,8 +27,8 @@ use std::sync::Arc;
 use anyhow::{bail, ensure, Context, Result};
 use rdma_display_proto::{Conn, DisplayMeta};
 use rdma_display_capture::{
-    CaptureEvent, CaptureSource, DrmKmsSource, FrameFormat, FrameMaterializer, InputSink,
-    QemuDbusInput, QemuDbusSource, ScreenSize,
+    CaptureEvent, CaptureSource, CaptureSync, DrmKmsSource, FrameFormat, FrameMaterializer,
+    InputSink, QemuDbusInput, QemuDbusSource, ScreenSize,
 };
 
 mod lossy;
@@ -51,6 +51,7 @@ fn main() -> Result<()> {
     let mut audio = false;
     let mut audio_device: Option<String> = None;
     let mut audio_helper = false;
+    let mut capture_sync = CaptureSync::Auto;
     let mut codec = rdma_display_codec::Codec::Raw;
     let mut lossy_budget: usize = 1_000_000;
     let mut lossy_chroma444 = false;
@@ -74,6 +75,12 @@ fn main() -> Result<()> {
             "--readback" => readback = args.next().expect("--readback needs a value"),
             "--rendernode" => rendernode = Some(args.next().expect("--rendernode needs a value")),
             "--drm-card" => drm_card = Some(args.next().expect("--drm-card needs a value")),
+            "--capture-sync" => {
+                let v = args.next().expect("--capture-sync needs a value");
+                capture_sync = CaptureSync::parse(&v).with_context(|| {
+                    format!("--capture-sync must be onbehind|vblank|zero|auto, got {v:?}")
+                })?;
+            }
             "--input-test" => input_test = true,
             "--codec" => {
                 let v = args.next().expect("--codec needs a value");
@@ -110,6 +117,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
   --input qemu|uinput (default auto: qemu↔qemu-dbus, drm↔uinput)\n  \
   qemu: [--dbus-socket /path/dbus.sock] [--console 0]   drm: [--drm-card /dev/dri/card0]\n  \
   [--materialize egl|plain] [--rendernode /dev/dri/renderD128] [--readback pbo|direct] [--input-test]\n  \
+  --capture-sync onbehind|vblank|zero|auto  (drm) which fb to capture: onbehind = safe, one frame old; vblank = current frame as its vblank retires it (lower latency); zero = current frame immediately, no sync (testing only, may tear); auto = try vblank, fall back (default)\n  \
   --codec raw|lossless|lossy  frame coding for the whole session (default raw = unchanged wire). lossless = tile-delta against the previous frame (desktop-friendly); lossy = PyroWave intra-only GPU codec (needs libpyrowave-shared.so). The client negotiates automatically.\n  \
   --lossy-budget BYTES  lossy: max bitstream bytes per frame (default 1000000; slot size sent to the client).\n  \
   --lossy-chroma 420|444  lossy: chroma subsampling (default 420).\n  \
@@ -138,7 +146,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
         "capture" => run_capture(
             &ctx, &pd, &source, input.as_deref(), &dbus_socket, console, &drm_card,
             &materialize, rendernode.as_deref(), &listen, slots, fps, input_test, &readback,
-            audio, audio_device.as_deref(), codec, lossy_budget, lossy_chroma444,
+            capture_sync, audio, audio_device.as_deref(), codec, lossy_budget, lossy_chroma444,
         ),
         other => bail!("mode {other:?} not implemented yet"),
     }
@@ -266,6 +274,7 @@ fn run_capture(
     fps: u64,
     input_test: bool,
     readback: &str,
+    capture_sync: CaptureSync,
     audio: bool,
     audio_device: Option<&str>,
     codec: rdma_display_codec::Codec,
@@ -322,7 +331,7 @@ fn run_capture(
     let (tx, rx) = mpsc::channel();
     let source: Box<dyn CaptureSource> = match source_name {
         "qemu" => Box::new(QemuDbusSource::new(dbus_socket.clone(), console)),
-        "drm" => Box::new(DrmKmsSource::new(drm_card.clone())),
+        "drm" => Box::new(DrmKmsSource::with_sync(drm_card.clone(), capture_sync)),
         other => bail!("source {other:?} not implemented (qemu|drm)"),
     };
     CaptureSource::spawn(source, tx)?;
@@ -405,8 +414,12 @@ fn run_capture(
     // pipelined (PBO staging) state: frames issued to the materializer whose
     // fence hasn't been finished+posted yet (slot, t0 event, t0d issue time)
     let mut pipelined = false;
-    let mut issued: std::collections::VecDeque<(usize, u64, u64)> =
+    let mut issued: std::collections::VecDeque<(usize, u64, u64, u64)> =
         std::collections::VecDeque::new();
+    // pickup time of the frame the send step is currently working on (first
+    // time it decided to send it); kept across slot-credit retries so the
+    // credit wait lands in `slot`, not `queue`
+    let mut send_pickup: Option<u64> = None;
     // frame codec state (raw = pass-through); configured per session
     let mut fc = FrameCodec::new();
     // lossy chroma advertised to the client: 0 = 4:2:0, 1 = 4:4:4
@@ -640,6 +653,13 @@ fn run_capture(
         // oldest issued frame — its ~2.8 ms RDMA transfer overlaps the GPU
         // work of the frame just issued.
         if frame_dirty && session.is_some() && gate_open {
+            // Pickup time: when the sender decided to send the frame. The
+            // fps gate and event-queue wait before this point are `queue`
+            // time; a wait for a staging slot after it is `slot` time.
+            // Keeping the FIRST pickup across retries keeps a credit wait out
+            // of `queue` (the serial path splits it the same way).
+            let t0d =
+                (*send_pickup.get_or_insert_with(rdma_display_proto::unix_now_us)).max(t0_unix_us);
             let link = session.as_mut().unwrap();
             let slot_bytes = link.frame_bytes();
             // Materialize the newest pending capture now — only now do we know
@@ -709,11 +729,12 @@ fn run_capture(
             if frame_dirty {
             if pipelined {
                 if let Some(slot) = link.try_claim_slot() {
-                    let t0d = rdma_display_proto::unix_now_us();
+                    // slot claimed: pickup -> here is the slot-credit wait
+                    let t1s = rdma_display_proto::unix_now_us();
                     let out = link.slot_bytes_mut(slot);
                     match mat.issue_frame(slot, out) {
                         Ok(true) => {
-                            issued.push_back((slot, t0_unix_us, t0d));
+                            issued.push_back((slot, t0_unix_us, t0d, t1s));
                             frame_dirty = false;
                         }
                         Ok(false) => {
@@ -761,11 +782,16 @@ fn run_capture(
             }
             } // if frame_dirty
         }
+        // a resolved frame ends the pickup window (a still-dirty frame keeps
+        // its pickup time so its slot-credit wait is not billed to `queue`)
+        if !frame_dirty {
+            send_pickup = None;
+        }
         // 5. pipelined: finish + post the oldest issued frame (FIFO preserves
         // frame order; the fence wait is mostly elapsed because the GPU DMA
         // overlapped the previous frame's transfer)
         if pipelined && session.is_some() {
-            while let Some((slot, f_t0, f_t0d)) = issued.front().copied() {
+            while let Some((slot, f_t0, f_t0d, f_t1s)) = issued.front().copied() {
                 let link = session.as_mut().unwrap();
                 let out = link.slot_bytes_mut(slot);
                 let (changed, mat_times) = match mat.finish_frame(slot, out) {
@@ -798,6 +824,7 @@ fn run_capture(
                     slot,
                     f_t0,
                     f_t0d,
+                    f_t1s,
                     rdma_display_proto::unix_now_us(),
                     post_len,
                     mat_times,
@@ -999,7 +1026,7 @@ fn handle_capture_event(
     pending_scanout: &mut Option<rdma_display_capture::DmabufScanout>,
 ) -> Result<()> {
     match ev {
-        CaptureEvent::Scanout(dmabuf) => {
+        CaptureEvent::Scanout(dmabuf, t0) => {
             let fmt = dmabuf.format.clone();
             // latest-wins mailbox: keep only the newest capture. The GPU
             // import/blit/readback happens at send time (see the send step),
@@ -1007,7 +1034,9 @@ fn handle_capture_event(
             *pending_scanout = Some(dmabuf);
             screen.set(fmt.width, fmt.height);
             *pending_meta = Some(meta_linear(&fmt));
-            *t0_unix_us = rdma_display_proto::unix_now_us();
+            // t0 comes from the source: for DRM it is the flip that put this
+            // (one-behind) frame on screen, ~one frame before the poll noticed
+            *t0_unix_us = t0;
             *frame_dirty = true;
         }
         CaptureEvent::PlainScanout(fmt, data, t0) => {
