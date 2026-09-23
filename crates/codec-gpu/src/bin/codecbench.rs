@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Result};
 use rdma_display_codec::{crc32, Decoder, Encoder, Geometry, Header};
-use rdma_display_codec_gpu::GpuCodec;
+use rdma_display_codec_gpu::{GpuCodec, GpuVideoDecoder};
 
 const W: u32 = 3840;
 const H: u32 = 2160;
@@ -202,6 +202,39 @@ fn gpu_timing(geom: Geometry, frames: &[Vec<u32>]) -> Result<PassStats> {
     Ok(s)
 }
 
+fn decoder_roundtrip(geom: Geometry, frames: &[Vec<u32>]) -> Result<()> {
+    let mut gpu = GpuCodec::new(geom)?;
+    let dec = GpuVideoDecoder::attach_current(geom)?;
+    let tex = dec.create_texture(W, H)?;
+    let mut out = vec![0u8; geom.frame_bytes()];
+    for (i, frame) in frames.iter().enumerate() {
+        let fb = words_bytes(frame);
+        gpu.upload(fb)?;
+        gpu.sync();
+        let n = gpu.encode(i == 0)?;
+        gpu.update_reference()?;
+        let count = rdma_display_codec::Header::parse(gpu.coded(n))?.count as usize;
+        dec.upload(gpu.coded(n))?;
+        dec.decode_to_image(tex, count)?;
+        dec.read_texture(tex, &mut out)?;
+        if out != fb {
+            let off = out.iter().zip(fb.iter()).position(|(a, b)| a != b).unwrap();
+            bail!(
+                "decoder -> texture mismatch at frame {i}, first byte {off}: got {:#04x} want {:#04x} (out[0..8]={:02x?} fb[0..8]={:02x?})",
+                out[off],
+                fb[off],
+                &out[..8],
+                &fb[..8]
+            );
+        }
+    }
+    eprintln!(
+        "[decoder] all {} frames decoded into a texture bit-exact",
+        frames.len()
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let geom = Geometry::new(W, H, W * 4);
     let raw = geom.frame_bytes();
@@ -218,6 +251,7 @@ fn main() -> Result<()> {
 
     let frames = scenario();
     let _ = correctness(geom, &frames)?;
+    decoder_roundtrip(geom, &frames)?;
 
     let cpu = cpu_timing(geom, &frames)?;
     let gpu = gpu_timing(geom, &frames)?;
