@@ -55,6 +55,7 @@ fn main() -> Result<()> {
     let mut codec = rdma_display_codec::Codec::Raw;
     let mut lossy_budget: usize = 1_000_000;
     let mut lossy_chroma444 = false;
+    let mut transport = rdma_display_rdma::TransportPref::Auto;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -108,6 +109,11 @@ fn main() -> Result<()> {
                     other => bail!("--lossy-chroma must be 420|444, got {other:?}"),
                 };
             }
+            "--transport" => {
+                let v = args.next().expect("--transport needs a value");
+                transport = rdma_display_rdma::TransportPref::parse(&v)
+                    .with_context(|| format!("--transport must be auto|rdma|tcp, got {v:?}"))?;
+            }
             "--audio" => audio = true,
             "--audio-device" => audio_device = Some(args.next().expect("--audio-device needs a value")),
             "--audio-helper" => audio_helper = true,
@@ -121,6 +127,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
   --codec raw|lossless|lossy  frame coding for the whole session (default raw = unchanged wire). lossless = tile-delta against the previous frame (desktop-friendly); lossy = PyroWave intra-only GPU codec (needs libpyrowave-shared.so). The client negotiates automatically.\n  \
   --lossy-budget BYTES  lossy: max bitstream bytes per frame (default 1000000; slot size sent to the client).\n  \
   --lossy-chroma 420|444  lossy: chroma subsampling (default 420).\n  \
+  --transport auto|rdma|tcp  video transport (default auto: RDMA/RoCE when available, else TCP). Negotiated with the client; TCP sends length-prefixed coded frames on a TAG_VIDEO connection.\n  \
   --fps N (capture): pacing cap; 0 = uncapped, consumer-paced by client credits (default 30). For lower latency use 60 or 0.\n  \
   --audio [--audio-device my-sink.monitor]  audio side-channel: capture the named source's PCM through the pipewire-pulse\n  \
   compat socket (XDG_RUNTIME_DIR must point at the user's session when running under sudo; '@DEFAULT_MONITOR@' = default sink).");
@@ -138,13 +145,30 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
         );
     }
 
-    let ctx = rdma_display_rdma::open_device(device.as_deref())?;
-    let pd = ctx.alloc_pd()?;
+    // video transport: auto prefers RDMA/RoCE and falls back to TCP when no
+    // device is available (or when forced with --transport)
+    let rdma: Option<(ibverbs::Context, ibverbs::ProtectionDomain)> = match transport {
+        rdma_display_rdma::TransportPref::Tcp => None,
+        _ => match rdma_display_rdma::open_device(device.as_deref()) {
+            Ok(ctx) => {
+                let pd = ctx.alloc_pd()?;
+                Some((ctx, pd))
+            }
+            Err(e) => {
+                if transport == rdma_display_rdma::TransportPref::Rdma {
+                    return Err(e).context("--transport rdma: open RDMA device");
+                }
+                eprintln!("[server] no RDMA device ({e:#}); falling back to TCP video transport");
+                None
+            }
+        },
+    };
+    let rdma_ref = rdma.as_ref().map(|(c, p)| (c, p));
 
     match mode.as_str() {
-        "testcard" => run_testcard_server(&ctx, &pd, &listen, slots, fps),
+        "testcard" => run_testcard_server(rdma_ref, transport, &listen, slots, fps),
         "capture" => run_capture(
-            &ctx, &pd, &source, input.as_deref(), &dbus_socket, console, &drm_card,
+            rdma_ref, transport, &source, input.as_deref(), &dbus_socket, console, &drm_card,
             &materialize, rendernode.as_deref(), &listen, slots, fps, input_test, &readback,
             capture_sync, audio, audio_device.as_deref(), codec, lossy_budget, lossy_chroma444,
         ),
@@ -152,9 +176,42 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
     }
 }
 
+/// TCP transport: accept (and attach) the client's TAG_VIDEO socket. The
+/// client opens it immediately after the codec handshake; poll for it so the
+/// blocking send loop can start with a usable socket.
+fn wait_for_video(link: &mut rdma_display_rdma::ServerLink, listener: &TcpListener) -> Result<()> {
+    use rdma_display_rdma::Transport;
+    if link.transport() != Transport::Tcp {
+        return Ok(());
+    }
+    listener.set_nonblocking(true)?;
+    let start = std::time::Instant::now();
+    while !link.has_video() && start.elapsed() < std::time::Duration::from_secs(5) {
+        match listener.accept() {
+            Ok((mut s, _)) => {
+                let _ = s.set_nodelay(true);
+                let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+                let mut tag = [0u8; 1];
+                let ok = std::io::Read::read_exact(&mut s, &mut tag).is_ok();
+                let _ = s.set_read_timeout(None);
+                if ok && tag[0] == rdma_display_proto::TAG_VIDEO {
+                    link.attach_video(s);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(e) => return Err(e).context("accept video socket"),
+        }
+    }
+    listener.set_nonblocking(false)?;
+    anyhow::ensure!(link.has_video(), "client never opened its TAG_VIDEO socket");
+    Ok(())
+}
+
 fn run_testcard_server(
-    ctx: &ibverbs::Context,
-    pd: &ibverbs::ProtectionDomain,
+    rdma: Option<(&ibverbs::Context, &ibverbs::ProtectionDomain)>,
+    transport: rdma_display_rdma::TransportPref,
     listen: &str,
     slots: usize,
     fps: u64,
@@ -173,8 +230,8 @@ fn run_testcard_server(
     };
     let listener = TcpListener::bind(listen)?;
     eprintln!("listening on {listen}, mode=testcard");
-    for stream in listener.incoming() {
-        let mut stream = stream?;
+    loop {
+        let (mut stream, _) = listener.accept()?;
         let _ = stream.set_nodelay(true);
         // explicit first-byte tag routing; a short timeout keeps a silent
         // connection from stalling the loop
@@ -203,8 +260,8 @@ fn run_testcard_server(
         let rumble_hub = rdma_display_proto::gamepad::RumbleHub::new();
         let mut link = rdma_display_rdma::ServerLink::accept(
             Conn::new(stream),
-            ctx,
-            pd,
+            transport,
+            rdma,
             &meta,
             slots,
             rdma_display_codec::Codec::Raw,
@@ -215,10 +272,14 @@ fn run_testcard_server(
             &rumble_hub,
             rdma_display_rdma::random_nonce(),
         )?;
+        // TCP transport: the client opens its TAG_VIDEO socket right after the
+        // codec handshake; grab it before the (blocking) testcard loop starts
+        if link.transport() == rdma_display_rdma::Transport::Tcp {
+            wait_for_video(&mut link, &listener)?;
+        }
         eprintln!("session up: {slots} slots, {} frame bytes", link.frame_bytes());
         run_testcard(&mut link, fps)?;
     }
-    Ok(())
 }
 
 fn run_testcard(link: &mut rdma_display_rdma::ServerLink, fps: u64) -> Result<()> {
@@ -260,8 +321,8 @@ fn testcard_fill(bytes: &mut [u8], frame: u64) {
 
 #[allow(clippy::too_many_arguments)]
 fn run_capture(
-    ctx: &ibverbs::Context,
-    pd: &ibverbs::ProtectionDomain,
+    rdma: Option<(&ibverbs::Context, &ibverbs::ProtectionDomain)>,
+    transport: rdma_display_rdma::TransportPref,
     source_name: &str,
     input_name: Option<&str>,
     dbus_socket: &Option<String>,
@@ -559,6 +620,19 @@ fn run_capture(
                 let _ = std::thread::Builder::new()
                     .name("input-reader".into())
                     .spawn(move || serve_input(stream, nonce_cell, input_tx, addr));
+            } else if tag[0] == rdma_display_proto::TAG_VIDEO {
+                // client's TCP video socket (negotiated transport == TCP)
+                match session.as_mut() {
+                    Some(s)
+                        if s.transport() == rdma_display_rdma::Transport::Tcp
+                            && !s.has_video() =>
+                    {
+                        s.attach_video(stream);
+                    }
+                    _ => {
+                        eprintln!("[server] unexpected TAG_VIDEO connection dropped ({addr})")
+                    }
+                }
             } else if session.is_none() {
                 if let Some(meta) = pending_meta.clone() {
                     eprintln!("client connected: {}", stream.peer_addr()?);
@@ -582,7 +656,9 @@ fn run_capture(
                     // zero-copy staging (PBO readback): bind the materializer's
                     // persistent-mapped PBOs as the staging slots; None = fall
                     // back to verbs-allocated slots + direct readback
-                    let external = if codec != rdma_display_codec::Codec::Lossy
+                    let external = if rdma.is_some()
+                        && transport != rdma_display_rdma::TransportPref::Tcp
+                        && codec != rdma_display_codec::Codec::Lossy
                         && readback == "pbo"
                         && materialize == "egl"
                     {
@@ -600,8 +676,8 @@ fn run_capture(
                     // synthetic --input-test injector -> capture forwarder
                     match rdma_display_rdma::ServerLink::accept(
                         Conn::new(stream),
-                        ctx,
-                        pd,
+                        transport,
+                        rdma,
                         &meta,
                         slots,
                         codec,
@@ -633,7 +709,8 @@ fn run_capture(
                             // EGL context; restore ours before any GL work
                             mat.activate()?;
                             frame_dirty = true;
-                            pipelined = external.is_some();
+                            pipelined = external.is_some()
+                                && link.transport() == rdma_display_rdma::Transport::Rdma;
                             session_meta = Some(meta.clone());
                             session = Some(link);
                         }
