@@ -283,22 +283,50 @@ fn sym<'a, T: Copy>(lib: &'a libloading::Library, name: &str) -> Result<T> {
 impl Pyrowave {
     pub fn load(path: Option<&str>) -> Result<Self> {
         let lib = unsafe {
-            let names: [&str; 3] = match path {
-                Some(p) => [p, p, p],
-                None => [
-                    "libpyrowave-shared.so.0",
-                    "libpyrowave-shared.so",
-                    "libpyrowave-shared.so.0.6.0",
-                ],
-            };
-            let mut l = None;
-            for n in names {
-                if let Ok(x) = libloading::Library::new(n) {
-                    l = Some(x);
-                    break;
+            // Always keep the default candidates after an explicit path: a
+            // wrong/stale PYROWAVE_LIB must not stop us finding the lib beside
+            // the binary (or on the loader path).
+            let mut names: Vec<std::path::PathBuf> = Vec::new();
+            if let Some(p) = path {
+                names.push(std::path::PathBuf::from(p));
+            }
+            for n in [
+                "libpyrowave-shared.so.0",
+                "libpyrowave-shared.so",
+                "libpyrowave-shared.so.0.6.0",
+            ] {
+                names.push(std::path::PathBuf::from(n));
+            }
+            // Also try beside the running executable by absolute path:
+            // $ORIGIN/RUNPATH is not always honoured (e.g. under sudo) and a
+            // copied-out binary has no other way to find its sibling lib.
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(dir) = exe.parent() {
+                    for n in [
+                        "libpyrowave-shared.so.0",
+                        "libpyrowave-shared.so",
+                        "libpyrowave-shared.so.0.6.0",
+                    ] {
+                        names.push(dir.join(n));
+                    }
                 }
             }
-            l.context("dlopen libpyrowave-shared (set LD_LIBRARY_PATH / --pyrowave-lib)")?
+            let mut l = None;
+            let mut tried: Vec<String> = Vec::new();
+            for n in &names {
+                match libloading::Library::new(n) {
+                    Ok(x) => {
+                        l = Some(x);
+                        break;
+                    }
+                    Err(e) => tried.push(format!("{} ({e})", n.display())),
+                }
+            }
+            l.context(format!(
+                "dlopen libpyrowave-shared (set PYROWAVE_LIB, put it next to the \
+                 binary, or set LD_LIBRARY_PATH); tried: {}",
+                tried.join(", ")
+            ))?
         };
         let mut major = 0u32;
         let mut minor = 0u32;

@@ -1,0 +1,6 @@
+# Shared libraries the binaries dlopen at runtime but don't link against
+# (libpyrowave-shared.so for the lossy codec) live next to the executable, so
+# a `target/release` tree can be copied to the lab as-is. `$ORIGIN` is the
+# directory the running binary was loaded from.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN"]
