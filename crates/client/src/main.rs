@@ -16,6 +16,8 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use rdma_display_proto::Conn;
 
+mod lossy;
+
 fn main() -> Result<()> {
     let mut server: String = "127.0.0.1:4791".to_string();
     let mut device: Option<String> = None;
@@ -177,6 +179,7 @@ fn main() -> Result<()> {
 
     let started = Instant::now();
     let deadline = seconds.map(|s| started + std::time::Duration::from_secs(s));
+    let mut lossy_dec: Option<lossy::LossyDecoder> = None;
     let mut frames: u64 = 0;
     let mut last_seq = 0u64;
     let mut last_report = Instant::now();
@@ -210,6 +213,12 @@ fn main() -> Result<()> {
             let mut newest: Option<(u64, usize)> = None;
             while let Some((seq, slot)) = link.try_next_frame()? {
                 link.rearm_slot(slot)?;
+                // Lossless deltas reference the previous frame, so every
+                // received frame must be decoded in order (skipping one
+                // desyncs the chain). Lossy is intra-only: nothing to do.
+                if link.codec != rdma_display_codec::Codec::Lossy {
+                    link.frame(slot)?;
+                }
                 if let Some((_, old)) = newest.replace((seq, slot)) {
                     link.credit_slot(old)?; // superseded: never presented
                 }
@@ -237,10 +246,27 @@ fn main() -> Result<()> {
                     }
                     None => None,
                 };
-                let (t4, t5) = win.present(
-                    link.slot_bytes(slot),
-                    overlay.as_ref().map(|(r, w, h)| (&r[..], *w, *h)),
-                )?;
+                let (t4, t5) = if link.codec == rdma_display_codec::Codec::Lossy {
+                    if lossy_dec.is_none() {
+                        lossy_dec = Some(lossy::LossyDecoder::new(
+                            link.meta.width,
+                            link.meta.height,
+                            link.codec_chroma,
+                        )?);
+                    }
+                    let coded = link.slot_bytes(slot);
+                    let frame = lossy_dec.as_mut().unwrap().decode(coded)?;
+                    win.present(
+                        frame,
+                        overlay.as_ref().map(|(r, w, h)| (&r[..], *w, *h)),
+                    )?
+                } else {
+                    let frame = link.frame(slot)?;
+                    win.present(
+                        frame,
+                        overlay.as_ref().map(|(r, w, h)| (&r[..], *w, *h)),
+                    )?
+                };
                 link.credit_slot(slot)?; // upload consumed the pointer
                 if let Some(m) = metrics.as_mut() {
                     m.record(seq, t3, t4, t5);
@@ -285,26 +311,47 @@ fn main() -> Result<()> {
                 // no GL here: t4=t5=t3 (upload/present rows read 0.00)
                 m.record(seq, t3, t3, t3);
             }
-            if seq % 60 == 0 || seq == 0 {
-                match link.slot_read(slot) {
-                    Ok(bytes) => {
-                        let sum: u32 = bytes.iter().map(|b| *b as u32).sum();
-                        let nonzero = bytes.iter().filter(|b| **b != 0).count();
-                        eprintln!(
-                            "[client-check] seq={} slot={} sum={} nonzero={}/{}",
-                            seq, slot, sum, nonzero, bytes.len()
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("[client-check] seq={seq} slot={slot}: content unreadable ({e:#})")
-                    }
+            let want_stats = seq % 60 == 0 || seq == 0;
+            let want_dump = !dumped && dump.is_some();
+            let mut frame_owned: Option<Vec<u8>> = None;
+            if link.codec == rdma_display_codec::Codec::Lossy {
+                if lossy_dec.is_none() {
+                    lossy_dec = Some(lossy::LossyDecoder::new(
+                        link.meta.width,
+                        link.meta.height,
+                        link.codec_chroma,
+                    )?);
                 }
+                let coded = link.slot_bytes(slot);
+                let dec = lossy_dec.as_mut().unwrap().decode(coded)?.to_vec();
+                if want_stats {
+                    let sum: u32 = dec.iter().map(|b| *b as u32).sum();
+                    let nonzero = dec.iter().filter(|b| **b != 0).count();
+                    eprintln!(
+                        "[client-check] seq={} slot={} sum={} nonzero={}/{}",
+                        seq, slot, sum, nonzero, dec.len()
+                    );
+                }
+                if want_dump {
+                    frame_owned = Some(dec);
+                }
+            } else if want_dump {
+                frame_owned = Some(link.frame(slot)?.to_vec());
+            } else if want_stats {
+                let bytes = link.frame(slot)?;
+                let sum: u32 = bytes.iter().map(|b| *b as u32).sum();
+                let nonzero = bytes.iter().filter(|b| **b != 0).count();
+                eprintln!(
+                    "[client-check] seq={} slot={} sum={} nonzero={}/{}",
+                    seq, slot, sum, nonzero, bytes.len()
+                );
+            } else {
+                link.frame(slot)?;
             }
-            if !dumped {
+            if let Some(frame) = frame_owned {
                 dumped = true;
-                if let Some(path) = &dump {
-                    dump_ppm(path, &link, slot)?;
-                }
+                let path = dump.as_ref().expect("want_dump implies dump path");
+                dump_ppm(path, &link.meta, &frame)?;
             }
             link.ack_frame(slot)?;
             frames += 1;
@@ -429,13 +476,11 @@ fn apply_meta(link: &mut rdma_display_rdma::ClientLink, meta: &rdma_display_prot
     link.meta = meta.clone();
 }
 
-fn dump_ppm(path: &str, link: &rdma_display_rdma::ClientLink, slot: usize) -> Result<()> {
+fn dump_ppm(path: &str, meta: &rdma_display_proto::DisplayMeta, bytes: &[u8]) -> Result<()> {
     // XRGB8888 -> binary PPM (P6), dropping the alpha/upper byte
-    let m = &link.meta;
-    let bytes = link.slot_read(slot)?;
-    let width = m.width as usize;
-    let height = m.height as usize;
-    let stride = m.stride as usize;
+    let width = meta.width as usize;
+    let height = meta.height as usize;
+    let stride = meta.stride as usize;
     let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
     for y in 0..height {
         for x in 0..width {

@@ -251,6 +251,9 @@ impl ServerLink {
         pd: &ibverbs::ProtectionDomain,
         meta: &DisplayMeta,
         slots: usize,
+        codec: rdma_display_codec::Codec,
+        slot_len: usize,
+        chroma: u8,
         input_tx: mpsc::Sender<proto::InputEvent>,
         external: Option<&[(*mut u8, usize)]>,
         rumble: &proto::gamepad::RumbleHub,
@@ -275,9 +278,8 @@ impl ServerLink {
                 );
                 for (i, (ptr, len)) in list.iter().enumerate() {
                     anyhow::ensure!(
-                        *len == meta.frame_bytes as usize,
-                        "external slot {i} len {len} != frame bytes {}",
-                        meta.frame_bytes
+                        *len == slot_len,
+                        "external slot {i} len {len} != expected {slot_len}"
                     );
                     // zero-copy staging: the NIC reads the same pages the GL
                     // readback DMA fills. LOCAL_WRITE|REMOTE_READ, matching
@@ -299,7 +301,7 @@ impl ServerLink {
             None => {
                 for _ in 0..slots {
                     let mr = pd
-                        .allocate(meta.frame_bytes as usize, AccessFlags::PERMISSIVE)
+                        .allocate(slot_len, AccessFlags::PERMISSIVE)
                         .context("allocate staging slot")?;
                     stage.push(StagingSlot::Owned(mr));
                 }
@@ -307,15 +309,19 @@ impl ServerLink {
         }
 
         conn.send(&Message::Meta(meta.clone()))?;
+        // tell the client which codec the frames will use before it allocates
+        // its receive slots (they must hold the codec's worst case)
+        conn.send(&Message::Codec(codec.id(), slot_len as u32, chroma))?;
         let remote: Vec<RemoteMemorySlice> = match conn.recv()? {
             Message::Buffers(slots) => slots
                 .into_iter()
                 .map(|s| {
-                    if s.len != meta.frame_bytes as u64 {
+                    if s.len as usize != slot_len {
                         anyhow::bail!(
-                            "client slot len {} != frame bytes {}",
+                            "client slot len {} != expected slot {} for codec {}",
                             s.len,
-                            meta.frame_bytes
+                            slot_len,
+                            codec.name()
                         );
                     }
                     Ok(RemoteMemorySlice {
@@ -488,8 +494,9 @@ impl ServerLink {
     pub fn send_frame(&mut self, fill: impl FnOnce(&mut [u8]), t0_unix_us: u64) -> Result<u64> {
         self.send_frame_checked(
             |out| {
+                let n = out.len();
                 fill(out);
-                Ok((true, proto::MatTimes::ZERO))
+                Ok((true, n, proto::MatTimes::ZERO))
             },
             t0_unix_us,
         )?
@@ -497,11 +504,12 @@ impl ServerLink {
     }
 
     /// Like [`send_frame`](Self::send_frame), but `fill` decides whether the
-    /// frame content changed and should be sent (`Ok(false)` = skip), and
-    /// returns the frame's GPU stage times for the Stamp.
+    /// frame content changed and should be sent (`Ok(false)` = skip), returns
+    /// the number of bytes to post (`post_len`, e.g. the codec's coded length),
+    /// and returns the frame's GPU stage times for the Stamp.
     pub fn send_frame_checked(
         &mut self,
-        fill: impl FnOnce(&mut [u8]) -> anyhow::Result<(bool, proto::MatTimes)>,
+        fill: impl FnOnce(&mut [u8]) -> anyhow::Result<(bool, usize, proto::MatTimes)>,
         t0_unix_us: u64,
     ) -> Result<Option<u64>> {
         let t0d = proto::unix_now_us(); // frame picked up for sending
@@ -516,12 +524,13 @@ impl ServerLink {
         }
         self.slot_free[slot] = false;
         let frame_bytes = self.slots[slot].len();
-        let (changed, mat_times) = fill(self.slots[slot].as_mut_bytes(frame_bytes))?;
+        let (changed, post_len, mat_times) = fill(self.slots[slot].as_mut_bytes(frame_bytes))?;
         if !changed {
             // unchanged frame: return the slot, don't send
             self.slot_free[slot] = true;
             return Ok(None);
         }
+        anyhow::ensure!(post_len <= frame_bytes, "post_len {post_len} > slot {frame_bytes}");
         let t1_unix_us = proto::unix_now_us(); // readback/materialize complete
         #[cfg(feature = "frame-checksums")]
         {
@@ -540,7 +549,7 @@ impl ServerLink {
         let mut batch = self.qp.start_send();
         batch.op().signaled().imm(imm).write(
             seq,
-            &[self.slots[slot].post_slice(frame_bytes)],
+            &[self.slots[slot].post_slice(post_len)],
             remote,
         );
         unsafe { batch.submit() }.context("post RDMA WRITE")?;
@@ -596,25 +605,29 @@ impl ServerLink {
     }
 
     /// Pipelined post: WRITE a slot that `issue_frame` already filled (the
-    /// materializer completed it via `finish_frame`). The stamp's staging
-    /// times come from the pipelined path: `t0d` = issue pickup, `t1s` = the
-    /// same instant (the slot was free at claim), `t1` = fence completion.
+    /// materializer completed it via `finish_frame`). `t0d` is the pickup
+    /// time (pacing/queue wait done); `t1` is the fence-completion time.
+    /// `post_len` is the number of bytes to send (the codec's coded length,
+    /// or the raw frame size).
+    #[allow(clippy::too_many_arguments)]
     pub fn post_filled(
         &mut self,
         slot: usize,
         t0_unix_us: u64,
         t0d_unix_us: u64,
         t1_unix_us: u64,
+        post_len: usize,
         mat_times: proto::MatTimes,
     ) -> Result<Option<u64>> {
         let frame_bytes = self.slots[slot].len();
+        anyhow::ensure!(post_len <= frame_bytes, "post_len {post_len} > slot {frame_bytes}");
         let remote = self.remote[slot];
         let seq = self.seq;
         let imm = imm_encode(seq, slot);
         let mut batch = self.qp.start_send();
         batch.op().signaled().imm(imm).write(
             seq,
-            &[self.slots[slot].post_slice(frame_bytes)],
+            &[self.slots[slot].post_slice(post_len)],
             remote,
         );
         unsafe { batch.submit() }.context("post RDMA WRITE")?;
@@ -775,6 +788,15 @@ impl Slot {
 pub struct ClientLink {
     pub conn: Conn<TcpStream>,
     pub meta: DisplayMeta,
+    /// frame codec negotiated for this session (see rdma-display-codec)
+    pub codec: rdma_display_codec::Codec,
+    /// lossy chroma subsampling: 0 = 4:2:0, 1 = 4:4:4
+    pub codec_chroma: u8,
+    /// bytes per receive slot (raw frame, or the codec's worst case)
+    slot_len: usize,
+    /// decode state for codec != Raw (kept here so the presenter just calls
+    /// [`ClientLink::frame`])
+    decoder: Option<rdma_display_codec::Decoder>,
     /// session nonce the server assigned; presented on the input connection
     pub session_nonce: u64,
     qp: QueuePair<Rc>,
@@ -815,6 +837,32 @@ impl ClientLink {
             Message::Meta(m) => m,
             other => anyhow::bail!("expected Meta, got {other:?}"),
         };
+        // codec + slot size + chroma follow Meta, before we size and advertise
+        let (codec, slot_len, codec_chroma) = match conn.recv()? {
+            Message::Codec(id, slot_len, chroma) => {
+                let c = rdma_display_codec::Codec::from_id(id)
+                    .ok_or_else(|| anyhow!("server chose unknown codec id {id}"))?;
+                (c, slot_len as usize, chroma)
+            }
+            other => anyhow::bail!("expected Codec, got {other:?}"),
+        };
+        anyhow::ensure!(
+            codec.implemented(),
+            "server chose codec {} which this client cannot decode",
+            codec.name()
+        );
+        anyhow::ensure!(slot_len >= meta.frame_bytes as usize, "nonsensical slot size {slot_len}");
+        let geom = rdma_display_codec::Geometry::new(meta.width, meta.height, meta.stride);
+        let decoder = match codec {
+            rdma_display_codec::Codec::Lossless => Some(rdma_display_codec::Decoder::new(geom)?),
+            _ => None,
+        };
+        eprintln!(
+            "[rdma] codec={} slot_len={} (frame_bytes={})",
+            codec.name(),
+            slot_len,
+            meta.frame_bytes
+        );
 
         let gpu_alloc: Option<Box<dyn SlotAlloc>> = match &mem {
             SlotMem::Host => None,
@@ -826,7 +874,7 @@ impl ClientLink {
             let slot = match (&gpu_alloc, meta.width, meta.height) {
                 (None, _, _) => {
                     let mr = pd
-                        .allocate(meta.frame_bytes as usize, AccessFlags::PERMISSIVE)
+                        .allocate(slot_len, AccessFlags::PERMISSIVE)
                         .context("allocate recv slot")?;
                     Slot::Host(mr)
                 }
@@ -838,7 +886,7 @@ impl ClientLink {
                     // payload). Strict ordering is a zero-copy invariant.
                     let flags = AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE;
                     let mr = pd
-                        .register_dmabuf(gpu.fd(), gpu.offset(), meta.frame_bytes as usize, gpu.iova(), flags)
+                        .register_dmabuf(gpu.fd(), gpu.offset(), slot_len, gpu.iova(), flags)
                         .with_context(|| format!("ibv_reg_dmabuf_mr slot {i} (C0 gate #3)"))?;
                     eprintln!(
                         "[slots] gpu slot {i}: iova={:#x} rkey={:#x}",
@@ -860,6 +908,10 @@ impl ClientLink {
         let mut link = ClientLink {
             conn,
             meta,
+            codec,
+            codec_chroma,
+            slot_len,
+            decoder,
             session_nonce,
             qp,
             recv_cq,
@@ -952,13 +1004,34 @@ impl ClientLink {
 
     /// Read the bytes of slot `slot`. For GPU slots this is the best-effort
     /// CPU mapping of the dma-buf; an empty slice means "no CPU view" (the
-    /// data is still valid in GPU memory — verify GPU-side).
+    /// data is still valid in GPU memory — verify GPU-side). This is the raw
+    /// slot contents (the coded frame when a codec is active); use
+    /// [`frame`](Self::frame) for decoded pixels.
     pub fn slot_bytes(&self, slot: usize) -> &[u8] {
-        let n = self.meta.frame_bytes as usize;
+        let n = self.slot_len;
         match &self.slots[slot] {
             Slot::Host(mr) => &mr.bytes()[..n],
             Slot::Gpu { gpu, .. } => gpu.cpu_bytes(n).unwrap_or(&[]),
         }
+    }
+
+    /// The full decoded frame for `slot` (stride × height pixels). `Raw` is a
+    /// borrow of the slot; a coded frame is decoded into the link's internal
+    /// buffer. Valid until the next `frame`/`decode` call (and, for `Raw`,
+    /// until the slot is credited).
+    pub fn frame(&mut self, slot: usize) -> Result<&[u8]> {
+        if self.decoder.is_none() {
+            return Ok(self.slot_bytes(slot));
+        }
+        // Inline the slot access so the borrow checker sees `slots` and
+        // `decoder` as disjoint fields.
+        let n = self.slot_len;
+        let coded: &[u8] = match &self.slots[slot] {
+            Slot::Host(mr) => &mr.bytes()[..n],
+            Slot::Gpu { gpu, .. } => gpu.cpu_bytes(n).unwrap_or(&[]),
+        };
+        let dec = self.decoder.as_mut().expect("decoder present");
+        dec.decode(coded)
     }
 
     /// True when frames land in GPU memory with no CPU view.
@@ -969,7 +1042,7 @@ impl ClientLink {
     /// Whole-slot read for content verification: CPU map when present, else
     /// the (verification-only) device->host copy. Errors when neither exists.
     pub fn slot_read(&self, slot: usize) -> Result<Vec<u8>> {
-        let n = self.meta.frame_bytes as usize;
+        let n = self.slot_len;
         match &self.slots[slot] {
             Slot::Host(mr) => Ok(mr.bytes()[..n].to_vec()),
             Slot::Gpu { gpu, .. } => match gpu.cpu_bytes(n) {

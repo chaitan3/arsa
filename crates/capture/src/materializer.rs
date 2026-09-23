@@ -18,6 +18,13 @@ pub trait FrameMaterializer: Send {
     /// (fence-wait for the draw, readback, residual finish), server-local.
     fn copy_frame(&mut self, out: &mut [u8]) -> Result<(bool, rdma_display_proto::MatTimes)>;
 
+    /// Optional: bytes to post for the frame just produced (the lossy
+    /// materializer writes the coded bitstream itself and reports its length
+    /// here). None = the caller owns the encoding (raw/lossless).
+    fn coded_len(&self) -> Option<usize> {
+        None
+    }
+
     /// Feed an event to the materializer before the next copy_frame. Returns
     /// true if the frame content actually changed (worth sending).
     fn handle_event(&mut self, ev: CaptureEvent) -> Result<bool>;

@@ -15,9 +15,8 @@ Server flag (the client negotiates automatically and sizes its slots to match):
 - `raw` — no coding, no header. The RDMA slot holds the raw frame
   (`stride × height`), exactly as before.
 - `lossless` — tile-delta against the previously sent frame (see below).
-- `lossy` — **reserved selector**, not implemented yet. It parses and has a
-  stable id so a lossy codec can be added without a protocol change; the
-  server refuses to start with it.
+- `lossy` — PyroWave intra-only GPU codec (see below); needs
+  `libpyrowave-shared.so` at runtime.
 
 The id space is owned by the `rdma-display-codec` crate:
 
@@ -25,7 +24,27 @@ The id space is owned by the `rdma-display-codec` crate:
 |----|----------|-------------|
 | 0  | raw      | yes         |
 | 1  | lossless | yes         |
-| 2  | lossy    | reserved    |
+| 2  | lossy    | yes         |
+
+## Lossy (PyroWave, id 2)
+
+Intra-only, GPU codec. The server imports the KMS scanout dma-buf into a
+Vulkan image and runs PyroWave's `encode_gpu_scaled_synchronous` (RGB → YCbCr
++ scale) on it, then packetizes the bitstream into the staging slot — no GL
+and no full-frame readback. The client pushes the packets into a PyroWave
+decoder, decodes on the GPU into Y/U/V plane images, and converts to BGRA.
+
+Flags on the server:
+
+```
+--lossy-budget BYTES   max bitstream bytes per frame (default 1000000)
+--lossy-chroma 420|444 chroma subsampling (default 420)
+```
+
+The slot is `budget + 1 MiB` (packet framing overhead). The negotiated
+`Codec` message carries the slot size and the chroma, so the client sizes its
+planes to match. Because it is intra-only there is no reference-chain
+invariant and no CRC: every frame is independently decodable.
 
 ## Lossless format (v1)
 
@@ -69,6 +88,7 @@ The staging/receive slot must hold the codec's worst case:
 
 - raw: `stride × height`
 - lossless: `32 + tiles·4 + tiles·tile²·4`
+- lossy: `budget + 1 MiB` (the PyroWave bit budget plus packet framing)
 
 The server sends the codec id right after `Meta`, before the client allocates
 its slots, so both sides agree on the slot size. Each frame posts exactly its
@@ -86,18 +106,16 @@ client sees is always full.
 
 ## Where the cost sits today (and the next step)
 
-The encode currently runs on the **CPU** in the server loop, after the GPU
+`raw` and `lossless` encode on the **CPU** in the server loop, after the GPU
 readback has landed the raw frame in the pinned slot (`FrameCodec` in
-`crates/server/main.rs`). That already removes the wire bytes, but the
-readback still moves a full frame.
+`crates/server/main.rs`). Lossless already removes the wire bytes, but the
+readback still moves a full frame. (Lossy does not: it encodes straight from
+the imported scanout dma-buf, so no full-frame readback at all.)
 
-The next step is to move the encode into the capture materializer as a
-**GLES 3.1 compute pass**: read the linear RGBA8 target (the same texture the
-readback already blits to), tile-diff against a reference texture, and write
-only the coded bytes into the pinned staging PBO. The byte format is
-unchanged, so the client decoder is a drop-in. This is the point of keeping
-the format in `rdma-display-codec` with a CPU reference — the GPU encoder is
-verified against the same tests.
-
-A lossy codec (id 2) slots in as a new encoder/decoder pair behind the same
-selector and the same `Meta`/`Codec` negotiation.
+The next step for lossless is to move the encode into the capture
+materializer as a **GLES 3.1 compute pass**: read the linear RGBA8 target
+(the same texture the readback already blits to), tile-diff against a
+reference texture, and write only the coded bytes into the pinned staging
+PBO. The byte format is unchanged, so the client decoder is a drop-in. This
+is the point of keeping the format in `rdma-display-codec` with a CPU
+reference — the GPU encoder is verified against the same tests.

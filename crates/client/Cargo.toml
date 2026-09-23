@@ -10,6 +10,8 @@ tempfile = "3"
 [dependencies]
 rdma-display-proto.workspace = true
 rdma-display-rdma = { path = "../rdma" }
+rdma-display-vkcore = { path = "../vkcore" }
+rdma-display-codec = { path = "../codec" }
 rdma-display-audio = { path = "../audio" }
 anyhow.workspace = true
 libloading = "0.8"

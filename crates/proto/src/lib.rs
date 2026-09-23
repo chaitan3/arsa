@@ -11,7 +11,7 @@ pub mod gamepad;
 pub mod keymap;
 
 pub const MAGIC: u32 = 0x5244_4453; // "RDDS"
-pub const VERSION: u32 = 8; // v8: routing tags, session nonce, per-frame meta generation
+pub const VERSION: u32 = 9; // v9: frame-codec negotiation (raw/lossless/…)
 
 /// First byte of every connection, so the server routes by an explicit tag
 /// rather than by guessing protocol bytes. Audio uses
@@ -50,16 +50,26 @@ pub enum MsgType {
     Pong = 11,
     /// server → client: force-feedback event for the client's physical pad
     Rumble = 12,
+    /// server → client: frame codec for this session (see rdma-display-codec).
+    /// Sent right after `Meta`, before the client allocates its slots, so the
+    /// client can size them for the codec's worst case.
+    Codec = 13,
 }
 
 /// Server-side pipeline timestamps for one frame (all `unix_now_us`).
-///   t0  = QEMU D-Bus event arrived in the capture thread
+///   t0  = capture event latched (QEMU D-Bus arrival / DRM scanout poll)
 ///   t0d = the sender picked the frame up (pacing + event-queue wait done)
 ///   t1s = a staging slot was available (after any credit wait)
-///   t1  = materializer readback finished (glFinish complete, slot populated)
+///   t1  = materializer readback finished (slot holds the pixels)
 ///   t2  = RDMA WRITE posted
 ///   t2c = send CQ reported the WRITE fully written on the client —
 ///         the true transfer time is `t2c - t2`, same-host (no clock skew)
+///
+/// Every stage the client reports is a difference of stamps taken on ONE
+/// host (server: t0..t2c, client: its own t3/t4/t5 + presentation time), so
+/// no latency number depends on the two clocks agreeing. The absolute unix
+/// stamps travel on the wire only so the client can choose which pairs to
+/// subtract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameStamp {
     pub seq: u64,
@@ -276,6 +286,9 @@ pub enum Message {
     /// server → client: force-feedback event from the host game, to be
     /// replayed on the client's physical controller (see proto::gamepad)
     Rumble(gamepad::Rumble),
+    /// server → client: frame codec id, the slot byte size, and (lossy) the
+    /// chroma subsampling (0 = 4:2:0, 1 = 4:4:4).
+    Codec(u8, u32, u8),
 }
 
 /// Encode + frame one message onto any writer. `Conn::send` is a wrapper;
@@ -355,6 +368,16 @@ pub fn send_msg<T: Write>(io: &mut T, msg: &Message) -> std::io::Result<()> {
             },
         ),
         Message::Rumble(r) => (MsgType::Rumble as u32, r.encode()),
+        Message::Codec(id, slot_len, chroma) => (
+            MsgType::Codec as u32,
+            {
+                let mut v = Vec::with_capacity(6);
+                v.push(*id);
+                v.extend_from_slice(&slot_len.to_le_bytes());
+                v.push(*chroma);
+                v
+            },
+        ),
     };
     if payload.len() > MAX_PAYLOAD {
         return Err(std::io::Error::new(
@@ -524,6 +547,14 @@ impl<T: Read + Write> Conn<T> {
                 )
             }
             t if t == MsgType::Rumble as u32 => Message::Rumble(gamepad::Rumble::decode(&payload)?),
+            t if t == MsgType::Codec as u32 => {
+                let id = *payload
+                    .first()
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "short codec payload"))?;
+                let slot_len = u32_at(&payload, 1)?;
+                let chroma = *payload.get(5).unwrap_or(&0);
+                Message::Codec(id, slot_len, chroma)
+            }
             other => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,

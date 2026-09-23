@@ -4,6 +4,9 @@
 //! Modes:
 //!   --mode testcard   synthetic frames (validates the transport end-to-end)
 //!   --mode capture    --source qemu|drm:
+//!     --codec raw|lossless|lossy  frame coding (default raw = unchanged wire;
+//!             lossless = tile-delta against the previous frame; see
+//!             docs/compression.md). The client negotiates the choice.
 //!     qemu  QEMU dbus display capture (the guest):
 //!             --materialize egl    GPU blit+readback (default, gl=on)
 //!             --materialize plain  D-Bus host-memory scanouts (gl=off)
@@ -21,12 +24,14 @@ use std::net::TcpListener;
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use rdma_display_proto::{Conn, DisplayMeta};
 use rdma_display_capture::{
     CaptureEvent, CaptureSource, DrmKmsSource, FrameFormat, FrameMaterializer, InputSink,
     QemuDbusInput, QemuDbusSource, ScreenSize,
 };
+
+mod lossy;
 
 fn main() -> Result<()> {
     let mut mode = "testcard".to_string();
@@ -46,6 +51,9 @@ fn main() -> Result<()> {
     let mut audio = false;
     let mut audio_device: Option<String> = None;
     let mut audio_helper = false;
+    let mut codec = rdma_display_codec::Codec::Raw;
+    let mut lossy_budget: usize = 1_000_000;
+    let mut lossy_chroma444 = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -67,6 +75,32 @@ fn main() -> Result<()> {
             "--rendernode" => rendernode = Some(args.next().expect("--rendernode needs a value")),
             "--drm-card" => drm_card = Some(args.next().expect("--drm-card needs a value")),
             "--input-test" => input_test = true,
+            "--codec" => {
+                let v = args.next().expect("--codec needs a value");
+                codec = rdma_display_codec::Codec::parse(&v).with_context(|| {
+                    format!("--codec must be raw|lossless|lossy, got {v:?}")
+                })?;
+                if !codec.implemented() {
+                    bail!(
+                        "--codec {} is a reserved selector and not implemented yet",
+                        codec.name()
+                    );
+                }
+            }
+            "--lossy-budget" => {
+                lossy_budget = args
+                    .next()
+                    .expect("--lossy-budget needs a value")
+                    .parse()?;
+            }
+            "--lossy-chroma" => {
+                let v = args.next().expect("--lossy-chroma needs a value");
+                lossy_chroma444 = match v.as_str() {
+                    "420" | "4:2:0" => false,
+                    "444" | "4:4:4" => true,
+                    other => bail!("--lossy-chroma must be 420|444, got {other:?}"),
+                };
+            }
             "--audio" => audio = true,
             "--audio-device" => audio_device = Some(args.next().expect("--audio-device needs a value")),
             "--audio-helper" => audio_helper = true,
@@ -76,6 +110,9 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
   --input qemu|uinput (default auto: qemu↔qemu-dbus, drm↔uinput)\n  \
   qemu: [--dbus-socket /path/dbus.sock] [--console 0]   drm: [--drm-card /dev/dri/card0]\n  \
   [--materialize egl|plain] [--rendernode /dev/dri/renderD128] [--readback pbo|direct] [--input-test]\n  \
+  --codec raw|lossless|lossy  frame coding for the whole session (default raw = unchanged wire). lossless = tile-delta against the previous frame (desktop-friendly); lossy = PyroWave intra-only GPU codec (needs libpyrowave-shared.so). The client negotiates automatically.\n  \
+  --lossy-budget BYTES  lossy: max bitstream bytes per frame (default 1000000; slot size sent to the client).\n  \
+  --lossy-chroma 420|444  lossy: chroma subsampling (default 420).\n  \
   --fps N (capture): pacing cap; 0 = uncapped, consumer-paced by client credits (default 30). For lower latency use 60 or 0.\n  \
   --audio [--audio-device my-sink.monitor]  audio side-channel: capture the named source's PCM through the pipewire-pulse\n  \
   compat socket (XDG_RUNTIME_DIR must point at the user's session when running under sudo; '@DEFAULT_MONITOR@' = default sink).");
@@ -101,7 +138,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
         "capture" => run_capture(
             &ctx, &pd, &source, input.as_deref(), &dbus_socket, console, &drm_card,
             &materialize, rendernode.as_deref(), &listen, slots, fps, input_test, &readback,
-            audio, audio_device.as_deref(),
+            audio, audio_device.as_deref(), codec, lossy_budget, lossy_chroma444,
         ),
         other => bail!("mode {other:?} not implemented yet"),
     }
@@ -162,6 +199,9 @@ fn run_testcard_server(
             pd,
             &meta,
             slots,
+            rdma_display_codec::Codec::Raw,
+            meta.frame_bytes as usize,
+            0,
             input_tx,
             None,
             &rumble_hub,
@@ -228,8 +268,11 @@ fn run_capture(
     readback: &str,
     audio: bool,
     audio_device: Option<&str>,
+    codec: rdma_display_codec::Codec,
+    lossy_budget: usize,
+    lossy_chroma444: bool,
 ) -> Result<()> {
-    if source_name == "drm" && materialize != "egl" {
+    if source_name == "drm" && materialize != "egl" && codec != rdma_display_codec::Codec::Lossy {
         bail!("--source drm requires --materialize egl (KMS capture is dmabuf-only)");
     }
     // audio side-channel: capture starts with the server (video flows even
@@ -241,10 +284,14 @@ fn run_capture(
         None
     };
     let audio_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut mat: Box<dyn FrameMaterializer> = match materialize {
-        "egl" => Box::new(rdma_display_capture::EglMaterializer::new(rendernode)?),
-        "plain" => Box::new(rdma_display_capture::materializer::PlainMaterializer::new()),
-        other => bail!("materializer {other:?} not implemented (egl|plain)"),
+    let mut mat: Box<dyn FrameMaterializer> = if codec == rdma_display_codec::Codec::Lossy {
+        Box::new(lossy::LossyMaterializer::new(lossy_budget, lossy_chroma444)?)
+    } else {
+        match materialize {
+            "egl" => Box::new(rdma_display_capture::EglMaterializer::new(rendernode)?),
+            "plain" => Box::new(rdma_display_capture::materializer::PlainMaterializer::new()),
+            other => bail!("materializer {other:?} not implemented (egl|plain)"),
+        }
     };
     eprintln!("[server] capture materializer: {}", mat.name());
 
@@ -360,6 +407,11 @@ fn run_capture(
     let mut pipelined = false;
     let mut issued: std::collections::VecDeque<(usize, u64, u64)> =
         std::collections::VecDeque::new();
+    // frame codec state (raw = pass-through); configured per session
+    let mut fc = FrameCodec::new();
+    // lossy chroma advertised to the client: 0 = 4:2:0, 1 = 4:4:4
+    let codec_chroma: u8 =
+        if codec == rdma_display_codec::Codec::Lossy && lossy_chroma444 { 1 } else { 0 };
 
     loop {
         // 0. reap a hung-up client: the control-reader thread signals EOF
@@ -499,11 +551,29 @@ fn run_capture(
                     eprintln!("client connected: {}", stream.peer_addr()?);
                     let nonce = rdma_display_rdma::random_nonce();
                     session_nonce.store(nonce, std::sync::atomic::Ordering::SeqCst);
+                    let geom = rdma_display_codec::Geometry::new(
+                        meta.width,
+                        meta.height,
+                        meta.stride,
+                    );
+                    let slot_len = match codec {
+                        rdma_display_codec::Codec::Lossy => lossy_budget + (1 << 20),
+                        _ => codec.slot_len(&geom).expect("implemented codec has a slot size"),
+                    };
+                    eprintln!(
+                        "[server] codec {} → slot {} B (raw frame {} B)",
+                        codec.name(),
+                        slot_len,
+                        meta.frame_bytes
+                    );
                     // zero-copy staging (PBO readback): bind the materializer's
                     // persistent-mapped PBOs as the staging slots; None = fall
                     // back to verbs-allocated slots + direct readback
-                    let external = if readback == "pbo" && materialize == "egl" {
-                        match mat.bind_staging(slots, meta.frame_bytes as usize) {
+                    let external = if codec != rdma_display_codec::Codec::Lossy
+                        && readback == "pbo"
+                        && materialize == "egl"
+                    {
+                        match mat.bind_staging(slots, slot_len) {
                             Some(v) => Some(v),
                             None => {
                                 eprintln!("[server] PBO staging unavailable — direct readback slots");
@@ -521,6 +591,9 @@ fn run_capture(
                         pd,
                         &meta,
                         slots,
+                        codec,
+                        slot_len,
+                        codec_chroma,
                         input_tx.clone(),
                         external.as_deref(),
                         &rumble_hub,
@@ -533,6 +606,16 @@ fn run_capture(
                             // though the guest hasn't repainted since the
                             // previous session's last frame
                             mat.mark_dirty();
+                            // fresh codec reference: the new client's first
+                            // frame must be full (no delta against a frame it
+                            // never received)
+                            fc.configure(
+                                codec,
+                                meta.width,
+                                meta.height,
+                                meta.stride,
+                                meta.frame_bytes as usize,
+                            )?;
                             frame_dirty = true;
                             pipelined = external.is_some();
                             session_meta = Some(meta.clone());
@@ -584,6 +667,18 @@ fn run_capture(
                         frame_dirty = false;
                     } else {
                         have_frame = true;
+                        // a resized scanout invalidates the codec's tile
+                        // geometry; rebuild it (resets the reference, so the
+                        // next frame is full)
+                        if fc.geometry_stale(fmt.width, fmt.height, fmt.stride) {
+                            fc.configure(
+                                codec,
+                                fmt.width,
+                                fmt.height,
+                                fmt.stride,
+                                fmt.frame_bytes() as usize,
+                            )?;
+                        }
                     }
                 }
                 // a client connected before the first capture: wait for one
@@ -635,7 +730,20 @@ fn run_capture(
                     }
                 }
             } else {
-                match link.send_frame_checked(|out| mat.copy_frame(out), t0_unix_us) {
+                match link.send_frame_checked(
+                    |out| {
+                        let (changed, t) = mat.copy_frame(out)?;
+                        if !changed {
+                            return Ok((false, 0, t));
+                        }
+                        let n = match mat.coded_len() {
+                            Some(n) => n,
+                            None => fc.encode_in_place(out)?,
+                        };
+                        Ok((true, n, t))
+                    },
+                    t0_unix_us,
+                ) {
                     Ok(Some(seq)) => {
                         frame_dirty = false;
                         last_send = Some(std::time::Instant::now());
@@ -675,7 +783,25 @@ fn run_capture(
                     link.release_slot(slot);
                     continue;
                 }
-                match link.post_filled(slot, f_t0, f_t0d, rdma_display_proto::unix_now_us(), mat_times) {
+                // compress the raw frame now that it is in the pinned slot
+                let post_len = match fc.encode_in_place(out) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("[server] encode failed: {e:#}");
+                        session = None;
+                        mat.drop_frames();
+                        issued.clear();
+                        break;
+                    }
+                };
+                match link.post_filled(
+                    slot,
+                    f_t0,
+                    f_t0d,
+                    rdma_display_proto::unix_now_us(),
+                    post_len,
+                    mat_times,
+                ) {
                     Ok(Some(seq)) => {
                         last_send = Some(std::time::Instant::now());
                         eprintln!("[server] frame {} sent", seq);
@@ -694,6 +820,87 @@ fn run_capture(
                 }
             }
         }
+    }
+}
+
+/// In-place frame coding for the RDMA staging slot. `raw` is a pass-through
+/// (post the whole frame, no header). The encoder's reference is reset in
+/// `configure` (once per session) so the first frame a new client receives is
+/// always full.
+///
+/// NOTE: the encode runs on the CPU here, after the GPU readback has landed
+/// the raw frame in the pinned slot. The next step is to move it into the
+/// materializer as a GLES 3.1 compute pass so it happens on the GPU and only
+/// the coded bytes are read back; the byte format (rdma-display-codec) is
+/// identical, so that is a drop-in replacement.
+struct FrameCodec {
+    enc: Option<rdma_display_codec::Encoder>,
+    buf: Vec<u8>,
+    frame_bytes: usize,
+    geom: Option<rdma_display_codec::Geometry>,
+}
+
+impl FrameCodec {
+    fn new() -> Self {
+        Self {
+            enc: None,
+            buf: Vec::new(),
+            frame_bytes: 0,
+            geom: None,
+        }
+    }
+
+    fn configure(
+        &mut self,
+        codec: rdma_display_codec::Codec,
+        width: u32,
+        height: u32,
+        stride: u32,
+        frame_bytes: usize,
+    ) -> Result<()> {
+        self.frame_bytes = frame_bytes;
+        self.geom = None;
+        self.enc = match codec {
+            rdma_display_codec::Codec::Raw => None,
+            rdma_display_codec::Codec::Lossless => {
+                let geom = rdma_display_codec::Geometry::new(width, height, stride);
+                self.buf.resize(geom.max_coded_len(), 0);
+                self.geom = Some(geom);
+                let mut e = rdma_display_codec::Encoder::new(geom)?;
+                // streaming path: the payload CRC costs tens of ms on a full
+                // frame and RC RDMA already guarantees delivery, so omit it
+                e.set_crc(false);
+                Some(e)
+            }
+            rdma_display_codec::Codec::Lossy => None,
+        };
+        Ok(())
+    }
+
+    /// True when the active lossless encoder was built for a different
+    /// geometry than `(width, height, stride)` and must be recreated (which
+    /// resets its reference, so the next frame is full).
+    fn geometry_stale(&self, width: u32, height: u32, stride: u32) -> bool {
+        match self.geom {
+            None => false,
+            Some(g) => g.width != width || g.height != height || g.stride != stride,
+        }
+    }
+
+    /// Encode `slot[..frame_bytes]` in place; returns the number of bytes to
+    /// post (coded length, or `frame_bytes` for raw).
+    fn encode_in_place(&mut self, slot: &mut [u8]) -> Result<usize> {
+        let Some(enc) = self.enc.as_mut() else {
+            return Ok(self.frame_bytes);
+        };
+        let n = enc.encode(&slot[..self.frame_bytes], &mut self.buf)?;
+        ensure!(
+            n <= slot.len(),
+            "coded frame {n} exceeds staging slot {}",
+            slot.len()
+        );
+        slot[..n].copy_from_slice(&self.buf[..n]);
+        Ok(n)
     }
 }
 
