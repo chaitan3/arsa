@@ -11,13 +11,19 @@ pub mod gamepad;
 pub mod keymap;
 
 pub const MAGIC: u32 = 0x5244_4453; // "RDDS"
-pub const VERSION: u32 = 9; // v9: frame-codec negotiation (raw/lossless/…)
+pub const VERSION: u32 = 10; // v10: transport negotiation (RDMA/TCP video)
 
 /// First byte of every connection, so the server routes by an explicit tag
 /// rather than by guessing protocol bytes. Audio uses
 /// `rdma_display_audio::wire::TAG_AUDIO` (0x02); control and input are here.
 pub const TAG_CONTROL: u8 = 0x01;
 pub const TAG_INPUT: u8 = 0x03;
+/// Video over TCP (fallback when RDMA/RoCE is unavailable): a length-prefixed
+/// frame stream, separate from control so a big frame can't block input/stamps.
+pub const TAG_VIDEO: u8 = 0x04;
+
+/// `Hello::caps` bit: this side can use an RDMA (ibverbs/RoCE) video transport.
+pub const CAP_RDMA: u8 = 0x01;
 
 /// Wall-clock microseconds since the unix epoch. Cross-host comparable
 /// (that is the point): per-frame server stamps and ping-pong clock-sync
@@ -122,6 +128,10 @@ pub struct Hello {
     /// value that the client must present on its input connection so a stale
     /// input socket can't feed a later session.
     pub nonce: u64,
+    /// Transport capabilities / choice (see `CAP_RDMA`): the client sets
+    /// `CAP_RDMA` if it has an RDMA device; the server's reply sets it if the
+    /// chosen video transport is RDMA (clear = TCP).
+    pub caps: u8,
 }
 
 /// Display format metadata, sent by the server for the current scanout.
@@ -299,10 +309,11 @@ pub fn send_msg<T: Write>(io: &mut T, msg: &Message) -> std::io::Result<()> {
         Message::Hello(h) => (
             MsgType::Hello as u32,
             {
-                let mut v = Vec::with_capacity(16);
+                let mut v = Vec::with_capacity(17);
                 v.extend_from_slice(&h.magic.to_le_bytes());
                 v.extend_from_slice(&h.version.to_le_bytes());
                 v.extend_from_slice(&h.nonce.to_le_bytes());
+                v.push(h.caps);
                 v
             },
         ),
@@ -449,6 +460,7 @@ impl<T: Read + Write> Conn<T> {
                         .try_into()
                         .unwrap(),
                 ),
+                caps: *payload.get(16).unwrap_or(&0),
             }),
             t if t == MsgType::Meta as u32 => {
                 let width = u32_at(&payload, 0)?;

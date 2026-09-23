@@ -12,6 +12,7 @@
 //! channel is a plain blocking TCP connection. All verbs resources are
 //! Arc-backed, so link structs can move to threads freely.
 
+use std::io::Write;
 use std::net::TcpStream;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -121,25 +122,98 @@ pub fn random_nonce() -> u64 {
     h.finish()
 }
 
-fn hello_exchange<T: std::io::Read + std::io::Write>(conn: &mut Conn<T>, our_nonce: u64) -> Result<u64> {
+/// Video transport for a session. RDMA (ibverbs/RoCE) is preferred; TCP is
+/// the fallback when no RDMA device (or RoCE GID) is available.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Transport {
+    Rdma,
+    Tcp,
+}
+
+/// Caller's preference for [`Transport`]; `Auto` prefers RDMA.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransportPref {
+    Auto,
+    Rdma,
+    Tcp,
+}
+
+impl TransportPref {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(Self::Auto),
+            "rdma" | "roce" | "ib" => Some(Self::Rdma),
+            "tcp" => Some(Self::Tcp),
+            _ => None,
+        }
+    }
+}
+
+/// Client side of the handshake: advertise our transport capability, learn
+/// the server's chosen transport (and the session nonce).
+fn hello_client<T: std::io::Read + std::io::Write>(
+    conn: &mut Conn<T>,
+    caps: u8,
+) -> Result<(u64, u8)> {
     conn.send(&Message::Hello(proto::Hello {
         magic: proto::MAGIC,
         version: proto::VERSION,
-        nonce: our_nonce,
+        nonce: 0,
+        caps,
     }))?;
     match conn.recv()? {
         Message::Hello(h) if h.magic == proto::MAGIC => {
             if h.version != proto::VERSION {
-                anyhow::bail!(
-                    "peer protocol version {} != our {}",
-                    h.version,
-                    proto::VERSION
-                );
+                anyhow::bail!("peer protocol version {} != our {}", h.version, proto::VERSION);
             }
-            Ok(h.nonce)
+            Ok((h.nonce, h.caps))
         }
         other => Err(anyhow!("expected Hello, got {other:?}")),
     }
+}
+
+/// Server side of the handshake: read the client's capability, choose the
+/// transport, and reply with the choice (and the session nonce).
+fn hello_server<T: std::io::Read + std::io::Write>(
+    conn: &mut Conn<T>,
+    session_nonce: u64,
+    pref: TransportPref,
+    server_has_rdma: bool,
+) -> Result<Transport> {
+    let ch = match conn.recv()? {
+        Message::Hello(h) if h.magic == proto::MAGIC => h,
+        other => return Err(anyhow!("expected Hello, got {other:?}")),
+    };
+    if ch.version != proto::VERSION {
+        anyhow::bail!("peer protocol version {} != our {}", ch.version, proto::VERSION);
+    }
+    let client_rdma = (ch.caps & proto::CAP_RDMA) != 0;
+    let transport = match pref {
+        TransportPref::Tcp => Transport::Tcp,
+        TransportPref::Rdma => {
+            if !server_has_rdma {
+                anyhow::bail!("--transport rdma: no RDMA device on the server");
+            }
+            if !client_rdma {
+                anyhow::bail!("--transport rdma: the client has no RDMA device");
+            }
+            Transport::Rdma
+        }
+        TransportPref::Auto => {
+            if server_has_rdma && client_rdma {
+                Transport::Rdma
+            } else {
+                Transport::Tcp
+            }
+        }
+    };
+    conn.send(&Message::Hello(proto::Hello {
+        magic: proto::MAGIC,
+        version: proto::VERSION,
+        nonce: session_nonce,
+        caps: if transport == Transport::Rdma { proto::CAP_RDMA } else { 0 },
+    }))?;
+    Ok(transport)
 }
 
 fn endpoint_exchange<T: std::io::Read + std::io::Write>(
@@ -223,15 +297,26 @@ impl StagingSlot {
     }
 }
 
+enum Tx {
+    Rdma {
+        qp: QueuePair<Rc>,
+        send_cq: CompletionQueue,
+        /// local staging slots (copy path / testcard writes here before WRITE)
+        slots: Vec<StagingSlot>,
+        remote: Vec<RemoteMemorySlice>,
+        slot_free: Vec<bool>,
+    },
+    Tcp {
+        slot_len: usize,
+        buf: Vec<u8>,
+        busy: bool,
+    },
+}
+
 pub struct ServerLink {
     /// credits arrive from the control-reader thread; None = client gone
     credit_rx: mpsc::Receiver<Option<u32>>,
-    qp: QueuePair<Rc>,
-    send_cq: CompletionQueue,
-    /// local staging slots (copy path / testcard writes here before the WRITE)
-    slots: Vec<StagingSlot>,
-    remote: Vec<RemoteMemorySlice>,
-    slot_free: Vec<bool>,
+    tx: Tx,
     seq: u64,
     /// current `DisplayMeta` generation, stamped into every FrameStamp;
     /// `send_meta` bumps it and pushes the new meta to the control reader
@@ -239,16 +324,21 @@ pub struct ServerLink {
     /// cloned control stream: the send path writes per-frame `Stamp`s here
     /// while the control-reader thread owns the receive side
     stamp_w: Option<TcpStream>,
+    transport: Transport,
+    /// TCP video socket; None until the client's TAG_VIDEO connection arrives
+    video: Option<TcpStream>,
 }
 
 impl ServerLink {
     /// Server half of a session on an accepted TCP stream. `meta` describes
-    /// the frames we will send (testcard or captured display format).
+    /// the frames we will send (testcard or captured display format). The
+    /// video transport is negotiated from `pref`: auto prefers RDMA and falls
+    /// back to tagged TCP video when either side lacks an RDMA device.
     #[allow(clippy::too_many_arguments)]
     pub fn accept(
         conn: Conn<TcpStream>,
-        ctx: &ibverbs::Context,
-        pd: &ibverbs::ProtectionDomain,
+        pref: TransportPref,
+        rdma: Option<(&ibverbs::Context, &ibverbs::ProtectionDomain)>,
         meta: &DisplayMeta,
         slots: usize,
         codec: rdma_display_codec::Codec,
@@ -265,75 +355,110 @@ impl ServerLink {
         let stamp_w = stream.try_clone().context("clone stream for stamps")?;
         let rumble_w = stream.try_clone().context("clone stream for rumble")?;
         let mut conn = Conn::new(stream);
-        let _ = hello_exchange(&mut conn, session_nonce)?;
-        let (qp, send_cq, _recv_cq) = endpoint_exchange(&mut conn, ctx, pd)?;
 
-        let mut stage: Vec<StagingSlot> = Vec::with_capacity(slots);
-        match external {
-            Some(list) => {
-                anyhow::ensure!(
-                    list.len() == slots,
-                    "external staging slot count {} != {slots}",
-                    list.len()
-                );
-                for (i, (ptr, len)) in list.iter().enumerate() {
-                    anyhow::ensure!(
-                        *len == slot_len,
-                        "external slot {i} len {len} != expected {slot_len}"
-                    );
-                    // zero-copy staging: the NIC reads the same pages the GL
-                    // readback DMA fills. LOCAL_WRITE|REMOTE_READ, matching
-                    // the bench probe (deliberately not PERMISSIVE).
-                    let mr = unsafe {
-                        pd.register_from_raw(
-                            *ptr,
-                            *len,
-                            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ,
-                        )
-                    }
-                    .context("register external staging slot (PBO)")?;
-                    stage.push(StagingSlot::Ext(mr));
-                }
-                eprintln!(
-                    "[rdma] external staging: {slots} slots from materializer PBOs (zero-copy)"
-                );
-            }
-            None => {
-                for _ in 0..slots {
-                    let mr = pd
-                        .allocate(slot_len, AccessFlags::PERMISSIVE)
-                        .context("allocate staging slot")?;
-                    stage.push(StagingSlot::Owned(mr));
-                }
-            }
-        }
+        // handshake first: the client advertises whether it can do RDMA; we
+        // choose the video transport and reply with the choice
+        let transport = hello_server(&mut conn, session_nonce, pref, rdma.is_some())?;
+        eprintln!(
+            "[rdma] video transport: {}{}",
+            match transport {
+                Transport::Rdma => "RDMA",
+                Transport::Tcp => "TCP",
+            },
+            if transport == Transport::Tcp { " (RDMA unavailable)" } else { "" }
+        );
 
-        conn.send(&Message::Meta(meta.clone()))?;
-        // tell the client which codec the frames will use before it allocates
-        // its receive slots (they must hold the codec's worst case)
-        conn.send(&Message::Codec(codec.id(), slot_len as u32, chroma))?;
-        let remote: Vec<RemoteMemorySlice> = match conn.recv()? {
-            Message::Buffers(slots) => slots
-                .into_iter()
-                .map(|s| {
-                    if s.len as usize != slot_len {
-                        anyhow::bail!(
-                            "client slot len {} != expected slot {} for codec {}",
-                            s.len,
-                            slot_len,
-                            codec.name()
+        let tx = match transport {
+            Transport::Rdma => {
+                let (ctx, pd) = rdma.context("RDMA transport selected but no device")?;
+                let (qp, send_cq, _recv_cq) = endpoint_exchange(&mut conn, ctx, pd)?;
+
+                let mut stage: Vec<StagingSlot> = Vec::with_capacity(slots);
+                match external {
+                    Some(list) => {
+                        anyhow::ensure!(
+                            list.len() == slots,
+                            "external staging slot count {} != {slots}",
+                            list.len()
+                        );
+                        for (i, (ptr, len)) in list.iter().enumerate() {
+                            anyhow::ensure!(
+                                *len == slot_len,
+                                "external slot {i} len {len} != expected {slot_len}"
+                            );
+                            // zero-copy staging: the NIC reads the same pages the GL
+                            // readback DMA fills. LOCAL_WRITE|REMOTE_READ, matching
+                            // the bench probe (deliberately not PERMISSIVE).
+                            let mr = unsafe {
+                                pd.register_from_raw(
+                                    *ptr,
+                                    *len,
+                                    AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ,
+                                )
+                            }
+                            .context("register external staging slot (PBO)")?;
+                            stage.push(StagingSlot::Ext(mr));
+                        }
+                        eprintln!(
+                            "[rdma] external staging: {slots} slots from materializer PBOs (zero-copy)"
                         );
                     }
-                    Ok(RemoteMemorySlice {
-                        addr: s.addr,
-                        len: s.len as usize,
-                        rkey: s.rkey,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?,
-            other => anyhow::bail!("expected Buffers, got {other:?}"),
+                    None => {
+                        for _ in 0..slots {
+                            let mr = pd
+                                .allocate(slot_len, AccessFlags::PERMISSIVE)
+                                .context("allocate staging slot")?;
+                            stage.push(StagingSlot::Owned(mr));
+                        }
+                    }
+                }
+
+                conn.send(&Message::Meta(meta.clone()))?;
+                // tell the client which codec the frames will use before it
+                // allocates its receive slots (they must hold the worst case)
+                conn.send(&Message::Codec(codec.id(), slot_len as u32, chroma))?;
+                let remote: Vec<RemoteMemorySlice> = match conn.recv()? {
+                    Message::Buffers(slots) => slots
+                        .into_iter()
+                        .map(|s| {
+                            if s.len as usize != slot_len {
+                                anyhow::bail!(
+                                    "client slot len {} != expected slot {} for codec {}",
+                                    s.len,
+                                    slot_len,
+                                    codec.name()
+                                );
+                            }
+                            Ok(RemoteMemorySlice {
+                                addr: s.addr,
+                                len: s.len as usize,
+                                rkey: s.rkey,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                    other => anyhow::bail!("expected Buffers, got {other:?}"),
+                };
+                conn.send(&Message::Ready)?;
+                Tx::Rdma {
+                    qp,
+                    send_cq,
+                    slots: stage,
+                    remote,
+                    slot_free: vec![true; slots],
+                }
+            }
+            Transport::Tcp => {
+                // no slots/buffers: Meta+Codec on control; frames ride the
+                // TAG_VIDEO socket once the client opens it
+                conn.send(&Message::Meta(meta.clone()))?;
+                conn.send(&Message::Codec(codec.id(), slot_len as u32, chroma))?;
+                Tx::Tcp {
+                    slot_len,
+                    buf: vec![0u8; slot_len],
+                    busy: false,
+                }
+            }
         };
-        conn.send(&Message::Ready)?;
 
         // rumble: the pad thread's events ride this channel to a dedicated
         // forwarder on a private clone of the control stream; a live session
@@ -412,18 +537,32 @@ impl ServerLink {
             .context("spawn control reader")?;
         std::mem::forget(reader); // runs for the session lifetime
 
-        let n = remote.len();
         Ok(ServerLink {
             credit_rx,
-            qp,
-            send_cq,
-            slots: stage,
-            remote,
-            slot_free: vec![true; n],
+            tx,
             seq: 0,
             meta_gen: meta.gen,
             stamp_w: Some(stamp_w),
+            transport,
+            video: None,
         })
+    }
+
+    /// The negotiated video transport.
+    pub fn transport(&self) -> Transport {
+        self.transport
+    }
+
+    /// Attach the client's TAG_VIDEO socket (TCP transport). Until this is
+    /// called, `send_frame*` returns `Ok(None)` (nothing is sent).
+    pub fn attach_video(&mut self, stream: TcpStream) {
+        let _ = stream.set_nodelay(true);
+        self.video = Some(stream);
+        eprintln!("[rdma] TCP video socket attached");
+    }
+
+    pub fn has_video(&self) -> bool {
+        self.video.is_some()
     }
 
     /// Non-blocking hangup/credit check: drains the credit channel (applying
@@ -434,8 +573,10 @@ impl ServerLink {
         loop {
             match self.credit_rx.try_recv() {
                 Ok(Some(slot)) => {
-                    if let Some(f) = self.slot_free.get_mut(slot as usize) {
-                        *f = true;
+                    if let Tx::Rdma { slot_free, .. } = &mut self.tx {
+                        if let Some(f) = slot_free.get_mut(slot as usize) {
+                            *f = true;
+                        }
                     }
                 }
                 Ok(None) => return true, // reader thread saw EOF
@@ -447,38 +588,66 @@ impl ServerLink {
 
     /// Whether a staging slot is currently free (client-credited).
     pub fn has_free_slot(&self) -> bool {
-        self.slot_free.iter().any(|f| *f)
+        match &self.tx {
+            Tx::Rdma { slot_free, .. } => slot_free.iter().any(|f| *f),
+            Tx::Tcp { busy, .. } => !*busy,
+        }
     }
 
     /// Non-blocking claim of the first free slot (marks it in use).
     pub fn try_claim_slot(&mut self) -> Option<usize> {
-        let slot = self.slot_free.iter().position(|f| *f)?;
-        self.slot_free[slot] = false;
-        Some(slot)
+        match &mut self.tx {
+            Tx::Rdma { slot_free, .. } => {
+                let slot = slot_free.iter().position(|f| *f)?;
+                slot_free[slot] = false;
+                Some(slot)
+            }
+            Tx::Tcp { busy, .. } => {
+                if *busy {
+                    None
+                } else {
+                    *busy = true;
+                    Some(0)
+                }
+            }
+        }
     }
 
     /// Return a claimed slot (used when a frame turns out unchanged).
     pub fn release_slot(&mut self, slot: usize) {
-        self.slot_free[slot] = true;
+        match &mut self.tx {
+            Tx::Rdma { slot_free, .. } => slot_free[slot] = true,
+            Tx::Tcp { busy, .. } => *busy = false,
+        }
     }
 
     /// The claimed slot's registered memory, for `issue_frame`.
     pub fn slot_bytes_mut(&mut self, slot: usize) -> &mut [u8] {
-        let len = self.slots[slot].len();
-        self.slots[slot].as_mut_bytes(len)
+        match &mut self.tx {
+            Tx::Rdma { slots, .. } => {
+                let len = slots[slot].len();
+                slots[slot].as_mut_bytes(len)
+            }
+            Tx::Tcp { buf, .. } => buf.as_mut_slice(),
+        }
     }
 
-    /// Blocks until a slot is free, absorbing credit messages meanwhile.
-    /// (Credits now arrive via the control-reader thread's channel.)
-    fn wait_free_slot(&mut self) -> Result<usize> {
+    /// Blocks until an RDMA staging slot is free, absorbing credit messages
+    /// meanwhile. (Credits arrive via the control-reader thread's channel.)
+    fn claim_free_slot_rdma(&mut self) -> Result<usize> {
         loop {
-            if let Some(slot) = self.slot_free.iter().position(|f| *f) {
-                return Ok(slot);
+            if let Tx::Rdma { slot_free, .. } = &mut self.tx {
+                if let Some(slot) = slot_free.iter().position(|f| *f) {
+                    slot_free[slot] = false;
+                    return Ok(slot);
+                }
             }
             match self.credit_rx.recv() {
                 Ok(Some(slot)) => {
-                    if let Some(f) = self.slot_free.get_mut(slot as usize) {
-                        *f = true;
+                    if let Tx::Rdma { slot_free, .. } = &mut self.tx {
+                        if let Some(f) = slot_free.get_mut(slot as usize) {
+                            *f = true;
+                        }
                     }
                 }
                 Ok(None) => anyhow::bail!("client hung up"),
@@ -512,8 +681,19 @@ impl ServerLink {
         fill: impl FnOnce(&mut [u8]) -> anyhow::Result<(bool, usize, proto::MatTimes)>,
         t0_unix_us: u64,
     ) -> Result<Option<u64>> {
+        match self.transport {
+            Transport::Rdma => self.send_frame_rdma(fill, t0_unix_us),
+            Transport::Tcp => self.send_frame_tcp(fill, t0_unix_us),
+        }
+    }
+
+    fn send_frame_rdma(
+        &mut self,
+        fill: impl FnOnce(&mut [u8]) -> anyhow::Result<(bool, usize, proto::MatTimes)>,
+        t0_unix_us: u64,
+    ) -> Result<Option<u64>> {
         let t0d = proto::unix_now_us(); // frame picked up for sending
-        let slot = self.wait_free_slot()?;
+        let slot = self.claim_free_slot_rdma()?;
         let t1s = proto::unix_now_us(); // staging slot available
         let slot_wait_us = t1s.saturating_sub(t0d);
         if slot_wait_us > 5_000 {
@@ -522,86 +702,162 @@ impl ServerLink {
                 slot_wait_us / 1000
             );
         }
-        self.slot_free[slot] = false;
-        let frame_bytes = self.slots[slot].len();
-        let (changed, post_len, mat_times) = fill(self.slots[slot].as_mut_bytes(frame_bytes))?;
+        let (changed, post_len, mat_times, frame_bytes) = {
+            let Tx::Rdma { slots, .. } = &mut self.tx else {
+                unreachable!()
+            };
+            let frame_bytes = slots[slot].len();
+            let (changed, post_len, mat_times) = fill(slots[slot].as_mut_bytes(frame_bytes))?;
+            #[cfg(feature = "frame-checksums")]
+            {
+                let out = slots[slot].as_mut_bytes(frame_bytes);
+                let sum: u32 = out.iter().map(|b| *b as u32).sum();
+                let nonzero = out.iter().filter(|b| **b != 0).count();
+                eprintln!(
+                    "[rdma] staging slot {} checksum sum={} nonzero={}/{}",
+                    slot, sum, nonzero, frame_bytes
+                );
+            }
+            (changed, post_len, mat_times, frame_bytes)
+        };
         if !changed {
             // unchanged frame: return the slot, don't send
-            self.slot_free[slot] = true;
+            self.release_slot(slot);
             return Ok(None);
         }
         anyhow::ensure!(post_len <= frame_bytes, "post_len {post_len} > slot {frame_bytes}");
         let t1_unix_us = proto::unix_now_us(); // readback/materialize complete
-        #[cfg(feature = "frame-checksums")]
-        {
-            let out = self.slots[slot].as_mut_bytes(frame_bytes);
-            let sum: u32 = out.iter().map(|b| *b as u32).sum();
-            let nonzero = out.iter().filter(|b| **b != 0).count();
-            eprintln!(
-                "[rdma] staging slot {} checksum sum={} nonzero={}/{}",
-                slot, sum, nonzero, frame_bytes
-            );
-        }
-
-        let remote = self.remote[slot];
         let seq = self.seq;
-        let imm = imm_encode(seq, slot);
-        let mut batch = self.qp.start_send();
-        batch.op().signaled().imm(imm).write(
-            seq,
-            &[self.slots[slot].post_slice(post_len)],
-            remote,
-        );
-        unsafe { batch.submit() }.context("post RDMA WRITE")?;
-        let t2_unix_us = proto::unix_now_us(); // WRITE posted to the NIC
-
-        // drain completions so the signaled WRITE is confirmed before we hand
-        // the staging slot back to the caller
-        loop {
-            let mut completions = self.send_cq.poll().context("poll send CQ")?;
-            match completions.next() {
-                Some(wc) => {
-                    wc.ok().context("RDMA WRITE failed")?;
-                    break;
+        let (t2_unix_us, t2c_unix_us) = {
+            let Tx::Rdma {
+                slots,
+                remote,
+                qp,
+                send_cq,
+                ..
+            } = &mut self.tx
+            else {
+                unreachable!()
+            };
+            let remote = remote[slot];
+            let imm = imm_encode(seq, slot);
+            let mut batch = qp.start_send();
+            batch
+                .op()
+                .signaled()
+                .imm(imm)
+                .write(seq, &[slots[slot].post_slice(post_len)], remote);
+            unsafe { batch.submit() }.context("post RDMA WRITE")?;
+            let t2 = proto::unix_now_us(); // WRITE posted to the NIC
+            // drain completions so the signaled WRITE is confirmed before we
+            // hand the staging slot back to the caller
+            loop {
+                let mut completions = send_cq.poll().context("poll send CQ")?;
+                match completions.next() {
+                    Some(wc) => {
+                        wc.ok().context("RDMA WRITE failed")?;
+                        break;
+                    }
+                    None => std::thread::sleep(Duration::from_micros(20)),
                 }
-                None => std::thread::sleep(Duration::from_micros(20)),
             }
-        }
-        // WRITE completion, same-host stamp: t2c - t2 is the true transfer
-        // time and needs no clock sync at all (unlike the client's t3)
-        let t2c_unix_us = proto::unix_now_us();
+            // WRITE completion, same-host stamp: t2c - t2 is the true transfer
+            // time and needs no clock sync at all (unlike the client's t3)
+            (t2, proto::unix_now_us())
+        };
         self.seq += 1;
-        // pipeline stamp for the client's metrics overlay; the TCP trip is
-        // intentionally after the WRITE completes, so the client sees the
-        // stamp ~immediately after the frame itself
-        if let Some(w) = self.stamp_w.as_mut() {
-            // Clamp: a frame that sat dirty >1 s (e.g. arrived before any
-            // client connected, or a zero-initialized t0) would poison the
-            // latency stats with a meaningless queue wait — collapse it to 0.
-            let t0 = if t0_unix_us == 0 || t0d.saturating_sub(t0_unix_us) > 1_000_000 {
-                t0d
-            } else {
-                t0_unix_us
-            };
-            let s = proto::FrameStamp {
-                seq,
-                t0,
-                t0d,
-                t1s,
-                t1: t1_unix_us,
-                t2: t2_unix_us,
-                t2c: t2c_unix_us,
-                blit_us: mat_times.blit_us,
-                read_us: mat_times.read_us,
-                fin_us: mat_times.fin_us,
-                meta_gen: self.meta_gen,
-            };
-            if let Err(e) = proto::send_msg(w, &Message::Stamp(s)) {
-                eprintln!("[rdma] stamp send failed: {e}");
-                self.stamp_w = None;
-            }
-        }
+        self.send_stamp(
+            seq, t0_unix_us, t0d, t1s, t1_unix_us, t2_unix_us, t2c_unix_us, mat_times,
+        );
         Ok(Some(seq))
+    }
+
+    fn send_frame_tcp(
+        &mut self,
+        fill: impl FnOnce(&mut [u8]) -> anyhow::Result<(bool, usize, proto::MatTimes)>,
+        t0_unix_us: u64,
+    ) -> Result<Option<u64>> {
+        let t0d = proto::unix_now_us();
+        if self.video.is_none() {
+            return Ok(None); // client hasn't opened its TAG_VIDEO socket yet
+        }
+        let t1s = t0d; // no staging-slot credits on TCP
+        let (changed, post_len, mat_times, capacity) = {
+            let Tx::Tcp { buf, .. } = &mut self.tx else {
+                unreachable!()
+            };
+            let capacity = buf.len();
+            let (changed, post_len, mat_times) = fill(buf)?;
+            (changed, post_len, mat_times, capacity)
+        };
+        if !changed {
+            return Ok(None);
+        }
+        anyhow::ensure!(post_len <= capacity, "post_len {post_len} > slot {capacity}");
+        let t1_unix_us = proto::unix_now_us();
+        let seq = self.seq;
+        let (t2_unix_us, t2c_unix_us) = {
+            let Tx::Tcp { buf, .. } = &self.tx else {
+                unreachable!()
+            };
+            let w = self.video.as_mut().expect("video attached");
+            w.write_all(&(post_len as u32).to_le_bytes())
+                .context("tcp video frame length")?;
+            w.write_all(&seq.to_le_bytes())
+                .context("tcp video frame seq")?;
+            w.write_all(&buf[..post_len]).context("tcp video frame")?;
+            let t2 = proto::unix_now_us();
+            // no remote-completion signal on TCP: t2c == t2 (the client's t3
+            // read-observation is the meaningful receipt stamp)
+            (t2, t2)
+        };
+        self.seq += 1;
+        self.send_stamp(
+            seq, t0_unix_us, t0d, t1s, t1_unix_us, t2_unix_us, t2c_unix_us, mat_times,
+        );
+        Ok(Some(seq))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_stamp(
+        &mut self,
+        seq: u64,
+        t0_unix_us: u64,
+        t0d: u64,
+        t1s: u64,
+        t1: u64,
+        t2: u64,
+        t2c: u64,
+        mat_times: proto::MatTimes,
+    ) {
+        let Some(w) = self.stamp_w.as_mut() else {
+            return;
+        };
+        // Clamp: a frame that sat dirty >1 s (e.g. arrived before any client
+        // connected, or a zero-initialized t0) would poison the latency stats
+        // with a meaningless queue wait — collapse it to 0.
+        let t0 = if t0_unix_us == 0 || t0d.saturating_sub(t0_unix_us) > 1_000_000 {
+            t0d
+        } else {
+            t0_unix_us
+        };
+        let s = proto::FrameStamp {
+            seq,
+            t0,
+            t0d,
+            t1s,
+            t1,
+            t2,
+            t2c,
+            blit_us: mat_times.blit_us,
+            read_us: mat_times.read_us,
+            fin_us: mat_times.fin_us,
+            meta_gen: self.meta_gen,
+        };
+        if let Err(e) = proto::send_msg(w, &Message::Stamp(s)) {
+            eprintln!("[rdma] stamp send failed: {e}");
+            self.stamp_w = None;
+        }
     }
 
     /// Pipelined post: WRITE a slot that `issue_frame` already filled (the
@@ -621,60 +877,84 @@ impl ServerLink {
         post_len: usize,
         mat_times: proto::MatTimes,
     ) -> Result<Option<u64>> {
-        let frame_bytes = self.slots[slot].len();
-        anyhow::ensure!(post_len <= frame_bytes, "post_len {post_len} > slot {frame_bytes}");
-        let remote = self.remote[slot];
         let seq = self.seq;
-        let imm = imm_encode(seq, slot);
-        let mut batch = self.qp.start_send();
-        batch.op().signaled().imm(imm).write(
-            seq,
-            &[self.slots[slot].post_slice(post_len)],
-            remote,
-        );
-        unsafe { batch.submit() }.context("post RDMA WRITE")?;
-        let t2_unix_us = proto::unix_now_us(); // WRITE posted to the NIC
-
-        // drain completions so the signaled WRITE is confirmed (t2c stamp);
-        // the staging slot stays busy until the client's credit arrives
-        loop {
-            let mut completions = self.send_cq.poll().context("poll send CQ")?;
-            match completions.next() {
-                Some(wc) => {
-                    wc.ok().context("RDMA WRITE failed")?;
-                    break;
+        match self.transport {
+            Transport::Rdma => {
+                let (t2, t2c) = {
+                    let Tx::Rdma {
+                        slots,
+                        remote,
+                        qp,
+                        send_cq,
+                        ..
+                    } = &mut self.tx
+                    else {
+                        unreachable!()
+                    };
+                    let frame_bytes = slots[slot].len();
+                    anyhow::ensure!(
+                        post_len <= frame_bytes,
+                        "post_len {post_len} > slot {frame_bytes}"
+                    );
+                    let remote = remote[slot];
+                    let imm = imm_encode(seq, slot);
+                    let mut batch = qp.start_send();
+                    batch
+                        .op()
+                        .signaled()
+                        .imm(imm)
+                        .write(seq, &[slots[slot].post_slice(post_len)], remote);
+                    unsafe { batch.submit() }.context("post RDMA WRITE")?;
+                    let t2 = proto::unix_now_us();
+                    // drain completions so the signaled WRITE is confirmed;
+                    // the slot stays busy until the client's credit arrives
+                    loop {
+                        let mut completions = send_cq.poll().context("poll send CQ")?;
+                        match completions.next() {
+                            Some(wc) => {
+                                wc.ok().context("RDMA WRITE failed")?;
+                                break;
+                            }
+                            None => std::thread::sleep(Duration::from_micros(20)),
+                        }
+                    }
+                    (t2, proto::unix_now_us())
+                };
+                self.seq += 1;
+                self.send_stamp(
+                    seq, t0_unix_us, t0d_unix_us, t1s_unix_us, t1_unix_us, t2, t2c, mat_times,
+                );
+                Ok(Some(seq))
+            }
+            Transport::Tcp => {
+                if self.video.is_none() {
+                    return Ok(None);
                 }
-                None => std::thread::sleep(Duration::from_micros(20)),
+                let (t2, t2c) = {
+                    let Tx::Tcp { buf, .. } = &self.tx else {
+                        unreachable!()
+                    };
+                    anyhow::ensure!(
+                        post_len <= buf.len(),
+                        "post_len {post_len} > slot {}",
+                        buf.len()
+                    );
+                    let w = self.video.as_mut().expect("video attached");
+                    w.write_all(&(post_len as u32).to_le_bytes())
+                        .context("tcp video frame length")?;
+                    w.write_all(&seq.to_le_bytes())
+                        .context("tcp video frame seq")?;
+                    w.write_all(&buf[..post_len]).context("tcp video frame")?;
+                    let t2 = proto::unix_now_us();
+                    (t2, t2)
+                };
+                self.seq += 1;
+                self.send_stamp(
+                    seq, t0_unix_us, t0d_unix_us, t1s_unix_us, t1_unix_us, t2, t2c, mat_times,
+                );
+                Ok(Some(seq))
             }
         }
-        let t2c_unix_us = proto::unix_now_us();
-        self.seq += 1;
-        if let Some(w) = self.stamp_w.as_mut() {
-            // same >1 s stale-t0 clamp as the serial path
-            let t0 = if t0_unix_us == 0 || t0d_unix_us.saturating_sub(t0_unix_us) > 1_000_000 {
-                t0d_unix_us
-            } else {
-                t0_unix_us
-            };
-            let s = proto::FrameStamp {
-                seq,
-                t0,
-                t0d: t0d_unix_us,
-                t1s: t1s_unix_us,
-                t1: t1_unix_us,
-                t2: t2_unix_us,
-                t2c: t2c_unix_us,
-                blit_us: mat_times.blit_us,
-                read_us: mat_times.read_us,
-                fin_us: mat_times.fin_us,
-                meta_gen: self.meta_gen,
-            };
-            if let Err(e) = proto::send_msg(w, &Message::Stamp(s)) {
-                eprintln!("[rdma] stamp send failed: {e}");
-                self.stamp_w = None;
-            }
-        }
-        Ok(Some(seq))
     }
 
     /// Push a new `DisplayMeta` to the client (generation bumped by the
@@ -696,7 +976,10 @@ impl ServerLink {
     }
 
     pub fn frame_bytes(&self) -> usize {
-        self.slots.first().map(|m| m.len()).unwrap_or(0)
+        match &self.tx {
+            Tx::Rdma { slots, .. } => slots.first().map(|m| m.len()).unwrap_or(0),
+            Tx::Tcp { slot_len, .. } => *slot_len,
+        }
     }
 
     pub fn sequence(&self) -> u64 {
@@ -787,6 +1070,22 @@ impl Slot {
     }
 }
 
+enum Rx {
+    Rdma {
+        qp: QueuePair<Rc>,
+        recv_cq: CompletionQueue,
+        slots: Vec<Slot>,
+    },
+    Tcp {
+        frame_rx: mpsc::Receiver<(u64, Vec<u8>)>,
+        recycle_tx: mpsc::Sender<Vec<u8>>,
+        slots: Vec<Vec<u8>>,
+        slot_free: Vec<bool>,
+        pending: Option<(u64, Vec<u8>)>,
+        _reader: std::thread::JoinHandle<()>,
+    },
+}
+
 pub struct ClientLink {
     pub conn: Conn<TcpStream>,
     pub meta: DisplayMeta,
@@ -801,29 +1100,80 @@ pub struct ClientLink {
     decoder: Option<rdma_display_codec::Decoder>,
     /// session nonce the server assigned; presented on the input connection
     pub session_nonce: u64,
-    qp: QueuePair<Rc>,
-    recv_cq: CompletionQueue,
-    slots: Vec<Slot>,
+    rx: Rx,
     /// server→client control events (Stamps, Pongs) from the reader thread
     ctrl_rx: mpsc::Receiver<ControlEvent>,
+    transport: Transport,
+}
+
+/// Read length-prefixed `[u32 len][u64 seq][payload]` video frames off the
+/// TAG_VIDEO socket into freshly recycled buffers, handing `(seq, buf)` to the
+/// presenter. A bounded pool provides backpressure: with all buffers checked
+/// out the reader blocks on `recycle_rx` rather than growing latency.
+fn spawn_video_reader(
+    mut stream: TcpStream,
+    slot_len: usize,
+    slots: usize,
+    frame_tx: mpsc::Sender<(u64, Vec<u8>)>,
+    recycle_rx: mpsc::Receiver<Vec<u8>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("video-reader".into())
+        .spawn(move || {
+            let mut free: Vec<Vec<u8>> =
+                (0..slots).map(|_| Vec::with_capacity(slot_len)).collect();
+            loop {
+                let mut buf = match free.pop() {
+                    Some(b) => b,
+                    None => match recycle_rx.recv() {
+                        Ok(b) => b,
+                        Err(_) => break, // presenter gone
+                    },
+                };
+                let mut hdr = [0u8; 12];
+                if std::io::Read::read_exact(&mut stream, &mut hdr).is_err() {
+                    break;
+                }
+                let len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
+                let seq = u64::from_le_bytes(hdr[4..12].try_into().unwrap());
+                if len > slot_len {
+                    eprintln!("[tcp] video frame {len} > slot {slot_len}");
+                    break;
+                }
+                buf.clear();
+                buf.resize(len, 0);
+                if std::io::Read::read_exact(&mut stream, &mut buf).is_err() {
+                    break;
+                }
+                if frame_tx.send((seq, buf)).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("spawn video-reader")
 }
 
 impl ClientLink {
     /// Client half of a session with host-memory slots.
     pub fn connect(
         conn: Conn<TcpStream>,
-        ctx: &ibverbs::Context,
-        pd: &ibverbs::ProtectionDomain,
+        pref: TransportPref,
+        rdma: Option<(&ibverbs::Context, &ibverbs::ProtectionDomain)>,
+        addr: Option<std::net::SocketAddr>,
         slots: usize,
     ) -> Result<ClientLink> {
-        Self::connect_with(conn, ctx, pd, slots, SlotMem::Host)
+        Self::connect_with(conn, pref, rdma, addr, slots, SlotMem::Host)
     }
 
-    /// Client half of a session; `mem` chooses host vs GPU (GBM) slots.
+    /// Client half of a session; `mem` chooses host vs GPU (GBM) slots (GPU
+    /// slots are RDMA-only; TCP always uses host buffers). `addr` is the
+    /// server endpoint, used to open the TAG_VIDEO socket when the negotiated
+    /// transport is TCP.
     pub fn connect_with(
         conn: Conn<TcpStream>,
-        ctx: &ibverbs::Context,
-        pd: &ibverbs::ProtectionDomain,
+        pref: TransportPref,
+        rdma: Option<(&ibverbs::Context, &ibverbs::ProtectionDomain)>,
+        addr: Option<std::net::SocketAddr>,
         slots: usize,
         mem: SlotMem,
     ) -> Result<ClientLink> {
@@ -832,8 +1182,42 @@ impl ClientLink {
         let stream = conn.into_inner();
         let reader_stream = stream.try_clone().context("clone stream for control reader")?;
         let mut conn = Conn::new(stream);
-        let session_nonce = hello_exchange(&mut conn, 0)?;
-        let (qp, _send_cq, recv_cq) = endpoint_exchange(&mut conn, ctx, pd)?;
+
+        // handshake: advertise our RDMA capability, learn the server's choice
+        let caps = if pref == TransportPref::Tcp || rdma.is_none() {
+            0
+        } else {
+            proto::CAP_RDMA
+        };
+        let (session_nonce, server_caps) = hello_client(&mut conn, caps)?;
+        let transport = if server_caps & proto::CAP_RDMA != 0 {
+            Transport::Rdma
+        } else {
+            Transport::Tcp
+        };
+        eprintln!(
+            "[rdma] video transport: {}{}",
+            match transport {
+                Transport::Rdma => "RDMA",
+                Transport::Tcp => "TCP",
+            },
+            if transport == Transport::Tcp { " (RDMA unavailable)" } else { "" }
+        );
+
+        // RDMA endpoint exchange happens before Meta (server sends Meta after)
+        let endpoint = if transport == Transport::Rdma {
+            let (ctx, pd) = rdma.context("server chose RDMA but no device")?;
+            Some(endpoint_exchange(&mut conn, ctx, pd)?)
+        } else {
+            None
+        };
+        let pd = match transport {
+            Transport::Rdma => Some(
+                rdma.context("server chose RDMA but no device")?
+                    .1,
+            ),
+            Transport::Tcp => None,
+        };
 
         let meta = match conn.recv()? {
             Message::Meta(m) => m,
@@ -866,48 +1250,92 @@ impl ClientLink {
             meta.frame_bytes
         );
 
-        let gpu_alloc: Option<Box<dyn SlotAlloc>> = match &mem {
-            SlotMem::Host => None,
-            SlotMem::Cuda { device } => Some(Box::new(cuda::CudaSlots::open(*device)?)),
+        let rx = match transport {
+            Transport::Rdma => {
+                let (qp, _send_cq, recv_cq) = endpoint.expect("rdma endpoint");
+                let pd = pd.expect("pd");
+                let gpu_alloc: Option<Box<dyn SlotAlloc>> = match &mem {
+                    SlotMem::Host => None,
+                    SlotMem::Cuda { device } => Some(Box::new(cuda::CudaSlots::open(*device)?)),
+                };
+                let mut slots_v: Vec<Slot> = Vec::with_capacity(slots);
+                for i in 0..slots {
+                    let slot = match (&gpu_alloc, meta.width, meta.height) {
+                        (None, _, _) => {
+                            let mr = pd
+                                .allocate(slot_len, AccessFlags::PERMISSIVE)
+                                .context("allocate recv slot")?;
+                            Slot::Host(mr)
+                        }
+                        (Some(dev), w, h) => {
+                            let gpu = dev.alloc_slot(w, h, meta.stride)?;
+                            // Deliberately NOT PERMISSIVE: PERMISSIVE includes
+                            // RELAXED_ORDERING, which would let the NIC reorder
+                            // posted writes across PCIe destinations (CQE vs GPU
+                            // payload). Strict ordering is a zero-copy invariant.
+                            let flags = AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE;
+                            let mr = pd
+                                .register_dmabuf(gpu.fd(), gpu.offset(), slot_len, gpu.iova(), flags)
+                                .with_context(|| {
+                                    format!("ibv_reg_dmabuf_mr slot {i} (C0 gate #3)")
+                                })?;
+                            eprintln!(
+                                "[slots] gpu slot {i}: iova={:#x} rkey={:#x}",
+                                mr.remote().addr,
+                                mr.remote().rkey
+                            );
+                            Slot::Gpu { mr, gpu }
+                        }
+                    };
+                    slots_v.push(slot);
+                }
+                let descs: Vec<SlotDesc> = slots_v.iter().map(Slot::desc).collect();
+                conn.send(&Message::Buffers(descs))?;
+                match conn.recv()? {
+                    Message::Ready => {}
+                    other => anyhow::bail!("expected Ready, got {other:?}"),
+                }
+                let rx = Rx::Rdma {
+                    qp,
+                    recv_cq,
+                    slots: slots_v,
+                };
+                let mut link = ClientLink {
+                    conn,
+                    meta,
+                    codec,
+                    codec_chroma,
+                    slot_len,
+                    decoder,
+                    session_nonce,
+                    rx,
+                    ctrl_rx: spawn_control_reader(reader_stream),
+                    transport,
+                };
+                link.rearm_all()?;
+                return Ok(link);
+            }
+            Transport::Tcp => {
+                let addr = addr.context("TCP transport but no server address")?;
+                let mut s = TcpStream::connect(addr).context("connect TAG_VIDEO socket")?;
+                s.set_nodelay(true)?;
+                std::io::Write::write_all(&mut s, &[proto::TAG_VIDEO])
+                    .context("send TAG_VIDEO")?;
+                let (frame_tx, frame_rx) = mpsc::channel();
+                let (recycle_tx, recycle_rx) = mpsc::channel();
+                let reader = spawn_video_reader(s, slot_len, slots, frame_tx, recycle_rx);
+                Rx::Tcp {
+                    frame_rx,
+                    recycle_tx,
+                    slots: vec![Vec::new(); slots],
+                    slot_free: vec![true; slots],
+                    pending: None,
+                    _reader: reader,
+                }
+            }
         };
 
-        let mut slots_v: Vec<Slot> = Vec::with_capacity(slots);
-        for i in 0..slots {
-            let slot = match (&gpu_alloc, meta.width, meta.height) {
-                (None, _, _) => {
-                    let mr = pd
-                        .allocate(slot_len, AccessFlags::PERMISSIVE)
-                        .context("allocate recv slot")?;
-                    Slot::Host(mr)
-                }
-                (Some(dev), w, h) => {
-                    let gpu = dev.alloc_slot(w, h, meta.stride)?;
-                    // Deliberately NOT PERMISSIVE: PERMISSIVE includes
-                    // RELAXED_ORDERING, which would let the NIC reorder
-                    // posted writes across PCIe destinations (CQE vs GPU
-                    // payload). Strict ordering is a zero-copy invariant.
-                    let flags = AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE;
-                    let mr = pd
-                        .register_dmabuf(gpu.fd(), gpu.offset(), slot_len, gpu.iova(), flags)
-                        .with_context(|| format!("ibv_reg_dmabuf_mr slot {i} (C0 gate #3)"))?;
-                    eprintln!(
-                        "[slots] gpu slot {i}: iova={:#x} rkey={:#x}",
-                        mr.remote().addr,
-                        mr.remote().rkey
-                    );
-                    Slot::Gpu { mr, gpu }
-                }
-            };
-            slots_v.push(slot);
-        }
-        let descs: Vec<SlotDesc> = slots_v.iter().map(Slot::desc).collect();
-        conn.send(&Message::Buffers(descs))?;
-        match conn.recv()? {
-            Message::Ready => {}
-            other => anyhow::bail!("expected Ready, got {other:?}"),
-        }
-
-        let mut link = ClientLink {
+        Ok(ClientLink {
             conn,
             meta,
             codec,
@@ -915,21 +1343,21 @@ impl ClientLink {
             slot_len,
             decoder,
             session_nonce,
-            qp,
-            recv_cq,
-            slots: slots_v,
+            rx,
             ctrl_rx: spawn_control_reader(reader_stream),
-        };
-        link.rearm_all()?;
-        Ok(link)
+            transport,
+        })
     }
 
     fn rearm_all(&mut self) -> Result<()> {
-        let n = self.slots.len();
+        let Rx::Rdma { qp, slots, .. } = &mut self.rx else {
+            return Ok(()); // TCP: no recv re-arm
+        };
+        let n = slots.len();
         let reqs: Vec<ibverbs::RecvRequest> = (0..n)
             .map(|slot| ibverbs::RecvRequest::new(slot as u64, &[]))
             .collect();
-        unsafe { self.qp.post_recv(reqs) }.context("post_recv")?;
+        unsafe { qp.post_recv(reqs) }.context("post_recv")?;
         Ok(())
     }
 
@@ -949,32 +1377,81 @@ impl ClientLink {
     /// Non-blocking variant: `Ok(None)` if no completion is ready. The
     /// presenter loop uses this to interleave RDMA with Wayland events.
     pub fn try_next_frame(&mut self) -> Result<Option<(u64, usize)>> {
-        let mut completions = self.recv_cq.poll().context("poll recv CQ")?;
-        if let Some(wc) = completions.next() {
-            wc.ok().context("recv work request failed")?;
-            let imm = wc.imm_data().context("expected WRITE immediate")?;
-            let (frame_seq, slot) = imm_decode(imm);
-            return Ok(Some((frame_seq, slot)));
+        match &mut self.rx {
+            Rx::Rdma { recv_cq, .. } => {
+                let mut completions = recv_cq.poll().context("poll recv CQ")?;
+                if let Some(wc) = completions.next() {
+                    wc.ok().context("recv work request failed")?;
+                    let imm = wc.imm_data().context("expected WRITE immediate")?;
+                    let (frame_seq, slot) = imm_decode(imm);
+                    return Ok(Some((frame_seq, slot)));
+                }
+                Ok(None)
+            }
+            Rx::Tcp {
+                frame_rx,
+                slots,
+                slot_free,
+                pending,
+                ..
+            } => {
+                let item = match pending.take() {
+                    Some(p) => Some(p),
+                    None => frame_rx.try_recv().ok(),
+                };
+                let Some((seq, buf)) = item else {
+                    return Ok(None);
+                };
+                if let Some(slot) = slot_free.iter().position(|f| *f) {
+                    slot_free[slot] = false;
+                    slots[slot] = buf;
+                    Ok(Some((seq, slot)))
+                } else {
+                    *pending = Some((seq, buf)); // no free slot: retry next call
+                    Ok(None)
+                }
+            }
         }
-        Ok(None)
+    }
+
+    /// The negotiated video transport.
+    pub fn transport(&self) -> Transport {
+        self.transport
     }
 
     /// Re-arm the slot's notification receipt. Must happen right after
     /// [`try_next_frame`](Self::try_next_frame) took the completion; the
     /// *credit* (server permission to overwrite again) is separate —
-    /// presenters hold it until the compositor releases the buffer.
+    /// presenters hold it until the compositor releases the buffer. No-op for
+    /// TCP (the reader thread manages its own pool).
     pub fn rearm_slot(&mut self, slot: usize) -> Result<()> {
-        unsafe {
-            self.qp
-                .post_recv([ibverbs::RecvRequest::new(slot as u64, &[])])
+        if let Rx::Rdma { qp, .. } = &mut self.rx {
+            unsafe { qp.post_recv([ibverbs::RecvRequest::new(slot as u64, &[])]) }
+                .context("re-arm recv")?;
         }
-        .context("re-arm recv")?;
         Ok(())
     }
 
-    /// Return a slot to the server pool (credits it for reuse).
+    /// Return a slot to the pool (RDMA: credits it for reuse; TCP: recycles
+    /// the buffer to the video reader).
     pub fn credit_slot(&mut self, slot: usize) -> Result<()> {
-        self.conn.send(&Message::Credit(slot as u32))?;
+        match &mut self.rx {
+            Rx::Rdma { .. } => {
+                self.conn.send(&Message::Credit(slot as u32))?;
+            }
+            Rx::Tcp {
+                recycle_tx,
+                slots,
+                slot_free,
+                ..
+            } => {
+                if slot < slots.len() {
+                    slot_free[slot] = true;
+                    let v = std::mem::take(&mut slots[slot]);
+                    let _ = recycle_tx.send(v);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1010,10 +1487,15 @@ impl ClientLink {
     /// slot contents (the coded frame when a codec is active); use
     /// [`frame`](Self::frame) for decoded pixels.
     pub fn slot_bytes(&self, slot: usize) -> &[u8] {
-        let n = self.slot_len;
-        match &self.slots[slot] {
-            Slot::Host(mr) => &mr.bytes()[..n],
-            Slot::Gpu { gpu, .. } => gpu.cpu_bytes(n).unwrap_or(&[]),
+        match &self.rx {
+            Rx::Rdma { slots, .. } => {
+                let n = self.slot_len;
+                match &slots[slot] {
+                    Slot::Host(mr) => &mr.bytes()[..n],
+                    Slot::Gpu { gpu, .. } => gpu.cpu_bytes(n).unwrap_or(&[]),
+                }
+            }
+            Rx::Tcp { slots, .. } => &slots[slot][..],
         }
     }
 
@@ -1025,32 +1507,51 @@ impl ClientLink {
         if self.decoder.is_none() {
             return Ok(self.slot_bytes(slot));
         }
-        // Inline the slot access so the borrow checker sees `slots` and
-        // `decoder` as disjoint fields.
-        let n = self.slot_len;
-        let coded: &[u8] = match &self.slots[slot] {
-            Slot::Host(mr) => &mr.bytes()[..n],
-            Slot::Gpu { gpu, .. } => gpu.cpu_bytes(n).unwrap_or(&[]),
-        };
-        let dec = self.decoder.as_mut().expect("decoder present");
-        dec.decode(coded)
+        // Inline the slot access so the borrow checker sees the slot storage
+        // and `decoder` as disjoint fields.
+        match &self.rx {
+            Rx::Rdma { slots, .. } => {
+                let n = self.slot_len;
+                let coded: &[u8] = match &slots[slot] {
+                    Slot::Host(mr) => &mr.bytes()[..n],
+                    Slot::Gpu { gpu, .. } => gpu.cpu_bytes(n).unwrap_or(&[]),
+                };
+                let dec = self.decoder.as_mut().expect("decoder present");
+                dec.decode(coded)
+            }
+            Rx::Tcp { slots, .. } => {
+                let coded: &[u8] = &slots[slot][..];
+                let dec = self.decoder.as_mut().expect("decoder present");
+                dec.decode(coded)
+            }
+        }
     }
 
     /// True when frames land in GPU memory with no CPU view.
     pub fn slots_gpu_only(&self) -> bool {
-        matches!(&self.slots.first(), Some(Slot::Gpu { gpu, .. }) if gpu.cpu_bytes(1).is_none())
+        match &self.rx {
+            Rx::Rdma { slots, .. } => {
+                matches!(slots.first(), Some(Slot::Gpu { gpu, .. }) if gpu.cpu_bytes(1).is_none())
+            }
+            Rx::Tcp { .. } => false,
+        }
     }
 
     /// Whole-slot read for content verification: CPU map when present, else
     /// the (verification-only) device->host copy. Errors when neither exists.
     pub fn slot_read(&self, slot: usize) -> Result<Vec<u8>> {
-        let n = self.slot_len;
-        match &self.slots[slot] {
-            Slot::Host(mr) => Ok(mr.bytes()[..n].to_vec()),
-            Slot::Gpu { gpu, .. } => match gpu.cpu_bytes(n) {
-                Some(b) => Ok(b.to_vec()),
-                None => gpu.dto_h_vec(n),
-            },
+        match &self.rx {
+            Rx::Rdma { slots, .. } => {
+                let n = self.slot_len;
+                match &slots[slot] {
+                    Slot::Host(mr) => Ok(mr.bytes()[..n].to_vec()),
+                    Slot::Gpu { gpu, .. } => match gpu.cpu_bytes(n) {
+                        Some(b) => Ok(b.to_vec()),
+                        None => gpu.dto_h_vec(n),
+                    },
+                }
+            }
+            Rx::Tcp { slots, .. } => Ok(slots[slot].clone()),
         }
     }
 }
