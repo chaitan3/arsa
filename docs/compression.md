@@ -104,18 +104,26 @@ headless loops; skipping a frame would desync the chain and trip the CRC.
 The server resets the reference on every new session, so the first frame a
 client sees is always full.
 
-## Where the cost sits today (and the next step)
+## Where the cost sits
 
-`raw` and `lossless` encode on the **CPU** in the server loop, after the GPU
-readback has landed the raw frame in the pinned slot (`FrameCodec` in
-`crates/server/main.rs`). Lossless already removes the wire bytes, but the
-readback still moves a full frame. (Lossy does not: it encodes straight from
-the imported scanout dma-buf, so no full-frame readback at all.)
+`lossless` encodes on the **GPU** (`rdma-display-codec-gpu`, GLES 3.1 compute)
+in the server's send path: the materializer reads the scanout back into the
+pinned staging slot, the GPU tile-diffs it against a reference and compacts
+the changed tiles, and only the coded bytes are posted. The CPU reference
+encoder is kept as a fallback if the GPU codec can't be created.
 
-The next step for lossless is to move the encode into the capture
-materializer as a **GLES 3.1 compute pass**: read the linear RGBA8 target
-(the same texture the readback already blits to), tile-diff against a
-reference texture, and write only the coded bytes into the pinned staging
-PBO. The byte format is unchanged, so the client decoder is a drop-in. This
-is the point of keeping the format in `rdma-display-codec` with a CPU
-reference — the GPU encoder is verified against the same tests.
+Per 4K frame the encode is roughly `cpu 6.6 ms / gpu 0.2 ms` for a delta and
+`cpu 9.3 ms / gpu 8.1 ms` for a full frame — the full-frame cost is dominated
+by moving the payload either way, so on high-motion content that compresses
+poorly `raw` is still the cheaper choice.
+
+On the client, `--output egl` decodes the tiles on the GPU straight into the
+texture the presenter draws (`GpuVideoDecoder`, attached to the presenter's
+GLES context), so a delta patches only the changed region: no full-frame CPU
+decode and no full-frame `glTexImage2D` upload. Headless (`--output none`)
+keeps the CPU decoder.
+
+The next step for lossless is to feed the server encoder the linear RGBA8
+target directly (share the materializer's context, sample the texture in the
+compute shader) instead of going through the readback, so a static frame costs
+only the coded bytes' readback. The byte format is unchanged.

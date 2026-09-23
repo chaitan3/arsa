@@ -146,6 +146,31 @@ fn main() -> Result<()> {
         other => bail!("--output must be none|egl, got {other:?}"),
     };
 
+    // GPU lossless decode: when presenting through eglwin's GL context and the
+    // session uses the lossless codec, decode the tiles straight into a texture
+    // in that context (the presenter draws it) instead of a full-frame CPU
+    // decode followed by a full-frame upload.
+    let mut gl_lossless: Option<(rdma_display_codec_gpu::GpuVideoDecoder, u32)> = None;
+    if link.codec == rdma_display_codec::Codec::Lossless && presenter.is_some() {
+        let geom = rdma_display_codec::Geometry::new(
+            link.meta.width,
+            link.meta.height,
+            link.meta.stride,
+        );
+        match rdma_display_codec_gpu::GpuVideoDecoder::attach_current(geom) {
+            Ok(dec) => match dec.create_texture(link.meta.width, link.meta.height) {
+                Ok(tex) => {
+                    eprintln!("[client] lossless decode: GPU -> texture (no full-frame upload)");
+                    gl_lossless = Some((dec, tex));
+                }
+                Err(e) => {
+                    eprintln!("[client] lossless decode: GPU texture failed ({e:#}); using CPU")
+                }
+            },
+            Err(e) => eprintln!("[client] lossless decode: GPU unavailable ({e:#}); using CPU"),
+        }
+    }
+
     // input runs on its own thread + TCP connection (tagged `TAG_INPUT` plus
     // the session nonce), so a present or a control burst can never delay a
     // keystroke. Audio does the same on its own connection (tag 0x02).
@@ -224,8 +249,39 @@ fn main() -> Result<()> {
                 link.rearm_slot(slot)?;
                 // Lossless deltas reference the previous frame, so every
                 // received frame must be decoded in order (skipping one
-                // desyncs the chain). Lossy is intra-only: nothing to do.
-                if link.codec != rdma_display_codec::Codec::Lossy {
+                // desyncs the chain): on the GPU into the shared texture when
+                // available, otherwise the CPU decoder. Lossy is intra-only.
+                if let Some((dec, tex)) = gl_lossless.as_ref() {
+                    let g = dec.geometry();
+                    if g.width == link.meta.width
+                        && g.height == link.meta.height
+                        && g.stride == link.meta.stride
+                    {
+                        let coded = link.slot_bytes(slot);
+                        match rdma_display_codec::Header::parse(coded) {
+                            Ok(h) => {
+                                let n = rdma_display_codec::HEADER_LEN
+                                    + g.tile_count() * 4
+                                    + h.count as usize * g.tile_bytes();
+                                if n <= coded.len() {
+                                    dec.upload(&coded[..n])?;
+                                    dec.decode_to_image(*tex, h.count as usize)?;
+                                } else {
+                                    eprintln!(
+                                        "[client] lossless: coded {n} > slot {}",
+                                        coded.len()
+                                    );
+                                }
+                            }
+                            Err(e) => eprintln!("[client] lossless: header parse failed: {e:#}"),
+                        }
+                    } else {
+                        // geometry changed (Meta resize): the server resets the
+                        // reference on the next frame (full), so the CPU
+                        // decoder resyncs; stop using the stale GPU texture.
+                        link.frame(slot)?;
+                    }
+                } else if link.codec != rdma_display_codec::Codec::Lossy {
                     link.frame(slot)?;
                 }
                 if let Some((_, old, _)) = newest.replace((seq, slot, t3)) {
@@ -262,7 +318,12 @@ fn main() -> Result<()> {
                 } else {
                     None
                 };
-                let (t4, t5) = if link.codec == rdma_display_codec::Codec::Lossy {
+                let (t4, t5) = if let Some((_, tex)) = gl_lossless.as_ref() {
+                    win.present_texture(
+                        *tex,
+                        overlay.as_ref().map(|(r, w, h)| (&r[..], *w, *h)),
+                    )?
+                } else if link.codec == rdma_display_codec::Codec::Lossy {
                     if lossy_dec.is_none() {
                         lossy_dec = Some(lossy::LossyDecoder::new(
                             link.meta.width,

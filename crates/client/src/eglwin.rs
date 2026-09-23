@@ -29,6 +29,7 @@ const EGL_RENDERABLE_TYPE: i32 = 0x3040;
 const EGL_OPENGL_ES3_BIT: i32 = 0x0040;
 const EGL_NONE: i32 = 0x3038;
 const EGL_CONTEXT_CLIENT_VERSION: i32 = 0x3098;
+const EGL_CONTEXT_MINOR_VERSION: i32 = 0x30FB;
 const EGL_OPENGL_ES_API: u32 = 0x30A0;
 
 const GL_TEXTURE_2D: u32 = 0x0DE1;
@@ -307,7 +308,7 @@ impl EglWindow {
         if surf.is_null() {
             bail!("eglCreateWindowSurface failed (err {:#06x})", err());
         }
-        let ctx_attribs = [EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE];
+        let ctx_attribs = [EGL_CONTEXT_CLIENT_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 1, EGL_NONE];
         let ctx = unsafe {
             (egl.create_context)(dpy, cfg, std::ptr::null_mut(), ctx_attribs.as_ptr())
         };
@@ -572,8 +573,6 @@ impl EglWindow {
         bytes: &[u8],
         overlay: Option<(&[u8], u32, u32)>,
     ) -> Result<(u64, u64)> {
-        let t4;
-        let t5;
         unsafe {
             (self.gl.bind_texture)(GL_TEXTURE_2D, self.tex);
             (self.gl.tex_image_2d)(
@@ -590,74 +589,79 @@ impl EglWindow {
             // t4: the upload call itself. Stamp BEFORE glGetError: the error
             // query forces the driver to process queued commands, so timing
             // after it would bill the upload for the driver's flush.
-            t4 = rdma_display_proto::unix_now_us();
+            let t4 = rdma_display_proto::unix_now_us();
             let gl_err = (self.gl.get_error)();
             if gl_err != 0 {
                 bail!("upload glError 0x{gl_err:04x}");
             }
             (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
-            (self.gl.use_program)(self.prog);
-            (self.gl.uniform_2f)(
-                self.loc_win,
-                self.width as f32,
-                self.height as f32,
-            );
-            (self.gl.uniform_2f)(
-                self.loc_frame,
-                self.frame_w as f32,
-                self.frame_h as f32,
-            );
-            (self.gl.bind_texture)(GL_TEXTURE_2D, self.tex);
-            (self.gl.viewport)(0, 0, self.width as i32, self.height as i32);
-            (self.gl.draw_arrays)(GL_TRIANGLES, 0, 3);
-            (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
-            if self.ov_prog != 0 {
-                if let Some((rgba, w, h)) = overlay {
-                    (self.gl.bind_texture)(GL_TEXTURE_2D, self.ov_tex);
-                    (self.gl.tex_image_2d)(
-                        GL_TEXTURE_2D,
-                        0,
-                        GL_RGBA8 as i32,
-                        w as i32,
-                        h as i32,
-                        0,
-                        GL_RGBA,
-                        GL_UNSIGNED_BYTE,
-                        rgba.as_ptr() as *const c_void,
-                    );
-                    (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
-                }
-                (self.gl.use_program)(self.ov_prog);
-                (self.gl.uniform_2f)(
-                    self.ov_loc_origin,
-                    8.0,
-                    8.0,
-                );
-                (self.gl.uniform_2f)(
-                    self.ov_loc_size,
-                    crate::metrics::OVERLAY_W as f32,
-                    crate::metrics::OVERLAY_H as f32,
-                );
-                (self.gl.uniform_2f)(
-                    self.ov_loc_win,
-                    self.width as f32,
-                    self.height as f32,
-                );
-                (self.gl.enable)(GL_BLEND);
-                (self.gl.blend_func)(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            self.draw_with(self.tex, overlay);
+            if (self.egl.swap_buffers)(self.dpy, self.surf) == 0 {
+                bail!("eglSwapBuffers failed (err {:#06x})", (self.egl.get_error)());
+            }
+            Ok((t4, rdma_display_proto::unix_now_us()))
+        }
+    }
+
+    /// Draw an already-populated texture and swap, skipping the CPU upload.
+    /// Used for the GPU lossless decode target: the decode pass wrote `tex`
+    /// in this context, so the client does not touch a full host frame.
+    /// `t4` is stamped at entry (the decode the caller already queued).
+    pub fn present_texture(
+        &mut self,
+        tex: u32,
+        overlay: Option<(&[u8], u32, u32)>,
+    ) -> Result<(u64, u64)> {
+        unsafe {
+            let t4 = rdma_display_proto::unix_now_us();
+            self.draw_with(tex, overlay);
+            if (self.egl.swap_buffers)(self.dpy, self.surf) == 0 {
+                bail!("eglSwapBuffers failed (err {:#06x})", (self.egl.get_error)());
+            }
+            Ok((t4, rdma_display_proto::unix_now_us()))
+        }
+    }
+
+    /// Shared draw: full-screen letterboxed triangle sampling `tex`, then the
+    /// metrics overlay quad if enabled. Does not swap.
+    unsafe fn draw_with(&self, tex: u32, overlay: Option<(&[u8], u32, u32)>) {
+        (self.gl.use_program)(self.prog);
+        (self.gl.uniform_2f)(self.loc_win, self.width as f32, self.height as f32);
+        (self.gl.uniform_2f)(self.loc_frame, self.frame_w as f32, self.frame_h as f32);
+        (self.gl.bind_texture)(GL_TEXTURE_2D, tex);
+        (self.gl.viewport)(0, 0, self.width as i32, self.height as i32);
+        (self.gl.draw_arrays)(GL_TRIANGLES, 0, 3);
+        (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
+        if self.ov_prog != 0 {
+            if let Some((rgba, w, h)) = overlay {
                 (self.gl.bind_texture)(GL_TEXTURE_2D, self.ov_tex);
-                (self.gl.draw_arrays)(GL_TRIANGLES, 0, 6);
-                (self.gl.disable)(GL_BLEND);
+                (self.gl.tex_image_2d)(
+                    GL_TEXTURE_2D,
+                    0,
+                    GL_RGBA8 as i32,
+                    w as i32,
+                    h as i32,
+                    0,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    rgba.as_ptr() as *const c_void,
+                );
                 (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
             }
-            if (self.egl.swap_buffers)(self.dpy, self.surf) == 0 {
-                bail!(
-                    "eglSwapBuffers failed (err {:#06x})",
-                    (self.egl.get_error)()
-                );
-            }
-            t5 = rdma_display_proto::unix_now_us();
+            (self.gl.use_program)(self.ov_prog);
+            (self.gl.uniform_2f)(self.ov_loc_origin, 8.0, 8.0);
+            (self.gl.uniform_2f)(
+                self.ov_loc_size,
+                crate::metrics::OVERLAY_W as f32,
+                crate::metrics::OVERLAY_H as f32,
+            );
+            (self.gl.uniform_2f)(self.ov_loc_win, self.width as f32, self.height as f32);
+            (self.gl.enable)(GL_BLEND);
+            (self.gl.blend_func)(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            (self.gl.bind_texture)(GL_TEXTURE_2D, self.ov_tex);
+            (self.gl.draw_arrays)(GL_TRIANGLES, 0, 6);
+            (self.gl.disable)(GL_BLEND);
+            (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
         }
-        Ok((t4, t5))
     }
 }
