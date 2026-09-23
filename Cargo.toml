@@ -12,6 +12,7 @@ rust-version = "1.85"
 vnc = { git = "https://github.com/elmarco/rust-vnc", branch = "server" }
 ibverbs = { git = "https://github.com/jonhoo/rust-ibverbs" }
 rdma-display-proto = { path = "crates/proto" }
+rdma-display-codec = { path = "crates/codec" }
 qemu-display = { git = "https://gitlab.com/marcandre.lureau/qemu-display", default-features = false, features = ["qmp"] }
 async-std = "1"
 anyhow = "1"
