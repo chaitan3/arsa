@@ -9,6 +9,10 @@
 //! that drop without capping the boost. So every preset is a *minimum* and the
 //! ceiling is always the card's `clocks.max.*`.
 //!
+//! A floor survives this process, so `install_cleanup()` catches SIGINT/SIGTERM/
+//! SIGQUIT and releases exactly the floors we set before exiting. SIGKILL and a
+//! reboot still leave nothing behind (the driver resets on load).
+//!
 //! nvidia-smi (not nvidia-settings) is used deliberately: these commands work
 //! headless, with no X/NV-CONTROL display.
 //!
@@ -20,6 +24,8 @@
 //! `-lmc` is not supported on GeForce at all and prints "not supported" to
 //! stdout with exit 0 — so `lock_range()` inspects the output, not just the exit
 //! status.
+
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use anyhow::{bail, Context, Result};
 
@@ -42,6 +48,36 @@ pub enum GpuPower {
     Max,
     /// Floor at explicit `<sm>[,<mem>]` MHz, boost allowed; memory is optional.
     Custom { sm: u32, mem: Option<u32> },
+}
+
+/// Which clock floors were actually applied, so cleanup releases only those.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Applied {
+    sm: bool,
+    mem: bool,
+}
+
+impl Applied {
+    fn any(self) -> bool {
+        self.sm || self.mem
+    }
+
+    /// Release the floors we set. A card that rejected one never gets a reset
+    /// for it, so a clock set by someone else is not clobbered.
+    fn reset(self) {
+        if self.sm {
+            match nvidia_smi(&["-rgc"]) {
+                Ok(_) => eprintln!("[gpu-power] graphics clock floor released"),
+                Err(e) => eprintln!("[gpu-power] releasing graphics clock floor failed: {e:#}"),
+            }
+        }
+        if self.mem {
+            match nvidia_smi(&["-rmc"]) {
+                Ok(_) => eprintln!("[gpu-power] memory clock floor released"),
+                Err(e) => eprintln!("[gpu-power] releasing memory clock floor failed: {e:#}"),
+            }
+        }
+    }
 }
 
 impl GpuPower {
@@ -73,9 +109,9 @@ impl GpuPower {
 
     /// Apply the floor. Returns an error for display only: the caller logs it
     /// and keeps streaming, so this is never fatal.
-    pub fn apply(self) -> Result<()> {
+    pub fn apply(self) -> Result<Applied> {
         match self {
-            Self::Off => Ok(()),
+            Self::Off => Ok(Applied::default()),
             Self::P5 => pin(P5_SM_MHZ, Some(P5_MEM_MHZ), max_clocks()?, "p5"),
             Self::Max => {
                 let ceil = max_clocks()?;
@@ -84,6 +120,55 @@ impl GpuPower {
             Self::Custom { sm, mem } => pin(sm, mem, max_clocks()?, "custom"),
         }
     }
+}
+
+/// Reset flags shared with the signal watcher. The handler itself may only do
+/// async-signal-safe work, so it records the signal; a thread does the reset.
+static WANT_RESET_SM: AtomicBool = AtomicBool::new(false);
+static WANT_RESET_MEM: AtomicBool = AtomicBool::new(false);
+static GOT_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn on_signal(sig: libc::c_int) {
+    GOT_SIGNAL.store(sig, Ordering::SeqCst);
+}
+
+/// Release the clock floors on SIGINT (ctrl-c), SIGTERM or SIGQUIT. No-op when
+/// nothing was floored, so an unpinned run keeps the default signal behavior.
+pub fn install_cleanup(applied: Applied) {
+    if !applied.any() {
+        return;
+    }
+    WANT_RESET_SM.store(applied.sm, Ordering::SeqCst);
+    WANT_RESET_MEM.store(applied.mem, Ordering::SeqCst);
+
+    // sigaction rather than signal(): some libcs reset the handler on delivery
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        let handler: extern "C" fn(libc::c_int) = on_signal;
+        sa.sa_sigaction = handler as usize;
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut sa.sa_mask);
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGQUIT] {
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+
+    std::thread::spawn(|| {
+        let sig = loop {
+            let s = GOT_SIGNAL.load(Ordering::SeqCst);
+            if s != 0 {
+                break s;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        eprintln!("[gpu-power] quit signal ({sig}); releasing clock floors");
+        Applied {
+            sm: WANT_RESET_SM.load(Ordering::SeqCst),
+            mem: WANT_RESET_MEM.load(Ordering::SeqCst),
+        }
+        .reset();
+        std::process::exit(128 + sig);
+    });
 }
 
 /// The card's boost clocks, used as the ceiling so a floor never caps boost.
@@ -159,17 +244,17 @@ fn lock_range(flag: &str, min: u32, max: u32) -> Result<()> {
 /// ceiling at the card maximum so the GPU may still boost. Each clock is
 /// attempted independently so a card that rejects one still gets the other;
 /// only a complete failure is reported.
-fn pin(sm_floor: u32, mem_floor: Option<u32>, ceil: MaxClocks, label: &str) -> Result<()> {
+fn pin(sm_floor: u32, mem_floor: Option<u32>, ceil: MaxClocks, label: &str) -> Result<Applied> {
     // persistence mode keeps the driver resident so the floors survive idle;
     // best-effort — a permission error here is not fatal on its own
     if let Err(e) = nvidia_smi(&["-pm", "1"]) {
         eprintln!("[gpu-power] {label}: persistence mode not set ({e:#})");
     }
 
-    let mut floored = Vec::new();
+    let mut applied = Applied::default();
     match lock_range("-lgc", sm_floor, ceil.sm) {
         Ok(()) => {
-            floored.push(format!("sm >= {sm_floor} MHz"));
+            applied.sm = true;
             eprintln!(
                 "[gpu-power] {label}: graphics clock floored at {sm_floor} MHz (may boost to {})",
                 ceil.sm
@@ -180,7 +265,7 @@ fn pin(sm_floor: u32, mem_floor: Option<u32>, ceil: MaxClocks, label: &str) -> R
     if let Some(mem_floor) = mem_floor {
         match lock_range("-lmc", mem_floor, ceil.mem) {
             Ok(()) => {
-                floored.push(format!("mem >= {mem_floor} MHz"));
+                applied.mem = true;
                 eprintln!(
                     "[gpu-power] {label}: memory clock floored at {mem_floor} MHz (may boost to {})",
                     ceil.mem
@@ -189,21 +274,17 @@ fn pin(sm_floor: u32, mem_floor: Option<u32>, ceil: MaxClocks, label: &str) -> R
             Err(e) => eprintln!("[gpu-power] {label}: memory clock floor failed: {e:#}"),
         }
     }
-    if floored.is_empty() {
+    if !applied.any() {
         bail!("{label}: no clock floor could be set (need root / a supported GPU)");
     }
     if let Ok(state) = nvidia_smi(&[
         "--query-gpu=pstate,clocks.sm,clocks.mem",
         "--format=csv,noheader",
     ]) {
-        eprintln!(
-            "[gpu-power] {label}: floored ({}) -> {state}",
-            floored.join(", ")
-        );
+        eprintln!("[gpu-power] {label}: floored -> {state}");
     }
-    // otherwise the floors outlive this process; say how to undo them
-    eprintln!("[gpu-power] release with: nvidia-smi -i 0 -rgc -rmc");
-    Ok(())
+    eprintln!("[gpu-power] floors will be released on exit (manual: nvidia-smi -i 0 -rgc -rmc)");
+    Ok(applied)
 }
 
 #[cfg(test)]
@@ -242,5 +323,13 @@ mod tests {
         assert!(GpuPower::parse("p9").is_err());
         assert!(GpuPower::parse("435,fast").is_err());
         assert!(GpuPower::parse("").is_err());
+    }
+
+    #[test]
+    fn cleanup_applies_only_to_what_was_set() {
+        assert!(!Applied::default().any());
+        assert!(Applied { sm: true, mem: false }.any());
+        assert!(Applied { sm: false, mem: true }.any());
+        assert!(Applied { sm: true, mem: true }.any());
     }
 }

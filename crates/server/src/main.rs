@@ -155,11 +155,15 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
         );
     }
 
-    // best-effort GPU clock pin (--gpu-power): never fatal, so a non-root or
-    // non-NVIDIA box still streams on the driver's own power management
-    if let Err(e) = gpu_power.apply() {
-        eprintln!("[gpu-power] {e:#}");
-        eprintln!("[gpu-power] continuing with the driver's default power management");
+    // best-effort GPU clock floor (--gpu-power): never fatal, so a non-root or
+    // non-NVIDIA box still streams on the driver's own power management. On
+    // success the floors are released again on SIGINT/SIGTERM (ctrl-c).
+    match gpu_power.apply() {
+        Ok(applied) => gpu_power::install_cleanup(applied),
+        Err(e) => {
+            eprintln!("[gpu-power] {e:#}");
+            eprintln!("[gpu-power] continuing with the driver's default power management");
+        }
     }
 
     // video transport: auto prefers RDMA/RoCE and falls back to TCP when no
