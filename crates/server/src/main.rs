@@ -774,7 +774,12 @@ fn run_capture(
                 Some(d) => {
                     let fmt = d.format.clone();
                     let fb = fmt.frame_bytes() as usize;
-                    if fb > slot_bytes {
+                    // raw and lossless read the raw frame back into the slot,
+                    // so it must be big enough to hold it. lossy encodes from
+                    // the imported dmabuf into the slot (budget + 1 MiB), which
+                    // is deliberately smaller than the raw frame, so the raw
+                    // size is irrelevant there.
+                    if codec != rdma_display_codec::Codec::Lossy && fb > slot_bytes {
                         eprintln!(
                             "[server] scanout {}x{} fourcc={:#010x} '{}' ({} B) exceeds negotiated slot ({} B); dropped",
                             fmt.width,
