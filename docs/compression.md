@@ -206,3 +206,12 @@ traffic is the coded bytes; the frame's pixels stay in the texture between
 frames. Note `decode_to_image` currently ends in `glFinish` — a per-frame CPU
 sync that could become a fence, since the presenter's draw follows on the same
 command stream.
+
+**Presentation latency.** `display` (= compositor on-screen time − swap return)
+dominates the client span and is the compositor's queue-to-scanout, not our
+work. To let KWin bypass composition, the client marks the surface fully opaque
+(`wl_surface.set_opaque_region`, updated on every size change) and uses an
+alpha-free (XRGB) EGL window config, and runs `--fullscreen`. That makes the
+buffer eligible for **direct scanout** to the primary plane; otherwise KWin
+composites and adds a buffered stage. VRR and a refresh rate matching the
+source further bound `display`.
