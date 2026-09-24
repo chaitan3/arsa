@@ -765,13 +765,7 @@ fn run_capture(
                             slot_bytes
                         );
                         frame_dirty = false;
-                    } else if let Err(e) = mat.prepare(&fmt, Some(&d)) {
-                        // never tear down a session over a bad capture: hold
-                        // the last frame and resume when the format returns
-                        eprintln!("[server] prepare scanout failed: {e:#}; holding last frame");
-                        frame_dirty = false;
                     } else {
-                        have_frame = true;
                         // a resized scanout invalidates the codec's tile
                         // geometry; rebuild it (resets the reference, so the
                         // next frame is full)
@@ -786,25 +780,51 @@ fn run_capture(
                             mat.activate()?;
                         }
                         // Lossless on the GPU: import the scanout into the
-                        // encoder and encode straight from GPU memory — no
-                        // readback to host, no re-upload. On any error keep the
-                        // readback+encode path (warn once).
+                        // encoder and encode straight from GPU memory. When this
+                        // succeeds we never touch the materializer — its
+                        // per-frame dmabuf re-import would dominate the frame.
+                        let mut texture_ok = false;
                         if codec == rdma_display_codec::Codec::Lossless && fc.has_gpu() {
-                            if let Err(e) = fc.set_scanout(&d) {
-                                if !fc.scanout_warned {
-                                    eprintln!(
-                                        "[server] lossless texture-direct unavailable ({e:#}); using readback+encode"
-                                    );
-                                    fc.scanout_warned = true;
+                            match fc.set_scanout(&d) {
+                                Ok(()) => {
+                                    texture_ok = true;
+                                    // texture-direct has no readback to pipeline
+                                    pipelined = false;
                                 }
-                                fc.clear_scanout();
-                                pipelined = pipelined_capable;
-                            } else {
-                                // texture-direct has no readback to pipeline
-                                pipelined = false;
+                                Err(e) => {
+                                    if !fc.scanout_warned {
+                                        eprintln!(
+                                            "[server] lossless texture-direct unavailable ({e:#}); using readback+encode"
+                                        );
+                                        fc.scanout_warned = true;
+                                    }
+                                    fc.clear_scanout();
+                                }
                             }
                             // set_scanout made the codec's EGL context current
                             mat.activate()?;
+                        }
+                        if texture_ok {
+                            have_frame = true;
+                        } else {
+                            // materializer path: raw/lossy, or the lossless
+                            // fallback (readback + encode)
+                            mat.activate()?;
+                            match mat.prepare(&fmt, Some(&d)) {
+                                Ok(()) => {
+                                    have_frame = true;
+                                    pipelined = pipelined_capable;
+                                }
+                                Err(e) => {
+                                    // never tear down a session over a bad
+                                    // capture: hold the last frame and resume
+                                    // when the format returns
+                                    eprintln!(
+                                        "[server] prepare scanout failed: {e:#}; holding last frame"
+                                    );
+                                    frame_dirty = false;
+                                }
+                            }
                         }
                     }
                 }
