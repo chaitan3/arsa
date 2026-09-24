@@ -1030,6 +1030,8 @@ struct FrameCodec {
     /// import-cache hit/miss counters (cumulative)
     import_hits: u64,
     import_misses: u64,
+    /// one-shot startup benchmark: iterations left (RDMA_LOSSLESS_BENCH=N)
+    bench_left: u32,
 }
 
 impl FrameCodec {
@@ -1047,6 +1049,10 @@ impl FrameCodec {
             mat_activate_us: 0,
             import_hits: 0,
             import_misses: 0,
+            bench_left: std::env::var("RDMA_LOSSLESS_BENCH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
         }
     }
 
@@ -1245,6 +1251,11 @@ impl FrameCodec {
         let coded = gpu.coded(n);
         out[..n].copy_from_slice(coded);
         let copy = t.elapsed();
+        if self.bench_left > 0 {
+            let n_iter = self.bench_left;
+            self.bench_left = 0;
+            self.bench_scanout_read(n_iter)?;
+        }
         self.stat_buf.push([
             act.as_micros() as u64,
             blit.as_micros() as u64,
@@ -1281,6 +1292,51 @@ impl FrameCodec {
                 fin_us: 0,
             },
         ))
+    }
+
+    /// One-shot startup diagnostic (`RDMA_LOSSLESS_BENCH=N`): time N
+    /// detection-only reads of the imported real scanout through the active
+    /// path, after the first frame has seeded the reference. Compare with
+    /// `codecbench --gbm` (a synthetic tiled dma-buf) to see whether the cost
+    /// is the tiled layout or the compositor's buffer itself.
+    fn bench_scanout_read(&mut self, n: u32) -> Result<()> {
+        let Some(gpu) = self.gpu.as_mut() else {
+            return Ok(());
+        };
+        gpu.activate()?;
+        let path = if gpu.has_fetch_encode() {
+            "fetch"
+        } else if gpu.has_ext_encode() {
+            "ext"
+        } else {
+            "blit+tex"
+        };
+        let mut us = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            gpu.sync();
+            let t = std::time::Instant::now();
+            match path {
+                "fetch" => {
+                    gpu.encode_fetch(false)?;
+                }
+                "ext" => {
+                    gpu.encode_ext(false)?;
+                }
+                _ => {
+                    gpu.blit_source()?;
+                    gpu.encode_tex(false)?;
+                }
+            }
+            us.push(t.elapsed().as_micros() as u64);
+        }
+        us.sort_unstable();
+        eprintln!(
+            "[server] real-scanout read bench (path={path}, n={n}): p50={}us min={}us max={}us",
+            us[us.len() / 2],
+            us[0],
+            us[us.len() - 1],
+        );
+        Ok(())
     }
 }
 
