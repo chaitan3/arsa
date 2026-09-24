@@ -133,8 +133,56 @@ re-upload, which the texture-direct path removes. On high-motion content that
 compresses poorly `raw` is still the cheaper choice (a texture-direct delta then
 costs about the same as the coded payload's readback).
 
-On the client, `--output egl` decodes the tiles on the GPU straight into the
-texture the presenter draws (`GpuVideoDecoder`, attached to the presenter's
-GLES context), so a delta patches only the changed region: no full-frame CPU
-decode and no full-frame `glTexImage2D` upload. Headless (`--output none`)
-keeps the CPU decoder.
+### Client display path (GPU lossless decode)
+
+With `--codec lossless --output egl`, the client decodes deltas into a
+persistent `GL_RGBA8` texture and the presenter draws *that texture* — the CPU
+never touches full-frame pixels, and there is no per-frame `glTexImage2D` of the
+frame. Headless (`--output none`) keeps the CPU decoder + full-frame upload.
+
+**Setup (once, at session start).** `GpuVideoDecoder::attach_current(geom)`
+attaches to `eglwin`'s *current* GLES 3.1 context (GL entry points come from
+`eglGetProcAddress`), builds the decode compute program (`DEC_TEX_SRC`), and
+allocates a persistently-mapped coded-input SSBO on binding 4
+(`codec-gpu/src/lib.rs:1022`). `create_texture(w,h)` makes the immutable
+`GL_RGBA8` target with `glTexStorage2D` (immutable storage is required for
+`imageStore` in ES 3.1); its contents are defined by the first decode — the
+server resets its reference on a new session/geometry, so the first frame is
+always full and paints every tile (`codec-gpu/src/lib.rs:1040`). If attach or
+texture creation fails, the client logs and falls back to the CPU decoder.
+
+**Per frame** (`client/src/main.rs:273`):
+
+1. `drain`: poll `try_next_frame()` until empty; stamp `t3` and `rearm_slot`.
+2. **Decode in order.** Lossless deltas reference the previous frame, so every
+   received frame must be decoded even if it will not be shown. For each:
+   `Header::parse` gives the tile count and coded length
+   `n = HEADER_LEN + tile_count*4 + count*tile_bytes`; `dec.upload(&coded[..n])`
+   memcpys only the *coded* bytes into the decoder SSBO;
+   `dec.decode_to_image(tex, count)` binds `tex` as a write-only image and
+   dispatches one workgroup per changed tile, each `imageStore`-ing its payload
+   at `(x0+lx, y0+ly)`. Unchanged tiles are not touched, so the texture *is* the
+   reference (`codec-gpu/src/lib.rs:1115`). On a `Meta` geometry change it
+   decodes that frame with the CPU decoder instead and stops using the stale
+   texture.
+3. **Present only the newest.** Superseded frames were decoded (to keep the
+   chain) but are credited without presenting (`newest.replace` +
+   `credit_slot`), so the display shows the latest content rather than replaying
+   a backlog.
+4. **Draw + swap.** `present_texture(tex, …)` (`eglwin.rs:610`) runs
+   `draw_with`: a full-screen letterboxed triangle sampling `tex`, then the
+   metrics overlay quad, then `eglSwapBuffers` (`swap_interval = 1`, i.e. FIFO
+   pacing). No upload is issued. It returns `(t4, t5)`.
+5. **Credit** the presented slot and `metrics.record(seq, t3, t4, t5, fb)`.
+
+**Metrics mapping.** `upload = t4 − t3` (coded memcpy + decode dispatch +
+the decode's `glFinish`), `present = t5 − t4` (draw + swap submission),
+`display = tp − t5` (compositor queue + scanout, from `wp_presentation`). The
+overlay is rasterized at `REFRESH_MS`, uploaded into its own texture, and drawn
+every frame so it never flickers.
+
+Compared with the CPU path (`link.frame` + `present`), the only per-frame host
+traffic is the coded bytes; the frame's pixels stay in the texture between
+frames. Note `decode_to_image` currently ends in `glFinish` — a per-frame CPU
+sync that could become a fence, since the presenter's draw follows on the same
+command stream.
