@@ -1073,14 +1073,56 @@ impl VblankTracker {
             self.wait = None;
             return VStep::Disabled;
         }
+        // A pending commit whose target vblank has passed is captured first,
+        // *before* looking for a newer commit. The old order replaced the wait
+        // whenever `fb != seen`; under continuous flips a new commit can land
+        // within the 1 ms poll period after the target vblank, so the wait was
+        // replaced again and again and frames were never captured in order.
+        if let Some(w) = self.wait.as_ref() {
+            let (w_fb, w_target, w_since, w_prev, w_prev_t0) =
+                (w.fb, w.target_seq, w.since_ms, w.prev, w.prev_t0_us);
+            if seq >= w_target {
+                let t0 = mono_ns_to_unix_us(ns);
+                self.wait = None;
+                self.last_captured = w_fb;
+                self.failures = 0;
+                // leave `seen` alone: if a newer commit is current, the next
+                // poll's `fb != seen` arms a wait for it (it retires a later
+                // vblank), so continuous flips are captured in order
+                return VStep::Capture(w_fb, t0);
+            }
+            if now_ms.saturating_sub(w_since) > VBLANK_TIMEOUT_MS {
+                self.wait = None;
+                self.failures += 1;
+                // A replacement resets `since_ms`, so reaching the timeout
+                // means `fb` stayed put AND the sequence did not advance: the
+                // kernel's vblank counter is not running (nvidia-drm can
+                // return a frozen `sequence_ns` even though the ioctl succeeds).
+                eprintln!(
+                    "[capture-drm] vblank timeout: fb {w_fb} (seen {}) waiting for seq {w_target}, \
+                     now seq {seq} ns {ns} after {} ms — sequence not advancing",
+                    self.seen,
+                    now_ms.saturating_sub(w_since),
+                );
+                // prefer the frame that certainly retired; else the committed
+                // one, which is certainly complete after this long a wait
+                let (id, t0) = if w_prev != 0 && w_prev != self.last_captured {
+                    (w_prev, w_prev_t0)
+                } else {
+                    (self.seen, self.seen_since_us)
+                };
+                self.last_captured = id;
+                return VStep::Capture(id, t0);
+            }
+            return VStep::None;
+        }
         if fb != self.seen {
             let prev = self.seen;
             let prev_t0 = self.seen_since_us;
             self.seen = fb;
             self.changed_ms = now_ms;
             self.seen_since_us = now_us;
-            // the next vblank retires this commit; a newer commit before then
-            // just replaces the wait (latest-wins, like the send mailbox)
+            // the next vblank retires this commit
             self.wait = Some(VblankWait {
                 fb,
                 target_seq: seq.wrapping_add(1),
@@ -1088,31 +1130,6 @@ impl VblankTracker {
                 prev,
                 prev_t0_us: prev_t0,
             });
-            return VStep::None;
-        }
-        if let Some(w) = self.wait.as_ref() {
-            if seq >= w.target_seq {
-                let fb = w.fb;
-                let t0 = mono_ns_to_unix_us(ns);
-                self.wait = None;
-                self.last_captured = fb;
-                self.failures = 0;
-                return VStep::Capture(fb, t0);
-            }
-            if now_ms.saturating_sub(w.since_ms) > VBLANK_TIMEOUT_MS {
-                let (prev, prev_t0) = (w.prev, w.prev_t0_us);
-                self.wait = None;
-                self.failures += 1;
-                // prefer the frame that certainly retired; else the committed
-                // one, which is certainly complete after this long a wait
-                let (id, t0) = if prev != 0 && prev != self.last_captured {
-                    (prev, prev_t0)
-                } else {
-                    (self.seen, self.seen_since_us)
-                };
-                self.last_captured = id;
-                return VStep::Capture(id, t0);
-            }
             return VStep::None;
         }
         // no pending wait: flips stopped — take the settled current fb
@@ -1189,6 +1206,8 @@ fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> 
     let mut vlag: Vec<u64> = Vec::new();
     let mut vints: Vec<u64> = Vec::new();
     let mut vns_prev: Option<i64> = None;
+    // log CRTC_GET_SEQUENCE failures once (otherwise silently frozen -> 0)
+    let mut vblank_err_logged = false;
     loop {
         if card.is_none() {
             if let Some(t) = last_open_attempt {
@@ -1276,7 +1295,17 @@ fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> 
         // now cannot already have been retired by a vblank folded into `seq`
         // (which would make us wait one extra vblank)
         let vblank = if active == ActiveSync::Vblank {
-            crtc_id.and_then(|c| get_sequence(fdi, c).ok())
+            match crtc_id.map(|c| get_sequence(fdi, c)) {
+                Some(Ok(v)) => Some(v),
+                Some(Err(e)) => {
+                    if !vblank_err_logged {
+                        eprintln!("[capture-drm] vblank: CRTC_GET_SEQUENCE failed: {e:#}");
+                        vblank_err_logged = true;
+                    }
+                    None
+                }
+                None => None,
+            }
         } else {
             None
         };
