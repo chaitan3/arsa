@@ -451,13 +451,23 @@ impl VkCore {
                 &mut req2,
             );
             let req = req2.memory_requirements;
+            // Vulkan takes ownership of the fd on a *successful* import and
+            // must not see it used afterwards, so never hand it the caller's
+            // fd: dup it and let the implementation own the duplicate. The
+            // caller keeps its own fd and closes it normally (handing over the
+            // caller's fd was a double-close once the caller closed it).
+            let dup = libc::dup(fd);
+            if dup < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("dup dmabuf fd for import");
+            }
             let imp = vk::ImportMemoryFdInfoKHR {
                 handle_type: vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
-                fd,
+                fd: dup,
                 ..Default::default()
             };
             let mt = self.find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
-            let memory = self.device.allocate_memory(
+            let memory = match self.device.allocate_memory(
                 &vk::MemoryAllocateInfo {
                     allocation_size: req.size,
                     memory_type_index: mt,
@@ -465,8 +475,21 @@ impl VkCore {
                     ..Default::default()
                 },
                 None,
-            )?;
-            self.device.bind_image_memory(image, memory, 0)?;
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    // a failed import does not take ownership: close our dup
+                    libc::close(dup);
+                    return Err(anyhow::anyhow!("import dmabuf memory: {e}"));
+                }
+            };
+            if let Err(e) = self.device.bind_image_memory(image, memory, 0) {
+                // the import succeeded, so Vulkan owns `dup`; freeing the
+                // memory releases it
+                self.device.free_memory(memory, None);
+                self.device.destroy_image(image, None);
+                return Err(anyhow::anyhow!("bind imported dmabuf memory: {e}"));
+            }
             Ok(Image { image, memory, format, width, height })
         }
     }
