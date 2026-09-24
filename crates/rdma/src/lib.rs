@@ -14,6 +14,7 @@
 
 use std::io::Write;
 use std::net::TcpStream;
+use std::os::fd::AsRawFd;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -557,8 +558,8 @@ impl ServerLink {
     /// called, `send_frame*` returns `Ok(None)` (nothing is sent).
     pub fn attach_video(&mut self, stream: TcpStream) {
         let _ = stream.set_nodelay(true);
+        eprintln!("[rdma] TCP video socket attached (fd {})", stream.as_raw_fd());
         self.video = Some(stream);
-        eprintln!("[rdma] TCP video socket attached");
     }
 
     pub fn has_video(&self) -> bool {
@@ -801,6 +802,12 @@ impl ServerLink {
                 unreachable!()
             };
             let w = self.video.as_mut().expect("video attached");
+            if let Err(e) = w.peer_addr() {
+                eprintln!(
+                    "[rdma] video socket fd {} is not a socket before write ({e}); an fd was closed and reused",
+                    w.as_raw_fd()
+                );
+            }
             w.write_all(&(post_len as u32).to_le_bytes())
                 .context("tcp video frame length")?;
             w.write_all(&seq.to_le_bytes())
@@ -938,6 +945,12 @@ impl ServerLink {
                         buf.len()
                     );
                     let w = self.video.as_mut().expect("video attached");
+                    if let Err(e) = w.peer_addr() {
+                        eprintln!(
+                            "[rdma] video socket fd {} is not a socket before write ({e}); an fd was closed and reused",
+                            w.as_raw_fd()
+                        );
+                    }
                     w.write_all(&(post_len as u32).to_le_bytes())
                         .context("tcp video frame length")?;
                     w.write_all(&seq.to_le_bytes())
