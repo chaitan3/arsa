@@ -122,6 +122,9 @@ mod tests {
 /// A dmabuf scanout with owned (duplicated) plane fds.
 #[derive(Debug)]
 pub struct DmabufScanout {
+    /// stable DRM framebuffer id for this buffer (the fds are re-imported each
+    /// frame, so this is the identifier to cache imports on)
+    pub fb_id: u32,
     pub fds: Vec<std::os::fd::OwnedFd>,
     pub offsets: Vec<u32>,
     pub strides: Vec<u32>,

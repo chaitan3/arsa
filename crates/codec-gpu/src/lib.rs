@@ -262,6 +262,9 @@ impl Gl {
 /// is only borrowed for the duration of [`GpuCodec::set_scanout`].
 #[derive(Clone, Copy, Debug)]
 pub struct DmabufImage {
+    /// stable buffer id (DRM fb_id): the fds are re-created each frame, so the
+    /// import cache keys on this rather than the fd
+    pub key: u64,
     pub fd: i32,
     pub offset: u32,
     pub stride: u32,
@@ -273,7 +276,7 @@ pub struct DmabufImage {
 
 /// A cached dmabuf import (EGLImage + texture target).
 struct SrcImport {
-    key: (i32, u32, u32, u32, u64, u32, u32),
+    key: (u64, u32, u32, u32, u64, u32, u32),
     img: Handle,
     tex: u32,
     linear: bool,
@@ -320,6 +323,8 @@ pub struct GpuCodec {
     /// cached dmabuf imports, keyed so a repeated scanout buffer isn't
     /// re-imported (the import enqueues ~3 ms of GPU work for 4K — measured)
     src_cache: Vec<SrcImport>,
+    cache_hits: u64,
+    cache_misses: u64,
     coded_map: *mut u8,
     coded_len: usize,
     counter_map: *mut u32,
@@ -588,6 +593,8 @@ impl GpuCodec {
                 src_tex2d: 0,
                 has_scanout: false,
                 src_cache: Vec::new(),
+                cache_hits: 0,
+                cache_misses: 0,
                 coded_map: coded_map as *mut u8,
                 coded_len,
                 counter_map: counter_map as *mut u32,
@@ -642,6 +649,11 @@ impl GpuCodec {
         self.has_scanout
     }
 
+    /// (import-cache hits, misses) since construction.
+    pub fn cache_stats(&self) -> (u64, u64) {
+        (self.cache_hits, self.cache_misses)
+    }
+
     /// Tiles changed by the most recent `encode`/`encode_tex` (0 = idle delta).
     pub fn last_count(&self) -> usize {
         self.last_count
@@ -655,13 +667,19 @@ impl GpuCodec {
     /// as `GL_TEXTURE_EXTERNAL_OES`. Makes the codec's EGL context current.
     pub fn set_scanout(&mut self, d: &DmabufImage) -> Result<()> {
         self.activate()?;
-        let key = (d.fd, d.offset, d.stride, d.fourcc, d.modifier, d.width, d.height);
-        if let Some(e) = self.src_cache.iter().find(|e| e.key == key) {
-            self.src_egl_image = e.img;
-            self.src_tex = e.tex;
-            self.direct_img = if e.linear { e.tex } else { 0 };
-            self.has_scanout = true;
-            return Ok(());
+        let key = (d.key, d.offset, d.stride, d.fourcc, d.modifier, d.width, d.height);
+        // key == 0 means "no stable buffer id" (e.g. QEMU D-Bus scanouts):
+        // re-import every frame rather than risk a stale cache entry
+        let cacheable = d.key != 0;
+        if cacheable {
+            if let Some(e) = self.src_cache.iter().find(|e| e.key == key) {
+                self.src_egl_image = e.img;
+                self.src_tex = e.tex;
+                self.direct_img = if e.linear { e.tex } else { 0 };
+                self.has_scanout = true;
+                self.cache_hits += 1;
+                return Ok(());
+            }
         }
         let create = self
             .create_image
@@ -737,15 +755,18 @@ impl GpuCodec {
         }
         self.src_egl_image = img;
         self.has_scanout = true;
+        self.cache_misses += 1;
         // keep the import cached (bounded) so a repeat of this buffer is a
         // lookup, not a re-import; evict the oldest non-current entry
         let tex = self.src_tex;
-        self.src_cache.push(SrcImport {
-            key,
-            img,
-            tex,
-            linear: self.direct_img != 0,
-        });
+        if cacheable {
+            self.src_cache.push(SrcImport {
+                key,
+                img,
+                tex,
+                linear: self.direct_img != 0,
+            });
+        }
         while self.src_cache.len() > 4 {
             match self.src_cache.iter().position(|e| e.img != self.src_egl_image) {
                 Some(i) => {

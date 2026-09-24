@@ -1007,6 +1007,10 @@ struct FrameCodec {
     stat_buf: Vec<[u64; 6]>,
     /// time the caller spent restoring the materializer context last frame
     mat_activate_us: u64,
+    /// diagnostic: time to import the scanout (with a sync) + cache stats
+    import_us: u64,
+    import_hits: u64,
+    import_misses: u64,
 }
 
 impl FrameCodec {
@@ -1022,6 +1026,9 @@ impl FrameCodec {
             scanout_warned: false,
             stat_buf: Vec::new(),
             mat_activate_us: 0,
+            import_us: 0,
+            import_hits: 0,
+            import_misses: 0,
         }
     }
 
@@ -1140,7 +1147,9 @@ impl FrameCodec {
             );
         }
         use std::os::fd::AsRawFd;
+        let t = std::time::Instant::now();
         gpu.set_scanout(&rdma_display_codec_gpu::DmabufImage {
+            key: d.fb_id as u64,
             fd: d.fds[0].as_raw_fd(),
             offset: d.offsets.first().copied().unwrap_or(0),
             stride: d.strides.first().copied().unwrap_or(d.format.stride),
@@ -1149,9 +1158,22 @@ impl FrameCodec {
             width: d.format.width,
             height: d.format.height,
         })?;
+        // diagnostic: expose the import's GPU cost (it otherwise drains into
+        // the encode's finish) and snapshot the cache hit/miss counters
+        gpu.sync();
+        self.import_us = t.elapsed().as_micros() as u64;
+        let (h, m) = gpu.cache_stats();
+        self.import_hits = h;
+        self.import_misses = m;
         if !self.scanout {
             eprintln!(
-                "[server] lossless texture-direct: encoding from the imported scanout dmabuf (no readback/re-upload)"
+                "[server] lossless texture-direct: {} scanout (modifier={:#x}) — no readback/re-upload",
+                if gpu.has_fetch_encode() {
+                    "linear → texelFetch"
+                } else {
+                    "tiled → external sampler"
+                },
+                d.format.modifier,
             );
         }
         self.scanout = true;
@@ -1229,9 +1251,10 @@ impl FrameCodec {
             }
             let sum: u64 = med.iter().sum();
             eprintln!(
-                "[server] lossless texture p50/xmax us: activate={}/{} blit={}/{} encode={}/{} ref={}/{} copy={}/{} mat_restore={}/{} | p50 sum={} | tiles={} coded={} B",
+                "[server] lossless texture p50/xmax us: activate={}/{} blit={}/{} encode={}/{} ref={}/{} copy={}/{} mat_restore={}/{} | p50 sum={} | import={} us hit={} miss={} | tiles={} coded={} B",
                 med[0], mx[0], med[1], mx[1], med[2], mx[2], med[3], mx[3],
-                med[4], mx[4], med[5], mx[5], sum, count, n,
+                med[4], mx[4], med[5], mx[5], sum,
+                self.import_us, self.import_hits, self.import_misses, count, n,
             );
             self.stat_buf.clear();
         }

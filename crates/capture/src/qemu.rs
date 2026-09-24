@@ -85,6 +85,9 @@ impl qemu_display::ConsoleListenerHandler for Listener {
             num_planes: s.num_planes,
         };
         let dmabuf = DmabufScanout {
+            // QEMU scanouts have no DRM fb id; 0 disables import caching (the
+            // D-Bus fds are not guaranteed stable per buffer)
+            fb_id: 0,
             fds,
             offsets: s.offset[..format.num_planes as usize].to_vec(),
             strides: s.stride[..format.num_planes as usize].to_vec(),

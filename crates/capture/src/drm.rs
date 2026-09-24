@@ -610,6 +610,7 @@ fn import_fb(card: &OwnedFd, fb_id: u32) -> Result<DmabufScanout> {
         num_planes: 1,
     };
     Ok(DmabufScanout {
+        fb_id,
         fds: vec![dmabuf],
         offsets: vec![fb.offsets[0]],
         strides: vec![fb.pitches[0]],
