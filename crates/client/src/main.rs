@@ -360,18 +360,18 @@ fn main() -> Result<()> {
                     )?
                 } else if link.codec == rdma_display_codec::Codec::Lossy {
                     if lossy_dec.is_none() {
-                        lossy_dec = Some(lossy::LossyDecoder::new(
+                        let dec = lossy::LossyDecoder::new(
                             link.meta.width,
                             link.meta.height,
                             link.codec_chroma,
-                        )?);
+                        )?;
+                        // import the decoded YUV planes into GL once (dma-buf)
+                        win.import_yuv(dec.plane_descs())?;
+                        lossy_dec = Some(dec);
                     }
                     let coded = link.slot_bytes(slot);
-                    let frame = lossy_dec.as_mut().unwrap().decode(coded)?;
-                    win.present(
-                        frame,
-                        overlay.as_ref().map(|(r, w, h)| (&r[..], *w, *h)),
-                    )?
+                    lossy_dec.as_mut().unwrap().decode(coded)?;
+                    win.present_yuv(overlay.as_ref().map(|(r, w, h)| (&r[..], *w, *h)))?
                 } else {
                     let frame = link.frame(slot)?;
                     win.present(
@@ -442,17 +442,22 @@ fn main() -> Result<()> {
                     )?);
                 }
                 let coded = link.slot_bytes(slot);
-                let dec = lossy_dec.as_mut().unwrap().decode(coded)?.to_vec();
-                if want_stats {
-                    let sum: u32 = dec.iter().map(|b| *b as u32).sum();
-                    let nonzero = dec.iter().filter(|b| **b != 0).count();
-                    eprintln!(
-                        "[client-check] seq={} slot={} sum={} nonzero={}/{}",
-                        seq, slot, sum, nonzero, dec.len()
-                    );
-                }
-                if want_dump {
-                    frame_owned = Some(dec);
+                let d = lossy_dec.as_mut().unwrap();
+                d.decode(coded)?;
+                if want_stats || want_dump {
+                    // debug-only CPU readback (the streaming path stays on GPU)
+                    let dec = d.read_rgba()?.to_vec();
+                    if want_stats {
+                        let sum: u32 = dec.iter().map(|b| *b as u32).sum();
+                        let nonzero = dec.iter().filter(|b| **b != 0).count();
+                        eprintln!(
+                            "[client-check] seq={} slot={} sum={} nonzero={}/{}",
+                            seq, slot, sum, nonzero, dec.len()
+                        );
+                    }
+                    if want_dump {
+                        frame_owned = Some(dec);
+                    }
                 }
             } else if want_dump {
                 frame_owned = Some(link.frame(slot)?.to_vec());

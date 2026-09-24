@@ -41,6 +41,7 @@ const GL_TEXTURE_2D: u32 = 0x0DE1;
 const GL_RGBA8: u32 = 0x8058;
 const GL_RGBA: u32 = 0x1908;
 const GL_UNSIGNED_BYTE: u32 = 0x1401;
+const GL_TEXTURE0: u32 = 0x84C0;
 const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
 const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
 const GL_NEAREST: u32 = 0x2600;
@@ -53,6 +54,17 @@ const GL_VERTEX_SHADER: u32 = 0x8B31;
 const GL_FRAGMENT_SHADER: u32 = 0x8B30;
 const GL_COMPILE_STATUS: u32 = 0x8B81;
 const GL_LINK_STATUS: u32 = 0x8B82;
+
+// --- EGL_EXT_image_dma_buf_import (YUV planes shared from Vulkan) -----------
+const EGL_WIDTH: i32 = 0x3057;
+const EGL_HEIGHT: i32 = 0x3056;
+const EGL_LINUX_DMA_BUF_EXT: i32 = 0x3270;
+const EGL_LINUX_DRM_FOURCC_EXT: i32 = 0x3271;
+const EGL_DMA_BUF_PLANE0_FD_EXT: i32 = 0x3272;
+const EGL_DMA_BUF_PLANE0_OFFSET_EXT: i32 = 0x3273;
+const EGL_DMA_BUF_PLANE0_PITCH_EXT: i32 = 0x3274;
+/// DRM_FORMAT_R8 ('R','8',' ',' ')
+const DRM_FORMAT_R8: i32 = 0x2020_3852;
 
 fn sym<T: Copy>(lib: &libloading::Library, name: &str) -> Result<T> {
     unsafe {
@@ -117,6 +129,8 @@ struct Gl {
     blend_func: unsafe extern "system" fn(u32, u32),
     uniform_2f: unsafe extern "system" fn(i32, f32, f32),
     get_uniform_location: unsafe extern "system" fn(u32, *const i8) -> i32,
+    uniform_1i: unsafe extern "system" fn(i32, i32),
+    active_texture: unsafe extern "system" fn(u32),
 }
 
 const GL_COLOR_BUFFER_BIT: u32 = 0x4000;
@@ -165,6 +179,39 @@ void main() {
         frag = texture(tex, vec2(uv.x, 1.0 - uv.y)).bgra;
     } else {
         frag = vec4(0.0, 0.0, 0.0, 1.0);  // letterbox bar
+    }
+}
+"#;
+
+// lossy YUV->RGB: the three PyroWave decode planes are shared from Vulkan as
+// linear R8 dma-bufs (no host round trip); letterbox + vertical flip match FS.
+const FS_YUV: &str = r#"#version 300 es
+precision highp float;
+uniform sampler2D y_tex;
+uniform sampler2D u_tex;
+uniform sampler2D v_tex;
+uniform vec2 u_win;
+uniform vec2 u_frame;
+in vec2 v_uv;
+out vec4 frag;
+void main() {
+    vec2 px = v_uv * u_win;
+    vec2 scl = min(u_win / u_frame, vec2(1e6));
+    vec2 pic = u_frame * scl;
+    vec2 org = (u_win - pic) * 0.5;
+    if (all(greaterThanEqual(px, org)) && all(lessThan(px, org + pic))) {
+        vec2 uv = (px - org) / pic;
+        uv.y = 1.0 - uv.y;                 // same flip as the RGBA path
+        float y = texture(y_tex, uv).r * 255.0;
+        float u = texture(u_tex, uv).r * 255.0 - 128.0;
+        float v = texture(v_tex, uv).r * 255.0 - 128.0;
+        // BT.709 full-range, identical to the old CPU conversion
+        float r = clamp(y + 1.5748 * v, 0.0, 255.0);
+        float g = clamp(y - 0.1873 * u - 0.4681 * v, 0.0, 255.0);
+        float b = clamp(y + 1.8556 * u, 0.0, 255.0);
+        frag = vec4(r, g, b, 255.0) / 255.0;
+    } else {
+        frag = vec4(0.0, 0.0, 0.0, 1.0);
     }
 }
 "#;
@@ -228,6 +275,14 @@ pub struct EglWindow {
     ov_loc_origin: i32,
     ov_loc_size: i32,
     ov_loc_win: i32,
+    // lossy: YUV->RGB on the GPU sampling the Vulkan decode planes imported as
+    // dma-bufs (no host readback, no CPU conversion)
+    yuv_prog: u32,
+    yuv_tex: [u32; 3],
+    yuv_egl_images: [*mut c_void; 3],
+    yuv_loc_win: i32,
+    yuv_loc_frame: i32,
+    yuv_loc_tex: [i32; 3],
 }
 
 // all GL/EGL calls happen from the single client loop thread
@@ -398,6 +453,8 @@ impl EglWindow {
                 "glGetUniformLocation",
                 unsafe extern "system" fn(u32, *const i8) -> i32
             ),
+            uniform_1i: glsym!("glUniform1i", unsafe extern "system" fn(i32, i32)),
+            active_texture: glsym!("glActiveTexture", unsafe extern "system" fn(u32)),
         };
 
         let mut me = EglWindow {
@@ -422,6 +479,12 @@ impl EglWindow {
             ov_loc_origin: -1,
             ov_loc_size: -1,
             ov_loc_win: -1,
+            yuv_prog: 0,
+            yuv_tex: [0; 3],
+            yuv_egl_images: [std::ptr::null_mut(); 3],
+            yuv_loc_win: -1,
+            yuv_loc_frame: -1,
+            yuv_loc_tex: [-1; 3],
         };
         me.build_program()?;
         unsafe {
@@ -659,6 +722,11 @@ impl EglWindow {
         (self.gl.viewport)(0, 0, self.width as i32, self.height as i32);
         (self.gl.draw_arrays)(GL_TRIANGLES, 0, 3);
         (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
+        self.draw_overlay(overlay);
+    }
+
+    /// Upload+draw the metrics overlay quad (no-op without --metrics).
+    unsafe fn draw_overlay(&self, overlay: Option<(&[u8], u32, u32)>) {
         if self.ov_prog != 0 {
             if let Some((rgba, w, h)) = overlay {
                 (self.gl.bind_texture)(GL_TEXTURE_2D, self.ov_tex);
@@ -689,6 +757,140 @@ impl EglWindow {
             (self.gl.draw_arrays)(GL_TRIANGLES, 0, 6);
             (self.gl.disable)(GL_BLEND);
             (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
+        }
+    }
+
+    fn build_yuv_program(&mut self) -> Result<()> {
+        unsafe {
+            let compile = |gl: &Gl, src: &str, ty: u32| -> Result<u32> {
+                let sh = (gl.create_shader)(ty);
+                let c = std::ffi::CString::new(src.as_bytes())?;
+                (gl.shader_source)(
+                    sh,
+                    1,
+                    (&[c.as_ptr()] as *const [*const i8]) as *const *const i8,
+                    std::ptr::null(),
+                );
+                (gl.compile_shader)(sh);
+                let mut ok = 0;
+                (gl.get_shaderiv)(sh, GL_COMPILE_STATUS, &mut ok);
+                if ok == 0 {
+                    let mut log = [0u8; 512];
+                    let mut n = 0;
+                    (gl.get_shader_info_log)(sh, 512, &mut n, log.as_mut_ptr());
+                    bail!(
+                        "yuv shader compile failed: {}",
+                        String::from_utf8_lossy(&log[..n as usize])
+                    );
+                }
+                Ok(sh)
+            };
+            let vs = compile(&self.gl, VS, GL_VERTEX_SHADER)?;
+            let fs = compile(&self.gl, FS_YUV, GL_FRAGMENT_SHADER)?;
+            let prog = (self.gl.create_program)();
+            (self.gl.attach_shader)(prog, vs);
+            (self.gl.attach_shader)(prog, fs);
+            (self.gl.link_program)(prog);
+            let mut ok = 0;
+            (self.gl.get_programiv)(prog, GL_LINK_STATUS, &mut ok);
+            if ok == 0 {
+                bail!("yuv program link failed");
+            }
+            self.yuv_prog = prog;
+            let name = |s: &str| -> i32 {
+                let c = std::ffi::CString::new(s).unwrap();
+                (self.gl.get_uniform_location)(prog, c.as_ptr())
+            };
+            self.yuv_loc_win = name("u_win");
+            self.yuv_loc_frame = name("u_frame");
+            self.yuv_loc_tex = [name("y_tex"), name("u_tex"), name("v_tex")];
+        }
+        Ok(())
+    }
+
+    /// Import the three PyroWave decode planes (linear R8 dma-bufs exported by
+    /// the client's Vulkan device) as GL textures. Called once per session:
+    /// no per-frame download, no CPU colour conversion.
+    pub fn import_yuv(&mut self, planes: [(i32, u32, u32, u32); 3]) -> Result<()> {
+        if self.yuv_prog == 0 {
+            self.build_yuv_program()?;
+        }
+        // extension entry points, fetched lazily so a missing
+        // EGL_EXT_image_dma_buf_import never breaks raw/lossless
+        let create_image: unsafe extern "system" fn(
+            *mut c_void,
+            *mut c_void,
+            i32,
+            *mut c_void,
+            *const i32,
+        ) -> *mut c_void =
+            unsafe { std::mem::transmute(egl_func(&self.egl, "eglCreateImageKHR")?) };
+        let bind_image: unsafe extern "system" fn(u32, *mut c_void) =
+            unsafe { std::mem::transmute(egl_func(&self.egl, "glEGLImageTargetTexture2DOES")?) };
+        unsafe {
+            (self.gl.gen_textures)(3, self.yuv_tex.as_mut_ptr());
+            for (i, (fd, w, h, pitch)) in planes.iter().enumerate() {
+                let attribs = [
+                    EGL_WIDTH,
+                    *w as i32,
+                    EGL_HEIGHT,
+                    *h as i32,
+                    EGL_LINUX_DRM_FOURCC_EXT,
+                    DRM_FORMAT_R8,
+                    EGL_DMA_BUF_PLANE0_FD_EXT,
+                    *fd,
+                    EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+                    0,
+                    EGL_DMA_BUF_PLANE0_PITCH_EXT,
+                    *pitch as i32,
+                    EGL_NONE,
+                ];
+                let img = create_image(
+                    self.dpy,
+                    std::ptr::null_mut(),
+                    EGL_LINUX_DMA_BUF_EXT,
+                    std::ptr::null_mut(),
+                    attribs.as_ptr(),
+                );
+                if img.is_null() || img as isize == -1 {
+                    bail!(
+                        "eglCreateImageKHR(plane {i}) failed (err {:#06x})",
+                        (self.egl.get_error)()
+                    );
+                }
+                self.yuv_egl_images[i] = img;
+                (self.gl.bind_texture)(GL_TEXTURE_2D, self.yuv_tex[i]);
+                bind_image(GL_TEXTURE_2D, img);
+                (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR as i32);
+                (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR as i32);
+                (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
+            }
+        }
+        eprintln!("[eglwin] lossy: YUV planes imported as dma-bufs (GPU YUV->RGB)");
+        Ok(())
+    }
+
+    /// Draw the imported YUV planes (letterboxed) + overlay and swap. The
+    /// Vulkan decode already signalled completion, so the planes are coherent.
+    pub fn present_yuv(&mut self, overlay: Option<(&[u8], u32, u32)>) -> Result<(u64, u64)> {
+        unsafe {
+            let t4 = rdma_display_proto::unix_now_us();
+            (self.gl.use_program)(self.yuv_prog);
+            (self.gl.uniform_2f)(self.yuv_loc_win, self.width as f32, self.height as f32);
+            (self.gl.uniform_2f)(self.yuv_loc_frame, self.frame_w as f32, self.frame_h as f32);
+            for i in 0..3 {
+                (self.gl.active_texture)(GL_TEXTURE0 + i as u32);
+                (self.gl.bind_texture)(GL_TEXTURE_2D, self.yuv_tex[i]);
+                (self.gl.uniform_1i)(self.yuv_loc_tex[i], i as i32);
+            }
+            (self.gl.viewport)(0, 0, self.width as i32, self.height as i32);
+            (self.gl.draw_arrays)(GL_TRIANGLES, 0, 3);
+            (self.gl.active_texture)(GL_TEXTURE0);
+            self.draw_overlay(overlay);
+            if (self.egl.swap_buffers)(self.dpy, self.surf) == 0 {
+                bail!("eglSwapBuffers failed (err {:#06x})", (self.egl.get_error)());
+            }
+            Ok((t4, rdma_display_proto::unix_now_us()))
         }
     }
 }

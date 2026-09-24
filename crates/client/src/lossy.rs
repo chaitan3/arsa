@@ -1,11 +1,15 @@
 //! Client-side PyroWave decoder for `--codec lossy`.
 //!
 //! The server sends a framed frame: `[u32 n][u32 sizes...][packet bytes]`.
-//! We push each packet, decode on the GPU into Y/U/V plane images, read the
-//! planes back and convert YCbCr->BGRA for the existing GL presenter.
+//! We push each packet, decode on the GPU into Y/U/V plane images, and hand
+//! those planes to the presenter as **exported dma-bufs** — the GL presenter
+//! imports them and does the YUV->RGB conversion on the GPU (see
+//! `eglwin::import_yuv`/`present_yuv`). No full-frame readback, no CPU colour
+//! conversion on the streaming path.
 //!
-//! (The readback + CPU colour conversion is the bring-up path; a later step
-//! exports the decoded planes as dma-bufs and converts on the GPU.)
+//! (`read_rgba` is the headless/`--dump` debug path: it downloads and converts
+//! on the CPU so the content can be inspected; it is never used when
+//! presenting.)
 
 use anyhow::{bail, Context, Result};
 use rdma_display_vkcore::ash::vk;
@@ -22,12 +26,17 @@ pub struct LossyDecoder {
     w: u32,
     h: u32,
     chroma444: bool,
+    /// linear R8 decode planes, exported as dma-bufs for GL
     planes: Vec<Image>,
+    plane_fds: [i32; 3],
+    plane_pitch: [u32; 3],
+    plane_w: [u32; 3],
+    plane_h: [u32; 3],
+    // headless/--dump debug readback
     ybuf: HostBuffer,
     ubuf: HostBuffer,
     vbuf: HostBuffer,
     bgra: Vec<u8>,
-    frames: u64,
 }
 
 impl LossyDecoder {
@@ -40,31 +49,35 @@ impl LossyDecoder {
         let dec = pw.decoder_new(dev, w, h, chroma)?;
 
         let (cw, ch) = if chroma444 { (w, h) } else { ((w + 1) / 2, (h + 1) / 2) };
+        let dims = [(w, h), (cw, ch), (cw, ch)];
         let mut planes = Vec::new();
-        for i in 0..3 {
-            let (pw_, ph_) = if i == 0 { (w, h) } else { (cw, ch) };
-            let im = vk.create_image(
-                vk::Format::R8_UNORM,
-                pw_,
-                ph_,
-                vk::ImageUsageFlags::STORAGE
-                    | vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::SAMPLED,
-                vk::ImageTiling::OPTIMAL,
-            )?;
-            vk.transition(
-                im.image,
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::GENERAL,
-                vk::ImageAspectFlags::COLOR,
-            )?;
+        let mut plane_fds = [0i32; 3];
+        let mut plane_pitch = [0u32; 3];
+        let mut plane_w = [0u32; 3];
+        let mut plane_h = [0u32; 3];
+        for &(pw_, ph_) in &dims {
+            let (im, fd, pitch) = vk
+                .create_exportable_image(
+                    vk::Format::R8_UNORM,
+                    pw_,
+                    ph_,
+                    vk::ImageUsageFlags::STORAGE
+                        | vk::ImageUsageFlags::SAMPLED
+                        | vk::ImageUsageFlags::TRANSFER_SRC,
+                )
+                .context("lossy: exportable decode plane (does this client's Vulkan export dma-bufs?)")?;
+            let i = planes.len();
+            plane_fds[i] = fd;
+            plane_pitch[i] = pitch;
+            plane_w[i] = pw_;
+            plane_h[i] = ph_;
             planes.push(im);
         }
         let ybuf = vk.host_buffer((w as u64) * (h as u64))?;
         let ubuf = vk.host_buffer((cw as u64) * (ch as u64))?;
         let vbuf = vk.host_buffer((cw as u64) * (ch as u64))?;
         eprintln!(
-            "[lossy] client decoder ready {}x{} chroma {}",
+            "[lossy] client decoder ready {}x{} chroma {} (decode planes exported for GPU YUV->RGB)",
             w,
             h,
             if chroma444 { "4:4:4" } else { "4:2:0" }
@@ -78,11 +91,14 @@ impl LossyDecoder {
             h,
             chroma444,
             planes,
+            plane_fds,
+            plane_pitch,
+            plane_w,
+            plane_h,
             ybuf,
             ubuf,
             vbuf,
             bgra: vec![0u8; (w as usize) * (h as usize) * 4],
-            frames: 0,
         })
     }
 
@@ -102,8 +118,18 @@ impl LossyDecoder {
         }
     }
 
-    /// Decode a framed frame and return tightly packed BGRA (wire order).
-    pub fn decode(&mut self, coded: &[u8]) -> Result<&[u8]> {
+    /// The three decode planes as `(fd, width, height, row_pitch)` for the GL
+    /// presenter to import once (`eglwin::import_yuv`).
+    pub fn plane_descs(&self) -> [(i32, u32, u32, u32); 3] {
+        [
+            (self.plane_fds[0], self.plane_w[0], self.plane_h[0], self.plane_pitch[0]),
+            (self.plane_fds[1], self.plane_w[1], self.plane_h[1], self.plane_pitch[1]),
+            (self.plane_fds[2], self.plane_w[2], self.plane_h[2], self.plane_pitch[2]),
+        ]
+    }
+
+    /// Decode on the GPU into the exported planes. No host round trip.
+    pub fn decode(&mut self, coded: &[u8]) -> Result<()> {
         if coded.len() < 4 {
             bail!("lossy: short frame");
         }
@@ -112,7 +138,6 @@ impl LossyDecoder {
             bail!("lossy: short packet table");
         }
         let mut off = 4 + 4 * n;
-        let t_push = std::time::Instant::now();
         unsafe { (self.pw.decoder_clear)(self.dec) };
         for i in 0..n {
             let sz = u32::from_le_bytes(coded[4 + 4 * i..8 + 4 * i].try_into().unwrap()) as usize;
@@ -122,30 +147,28 @@ impl LossyDecoder {
             self.pw.push(self.dec, &coded[off..off + sz])?;
             off += sz;
         }
-        let push_us = t_push.elapsed().as_micros() as u64;
         let bufs = PyrowaveGpuBuffers {
             planes: [self.plane_view(0), self.plane_view(1), self.plane_view(2)],
         };
-        let t_dec = std::time::Instant::now();
         self.pw.decode_gpu_synced(self.dev, self.dec, &bufs)?;
-        let dec_us = t_dec.elapsed().as_micros() as u64;
+        Ok(())
+    }
 
+    /// Headless/`--dump` only: download the planes and convert to BGRA on the
+    /// CPU so the content can be inspected. Never used when presenting.
+    pub fn read_rgba(&mut self) -> Result<&[u8]> {
         let (w, h) = (self.w as usize, self.h as usize);
         let (cw, ch) = if self.chroma444 {
             (w, h)
         } else {
             ((w + 1) / 2, (h + 1) / 2)
         };
-        let t_dl = std::time::Instant::now();
         self.vk
             .download_r8(self.planes[0].image, &self.ybuf, self.w, self.h, vk::ImageLayout::GENERAL)?;
         self.vk
             .download_r8(self.planes[1].image, &self.ubuf, cw as u32, ch as u32, vk::ImageLayout::GENERAL)?;
         self.vk
             .download_r8(self.planes[2].image, &self.vbuf, cw as u32, ch as u32, vk::ImageLayout::GENERAL)?;
-        let dl_us = t_dl.elapsed().as_micros() as u64;
-
-        let t_cv = std::time::Instant::now();
         let yp = self.ybuf.as_slice();
         let up = self.ubuf.as_slice();
         let vp = self.vbuf.as_slice();
@@ -166,14 +189,6 @@ impl LossyDecoder {
                 out[o + 2] = r;
                 out[o + 3] = 255;
             }
-        }
-        let cv_us = t_cv.elapsed().as_micros() as u64;
-        self.frames += 1;
-        if self.frames % 30 == 1 {
-            eprintln!(
-                "[lossy] decode us/frame: push={push_us} gpu={dec_us} download={dl_us} convert={cv_us} total={}",
-                push_us + dec_us + dl_us + cv_us
-            );
         }
         Ok(out)
     }

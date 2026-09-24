@@ -505,6 +505,80 @@ impl VkCore {
         }
     }
 
+    /// A **linear** image whose memory is exportable as a dma-buf, for
+    /// cross-API sharing: the client has PyroWave (Vulkan) decode into these,
+    /// then imports the fd into GL and does the YUV->RGB conversion on the GPU.
+    /// Returns the image, the exported fd, and the row pitch EGL needs.
+    pub fn create_exportable_image(
+        &self,
+        format: vk::Format,
+        width: u32,
+        height: u32,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<(Image, std::os::fd::RawFd, u32)> {
+        unsafe {
+            let mut ext = vk::ExternalMemoryImageCreateInfo {
+                handle_types: vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                ..Default::default()
+            };
+            let ci = vk::ImageCreateInfo {
+                p_next: &mut ext as *mut _ as *mut std::ffi::c_void,
+                image_type: vk::ImageType::TYPE_2D,
+                format,
+                extent: vk::Extent3D { width, height, depth: 1 },
+                mip_levels: 1,
+                array_layers: 1,
+                samples: vk::SampleCountFlags::TYPE_1,
+                tiling: vk::ImageTiling::LINEAR,
+                usage,
+                sharing_mode: vk::SharingMode::EXCLUSIVE,
+                initial_layout: vk::ImageLayout::UNDEFINED,
+                ..Default::default()
+            };
+            let image = self.device.create_image(&ci, None)?;
+            let req = self.device.get_image_memory_requirements(image);
+            let mt =
+                self.find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+            let mut exp = vk::ExportMemoryAllocateInfo {
+                handle_types: vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                ..Default::default()
+            };
+            let memory = self.device.allocate_memory(
+                &vk::MemoryAllocateInfo {
+                    allocation_size: req.size,
+                    memory_type_index: mt,
+                    p_next: &mut exp as *mut _ as *mut std::ffi::c_void,
+                    ..Default::default()
+                },
+                None,
+            )?;
+            self.device.bind_image_memory(image, memory, 0)?;
+            self.transition(
+                image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::GENERAL,
+                vk::ImageAspectFlags::COLOR,
+            )?;
+            let fd = ash::khr::external_memory_fd::Device::new(&self.instance, &self.device)
+                .get_memory_fd(&vk::MemoryGetFdInfoKHR {
+                    memory,
+                    handle_type: vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                    ..Default::default()
+                })?;
+            let sub = vk::ImageSubresource {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                array_layer: 0,
+            };
+            let layout = self.device.get_image_subresource_layout(image, sub);
+            Ok((
+                Image { image, memory, format, width, height },
+                fd,
+                layout.row_pitch as u32,
+            ))
+        }
+    }
+
     /// Export an image's memory as a dma-buf fd (for GL import on the client).
     pub fn export_dmabuf(&self, memory: vk::DeviceMemory) -> Result<std::os::fd::RawFd> {
         let ext = ash::khr::external_memory_fd::Device::new(&self.instance, &self.device);
