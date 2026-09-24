@@ -36,6 +36,9 @@ fn main() -> Result<()> {
     let mut fake_gamepad = false;
     let mut transport = rdma_display_rdma::TransportPref::Auto;
     let mut scale_filter: u32 = 0; // 0=auto 1=nearest 2=linear 3=cubic 4=area
+    // lossy: force the CPU download+upload path instead of the all-GPU
+    // Vulkan->GL dma-buf interop (also honours RDMA_DISPLAY_LOSSY_CPU=1)
+    let mut lossy_cpu = std::env::var_os("RDMA_DISPLAY_LOSSY_CPU").is_some();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -75,6 +78,7 @@ fn main() -> Result<()> {
                     ),
                 };
             }
+            "--lossy-cpu" => lossy_cpu = true,
             "--help" | "-h" => {
                 println!("usage: rdma-display-client --server HOST:PORT [--device mlx5_0] [--slots 3] [--dump frame.ppm] [--seconds N]");
                 println!("  --slot-mem host|cuda  receive slots: host = pinned RAM (default); cuda = dormant GPU path");
@@ -89,6 +93,7 @@ fn main() -> Result<()> {
                 println!("  --fake-gamepad        synthesize a controller (slot 0) for testing without hardware");
                 println!("  --transport auto|rdma|tcp  video transport (default auto: RDMA/RoCE when available, else TCP); negotiated with the server");
                 println!("  --scale-filter auto|nearest|linear|cubic|area  sampler for the letterboxed frame (default auto: nearest at integer scale, area when downscaling, else linear)");
+                println!("  --lossy-cpu           lossy: decode + download + upload on the CPU instead of the all-GPU Vulkan->GL dma-buf interop (default all-GPU, with an automatic fallback when the interop is unavailable)");
                 println!("  Ctrl+Alt+M            (--output egl) grab keyboard+mouse for the guest: the local compositor's");
                 println!("                        own shortcuts (alt-f4, alt-tab, alt-f1, ...) reach the guest too; Ctrl+Alt+M again");
                 println!("                        is the ONLY way to give control back to the desktop");
@@ -261,6 +266,9 @@ fn main() -> Result<()> {
     let started = Instant::now();
     let deadline = seconds.map(|s| started + std::time::Duration::from_secs(s));
     let mut lossy_dec: Option<lossy::LossyDecoder> = None;
+    // whether lossy_dec feeds the GL presenter through imported dma-buf planes
+    // (all-GPU) rather than the CPU download+upload path
+    let mut lossy_gpu = false;
     let mut frames: u64 = 0;
     let mut last_seq = 0u64;
     let mut last_report = Instant::now();
@@ -376,18 +384,43 @@ fn main() -> Result<()> {
                     )?
                 } else if link.codec == rdma_display_codec::Codec::Lossy {
                     if lossy_dec.is_none() {
-                        let dec = lossy::LossyDecoder::new(
-                            link.meta.width,
-                            link.meta.height,
-                            link.codec_chroma,
-                        )?;
-                        // import the decoded YUV planes into GL once (dma-buf)
-                        win.import_yuv(dec.plane_descs())?;
-                        lossy_dec = Some(dec);
+                        let (w, h, c) =
+                            (link.meta.width, link.meta.height, link.codec_chroma);
+                        // Prefer the all-GPU path: Vulkan decodes into exported
+                        // dma-buf planes, GL samples them (no CPU work). If this
+                        // client's Vulkan cannot export them or GL cannot import
+                        // them, fall back to the download+upload path instead of
+                        // failing — lossy still works, with a host round trip.
+                        if lossy_cpu {
+                            lossy_dec = Some(lossy::LossyDecoder::new(w, h, c, false)?);
+                        } else {
+                            match lossy::LossyDecoder::new(w, h, c, true).and_then(|dec| {
+                                win.import_yuv(dec.plane_descs())?;
+                                Ok(dec)
+                            }) {
+                                Ok(dec) => {
+                                    lossy_gpu = true;
+                                    lossy_dec = Some(dec);
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[lossy] GPU YUV interop unavailable ({e:#}); \
+                                         falling back to the CPU upload path"
+                                    );
+                                    lossy_dec = Some(lossy::LossyDecoder::new(w, h, c, false)?);
+                                }
+                            }
+                        }
                     }
+                    let d = lossy_dec.as_mut().unwrap();
                     let coded = link.slot_bytes(slot);
-                    lossy_dec.as_mut().unwrap().decode(coded)?;
-                    win.present_yuv(overlay.as_ref().map(|(r, w, h)| (&r[..], *w, *h)))?
+                    d.decode(coded)?;
+                    let ov = overlay.as_ref().map(|(r, w, h)| (&r[..], *w, *h));
+                    if lossy_gpu {
+                        win.present_yuv(ov)?
+                    } else {
+                        win.present(d.read_rgba()?, ov)?
+                    }
                 } else {
                     let frame = link.frame(slot)?;
                     win.present(
@@ -451,10 +484,12 @@ fn main() -> Result<()> {
             let mut frame_owned: Option<Vec<u8>> = None;
             if link.codec == rdma_display_codec::Codec::Lossy {
                 if lossy_dec.is_none() {
+                    // headless has no GL context: never export dma-bufs
                     lossy_dec = Some(lossy::LossyDecoder::new(
                         link.meta.width,
                         link.meta.height,
                         link.codec_chroma,
+                        false,
                     )?);
                 }
                 let coded = link.slot_bytes(slot);

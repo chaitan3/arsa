@@ -924,8 +924,11 @@ impl EglWindow {
         let bind_image: unsafe extern "system" fn(u32, *mut c_void) =
             unsafe { std::mem::transmute(egl_func(&self.egl, "glEGLImageTargetTexture2DOES")?) };
         unsafe {
+            // clear any stale GL error so the import below is attributed cleanly
+            while (self.gl.get_error)() != 0 {}
             (self.gl.gen_textures)(3, self.yuv_tex.as_mut_ptr());
             for (i, (fd, w, h, pitch)) in planes.iter().enumerate() {
+                eprintln!("[eglwin] lossy plane {i}: fd {fd} {w}x{h} pitch {pitch}");
                 let attribs = [
                     EGL_WIDTH,
                     *w as i32,
@@ -957,6 +960,16 @@ impl EglWindow {
                 self.yuv_egl_images[i] = img;
                 (self.gl.bind_texture)(GL_TEXTURE_2D, self.yuv_tex[i]);
                 bind_image(GL_TEXTURE_2D, img);
+                let gl_err = (self.gl.get_error)();
+                if gl_err != 0 {
+                    // A silent failure here is exactly how an unsupported
+                    // import shows up as an all-zero (green) frame, so make it
+                    // loud: the caller falls back to the CPU path on error.
+                    bail!(
+                        "glEGLImageTargetTexture2DOES(plane {i}) failed: glError 0x{gl_err:04x} \
+                         (fd {fd}, {w}x{h}, pitch {pitch})"
+                    );
+                }
                 (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR as i32);
                 (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR as i32);
                 (self.gl.bind_texture)(GL_TEXTURE_2D, 0);

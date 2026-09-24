@@ -40,7 +40,11 @@ pub struct LossyDecoder {
 }
 
 impl LossyDecoder {
-    pub fn new(w: u32, h: u32, chroma: u8) -> Result<Self> {
+    /// `export`: Vulkan exports the decode planes as dma-bufs for the GL
+    /// presenter (all-GPU). When false the planes are plain optimal images and
+    /// the caller uses the `read_rgba` download path (headless/`--dump`, and
+    /// the fallback on clients whose Vulkan cannot export dma-bufs).
+    pub fn new(w: u32, h: u32, chroma: u8, export: bool) -> Result<Self> {
         let chroma444 = chroma == 1;
         let vk = VkCore::new().context("lossy client: Vulkan core")?;
         let pw = Pyrowave::load(std::env::var("PYROWAVE_LIB").ok().as_deref())?;
@@ -55,33 +59,60 @@ impl LossyDecoder {
         let mut plane_pitch = [0u32; 3];
         let mut plane_w = [0u32; 3];
         let mut plane_h = [0u32; 3];
+        let usage = vk::ImageUsageFlags::STORAGE
+            | vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::TRANSFER_SRC;
         for &(pw_, ph_) in &dims {
-            let (im, fd, pitch) = vk
-                .create_exportable_image(
-                    vk::Format::R8_UNORM,
-                    pw_,
-                    ph_,
-                    vk::ImageUsageFlags::STORAGE
-                        | vk::ImageUsageFlags::SAMPLED
-                        | vk::ImageUsageFlags::TRANSFER_SRC,
-                )
-                .context("lossy: exportable decode plane (does this client's Vulkan export dma-bufs?)")?;
             let i = planes.len();
-            plane_fds[i] = fd;
-            plane_pitch[i] = pitch;
+            if export {
+                let (im, fd, pitch) = vk
+                    .create_exportable_image(vk::Format::R8_UNORM, pw_, ph_, usage)
+                    .context("lossy: exportable decode plane (does this client's Vulkan export dma-bufs?)")?;
+                plane_fds[i] = fd;
+                plane_pitch[i] = pitch;
+                planes.push(im);
+            } else {
+                let im = vk
+                    .create_image(vk::Format::R8_UNORM, pw_, ph_, usage, vk::ImageTiling::OPTIMAL)
+                    .context("lossy: decode plane")?;
+                vk.transition(
+                    im.image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::GENERAL,
+                    vk::ImageAspectFlags::COLOR,
+                )?;
+                plane_fds[i] = -1;
+                plane_pitch[i] = 0;
+                planes.push(im);
+            }
             plane_w[i] = pw_;
             plane_h[i] = ph_;
-            planes.push(im);
         }
         let ybuf = vk.host_buffer((w as u64) * (h as u64))?;
         let ubuf = vk.host_buffer((cw as u64) * (ch as u64))?;
         let vbuf = vk.host_buffer((cw as u64) * (ch as u64))?;
         eprintln!(
-            "[lossy] client decoder ready {}x{} chroma {} (decode planes exported for GPU YUV->RGB)",
+            "[lossy] client decoder ready {}x{} chroma {} ({})",
             w,
             h,
-            if chroma444 { "4:4:4" } else { "4:2:0" }
+            if chroma444 { "4:4:4" } else { "4:2:0" },
+            if export {
+                "decode planes exported as dma-bufs for GPU YUV->RGB"
+            } else {
+                "CPU upload path (planes not exported)"
+            },
         );
+        if export {
+            eprintln!(
+                "[lossy] plane exports: fd {} pitch {} | fd {} pitch {} | fd {} pitch {}",
+                plane_fds[0],
+                plane_pitch[0],
+                plane_fds[1],
+                plane_pitch[1],
+                plane_fds[2],
+                plane_pitch[2]
+            );
+        }
         Ok(Self {
             vk,
             pw,

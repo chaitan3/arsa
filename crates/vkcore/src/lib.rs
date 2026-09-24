@@ -505,6 +505,17 @@ impl VkCore {
         }
     }
 
+    /// Whether the chosen physical device advertises the device extension
+    /// `name` (dup of `has_ext` for callers outside this module).
+    pub fn has_device_ext(&self, name: &str) -> bool {
+        unsafe {
+            self.instance
+                .enumerate_device_extension_properties(self.physical_device)
+                .map(|e| has_ext(&e, name))
+                .unwrap_or(false)
+        }
+    }
+
     /// A **linear** image whose memory is exportable as a dma-buf, for
     /// cross-API sharing: the client has PyroWave (Vulkan) decode into these,
     /// then imports the fd into GL and does the YUV->RGB conversion on the GPU.
@@ -516,6 +527,16 @@ impl VkCore {
         height: u32,
         usage: vk::ImageUsageFlags,
     ) -> Result<(Image, std::os::fd::RawFd, u32)> {
+        // A device that does not advertise VK_EXT_external_memory_dma_buf may
+        // still accept vkGetMemoryFdKHR(DMA_BUF_EXT) but hand back an opaque
+        // handle whose bytes EGL then reads as garbage/zero (the classic
+        // "green" frame). Refuse up front so callers can fall back cleanly.
+        if !self.has_device_ext("VK_EXT_external_memory_dma_buf") {
+            bail!(
+                "device lacks VK_EXT_external_memory_dma_buf: \
+                 cannot export decoded planes as dma-bufs"
+            );
+        }
         unsafe {
             let mut ext = vk::ExternalMemoryImageCreateInfo {
                 handle_types: vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
