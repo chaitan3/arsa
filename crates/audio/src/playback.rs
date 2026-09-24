@@ -17,9 +17,9 @@ use super::wire;
 
 /// Retry loop wrapper — an audio session failure never takes down video;
 /// we log once per failure and reconnect.
-pub fn run(addr: std::net::SocketAddr) {
+pub fn run(addr: std::net::SocketAddr, buffer_ms: u32) {
     loop {
-        match session(addr) {
+        match session(addr, buffer_ms) {
             Ok(()) => unreachable!("audio session loop returned"),
             Err(e) => {
                 eprintln!("[audio] session ended: {e:#}; reconnecting in 2 s");
@@ -29,7 +29,7 @@ pub fn run(addr: std::net::SocketAddr) {
     }
 }
 
-fn session(addr: std::net::SocketAddr) -> Result<()> {
+fn session(addr: std::net::SocketAddr, buffer_ms: u32) -> Result<()> {
     let mut sock = TcpStream::connect(addr).with_context(|| format!("audio connect {addr}"))?;
     sock.set_nodelay(true)?;
     // idle tolerance: a silent monitor delivers nothing for as long as the
@@ -50,13 +50,13 @@ fn session(addr: std::net::SocketAddr) -> Result<()> {
     let stream = pulse.open_playback(
         None,
         SampleSpec { rate: wire::RATE, channels: wire::CHANNELS },
-        wire::BUFFER_MS,
+        buffer_ms,
     )?;
     eprintln!(
         "[audio] playing (f32le {} Hz, {}ch, {} ms buffer via the default sink)",
         wire::RATE,
         wire::CHANNELS,
-        wire::BUFFER_MS
+        buffer_ms
     );
 
     let mut hdr = [0u8; wire::PACKET_HDR_LEN];
@@ -101,7 +101,7 @@ fn session(addr: std::net::SocketAddr) -> Result<()> {
                     // drift guard: if backlog exceeds the buffer by a wide
                     // margin (clock skew between the two pulse streams),
                     // flush and resync rather than accumulating latency
-                    let backlog_us = us as i64 - (wire::BUFFER_MS as i64) * 1000;
+                    let backlog_us = us as i64 - (buffer_ms as i64) * 1000;
                     if backlog_us > 150_000 {
                         eprintln!("[audio] playout latency {} ms > buffer, flushing to resync", us / 1000);
                         stream.flush()?;

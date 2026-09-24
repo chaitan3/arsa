@@ -30,6 +30,7 @@ fn main() -> Result<()> {
     let mut metrics_on = false;
     let mut fullscreen = false;
     let mut audio_on = false;
+    let mut audio_buffer_ms: u32 = rdma_display_audio::wire::BUFFER_MS;
     let mut controller_on = true;
     let mut controller_grab = true;
     let mut fake_gamepad = false;
@@ -49,6 +50,9 @@ fn main() -> Result<()> {
             "--metrics" => metrics_on = true,
             "--fullscreen" => fullscreen = true,
             "--audio" => audio_on = true,
+            "--audio-buffer-ms" => {
+                audio_buffer_ms = args.next().expect("--audio-buffer-ms needs a value").parse()?
+            }
             "--no-controller" => controller_on = false,
             "--no-controller-grab" => controller_grab = false,
             "--fake-gamepad" => fake_gamepad = true,
@@ -64,6 +68,7 @@ fn main() -> Result<()> {
                 println!("  --output none|egl     egl = present in a Wayland window (needs --slot-mem host)");
                 println!("  --fullscreen          fullscreen on the current output; frame letterboxed/scaled to the screen with aspect kept (compositor's own fullscreen toggle also works)");
                 println!("  --audio               play the server's audio side-channel (default sink; server captures its own monitor source)");
+                println!("  --audio-buffer-ms N   client playout buffer depth / pulse tlength (default {}; lower = less latency, less jitter headroom)", rdma_display_audio::wire::BUFFER_MS);
                 println!("  --metrics             per-stage latency overlay (capture, send, transfer, upload, present, on-screen) + clock-sync pings");
                 println!("  --no-controller       don't forward attached gamepads");
                 println!("  --no-controller-grab  leave the gamepad exclusive-grabbable by the local compositor too (default: EVIOCGRAB while streaming)");
@@ -232,7 +237,7 @@ fn main() -> Result<()> {
     if audio_on {
         std::thread::Builder::new()
             .name("audio".into())
-            .spawn(move || rdma_display_audio::playback::run(addr))
+            .spawn(move || rdma_display_audio::playback::run(addr, audio_buffer_ms))
             .context("spawn audio thread")?;
         eprintln!("[audio] client stream connecting ({addr})");
     }
