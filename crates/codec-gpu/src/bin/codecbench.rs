@@ -412,6 +412,9 @@ fn gbm_read_bench(geom: Geometry) -> Result<()> {
     type DeviceDestroy = unsafe extern "C" fn(*mut c_void);
     type BoCreateMods =
         unsafe extern "C" fn(*mut c_void, u32, u32, u32, *const u64, u32) -> *mut c_void;
+    type BoCreateMods2 =
+        unsafe extern "C" fn(*mut c_void, u32, u32, u32, *const u64, u32, u32) -> *mut c_void;
+    type BoCreatePlain = unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32) -> *mut c_void;
     type BoI32 = unsafe extern "C" fn(*mut c_void) -> i32;
     type BoU32 = unsafe extern "C" fn(*mut c_void) -> u32;
     type BoU64 = unsafe extern "C" fn(*mut c_void) -> u64;
@@ -434,6 +437,9 @@ fn gbm_read_bench(geom: Geometry) -> Result<()> {
         let create_device: CreateDevice = *lib.get(b"gbm_create_device")?;
         let device_destroy: DeviceDestroy = *lib.get(b"gbm_device_destroy")?;
         let bo_create: BoCreateMods = *lib.get(b"gbm_bo_create_with_modifiers")?;
+        let bo_create2: Option<BoCreateMods2> =
+            lib.get(b"gbm_bo_create_with_modifiers2").ok().map(|s| *s);
+        let bo_create_plain: BoCreatePlain = *lib.get(b"gbm_bo_create")?;
         let bo_fd: BoI32 = *lib.get(b"gbm_bo_get_fd")?;
         let bo_stride: BoU32 = *lib.get(b"gbm_bo_get_stride")?;
         let bo_offset: BoU32 = *lib.get(b"gbm_bo_get_offset")?;
@@ -450,16 +456,20 @@ fn gbm_read_bench(geom: Geometry) -> Result<()> {
             ("nvidia-16bx2", [0x0300_0000_0060_6014u64]),
         ];
         for (name, mods) in cases {
-            let bo = bo_create(
-                dev,
-                geom.width,
-                geom.height,
-                XR24,
-                mods.as_ptr(),
-                mods.len() as u32,
-            );
+            // GBM flags: SCANOUT=1, RENDERING=4, LINEAR=16
+            let (w, h) = (geom.width, geom.height);
+            let mut bo = std::ptr::null_mut();
+            if let Some(f) = bo_create2 {
+                bo = f(dev, w, h, XR24, mods.as_ptr(), mods.len() as u32, 1 | 4);
+            }
             if bo.is_null() {
-                eprintln!("[gbm] {name}: gbm_bo_create_with_modifiers failed");
+                bo = bo_create(dev, w, h, XR24, mods.as_ptr(), mods.len() as u32);
+            }
+            if bo.is_null() && mods[0] == 0 {
+                bo = bo_create_plain(dev, w, h, XR24, 4 | 16);
+            }
+            if bo.is_null() {
+                eprintln!("[gbm] {name}: gbm_bo_create failed");
                 continue;
             }
             let img = rdma_display_codec_gpu::DmabufImage {
