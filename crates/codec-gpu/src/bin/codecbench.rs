@@ -501,22 +501,49 @@ fn gbm_read_bench(geom: Geometry) -> Result<()> {
                 bo_destroy(bo);
                 continue;
             }
-            // seed the reference from the buffer, then time detection-only reads
-            gpu.encode_ext(true)?;
+            // Seed the reference from the buffer, then measure three things on
+            // the *same* imported dma-buf so the read is separated from the
+            // coding:
+            //   detection = encode_ext(false) with a matching reference: reads
+            //               the whole buffer and XORs, codes nothing (this is
+            //               the "0.14 ms" number the docs/summary quote)
+            //   full      = encode_ext(true): reads the whole buffer and writes
+            //               a payload for every tile — the dynamic-screen case
+            //   full+ref  = full plus update_reference — the real t1-t1s span
+            let n_full = gpu.encode_ext(true)?;
             gpu.update_reference()?;
-            let mut us = Vec::new();
+            let p50 = |v: &mut Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let mut det = Vec::new();
+            let mut full = Vec::new();
+            let mut full_ref = Vec::new();
             for _ in 0..20 {
                 gpu.sync();
                 let t = Instant::now();
                 gpu.encode_ext(false)?;
-                us.push(t.elapsed().as_secs_f64() * 1e3);
+                det.push(t.elapsed().as_secs_f64() * 1e3);
+
+                gpu.sync();
+                let t = Instant::now();
+                gpu.encode_ext(true)?;
+                full.push(t.elapsed().as_secs_f64() * 1e3);
+
+                gpu.sync();
+                let t = Instant::now();
+                gpu.encode_ext(true)?;
+                gpu.update_reference()?;
+                full_ref.push(t.elapsed().as_secs_f64() * 1e3);
             }
-            us.sort_by(|a, b| a.partial_cmp(b).unwrap());
             eprintln!(
-                "[gbm] {name:13} modifier=0x{:016x} stride={:6} → detection read {:.2} ms (p50 of 20)",
+                "[gbm] {name:13} modifier=0x{:016x} stride={:6} coded={:8}B → detection {:.2} ms | full {:.2} ms | full+ref {:.2} ms (p50 of 20)",
                 img.modifier,
                 img.stride,
-                us[us.len() / 2]
+                n_full,
+                p50(&mut det),
+                p50(&mut full),
+                p50(&mut full_ref),
             );
             bo_destroy(bo);
         }
