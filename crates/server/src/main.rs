@@ -1032,6 +1032,8 @@ struct FrameCodec {
     import_misses: u64,
     /// one-shot startup benchmark: iterations left (RDMA_LOSSLESS_BENCH=N)
     bench_left: u32,
+    /// one-shot memory-placement diagnostic (RDMA_MEMPROBE=1)
+    memprobe_left: bool,
 }
 
 impl FrameCodec {
@@ -1053,6 +1055,9 @@ impl FrameCodec {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
+            memprobe_left: std::env::var("RDMA_MEMPROBE")
+                .map(|v| v != "0")
+                .unwrap_or(false),
         }
     }
 
@@ -1257,6 +1262,12 @@ impl FrameCodec {
             let n_iter = self.bench_left;
             self.bench_left = 0;
             self.bench_scanout_read(n_iter)?;
+        }
+        if self.memprobe_left {
+            self.memprobe_left = false;
+            if let Some(gpu) = self.gpu.as_ref() {
+                gpu.memprobe()?;
+            }
         }
         self.stat_buf.push([
             act.as_micros() as u64,

@@ -570,6 +570,17 @@ fn main() -> Result<()> {
         let geom = Geometry::new(W, H, W * 4);
         return gbm_read_bench(geom);
     }
+    if std::env::args().any(|a| a == "--memprobe") {
+        // no scanout here, so this measures the codec's own buffers: `coded` is
+        // persistently mapped/coherent (host-visible), `cur`/`reference` are
+        // plain glBufferData. The contrast calibrates what "host-visible" reads
+        // like versus VRAM before running RDMA_MEMPROBE on the real scanout.
+        let geom = Geometry::new(W, H, W * 4);
+        let gpu = GpuCodec::new(geom)?;
+        gpu.activate()?;
+        gpu.memprobe()?;
+        return Ok(());
+    }
     let geom = Geometry::new(W, H, W * 4);
     let raw = geom.frame_bytes();
     eprintln!(

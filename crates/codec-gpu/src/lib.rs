@@ -305,6 +305,12 @@ pub struct GpuCodec {
     /// program that reads the source as a normal `sampler2D` (texelFetch); used
     /// when the scanout is linear and can bind to `GL_TEXTURE_2D`
     enc_fetch_prog: u32,
+    /// read-bandwidth probe programs + scratch output (diagnostic; see
+    /// [`GpuCodec::memprobe`])
+    probe_buf_prog: u32,
+    probe_ext_prog: u32,
+    probe_2d_prog: u32,
+    probe_out: u32,
     /// source bound as `GL_TEXTURE_2D` (linear scanout) or 0
     direct_img: u32,
     cur: u32,
@@ -486,6 +492,9 @@ impl GpuCodec {
                 }
             };
             let enc_fetch_prog = build_program(&gl, ENC_FETCH_SRC)?;
+            let probe_buf_prog = build_program(&gl, PROBE_BUF_SRC)?;
+            let probe_2d_prog = build_program(&gl, PROBE_2D_SRC)?;
+            let probe_ext_prog = build_program(&gl, PROBE_EXT_SRC).unwrap_or(0);
 
             let frame_bytes = geom.frame_bytes();
             let index_cap = geom.tile_count();
@@ -545,6 +554,13 @@ impl GpuCodec {
             (gl.bind_buffer_base)(GL_SHADER_STORAGE_BUFFER, 2, coded);
             (gl.bind_buffer_base)(GL_SHADER_STORAGE_BUFFER, 3, counter);
 
+            // probe scratch: one uint the read-bandwidth probes may write
+            let mut pbuf = [0u32; 1];
+            (gl.gen_buffers)(1, pbuf.as_mut_ptr());
+            let probe_out = pbuf[0];
+            (gl.bind_buffer)(GL_SHADER_STORAGE_BUFFER, probe_out);
+            (gl.buffer_data)(GL_SHADER_STORAGE_BUFFER, 4, std::ptr::null(), GL_DYNAMIC_DRAW);
+
             // texture-direct source image: immutable RGBA8 storage so it can
             // be both an FBO color attachment (the blit) and a bound image
             // (the encode compute reads it)
@@ -598,6 +614,10 @@ impl GpuCodec {
                 enc_tex_prog,
                 enc_ext_prog,
                 enc_fetch_prog,
+                probe_buf_prog,
+                probe_ext_prog,
+                probe_2d_prog,
+                probe_out,
                 direct_img: 0,
                 cur,
                 reference,
@@ -1230,6 +1250,98 @@ impl GpuCodec {
         unsafe { (self.gl.finish)() };
     }
 
+    /// Read-bandwidth diagnostic: streams the whole imported scanout and each
+    /// of the codec's buffers once and prints GB/s. VRAM reads run at hundreds
+    /// of GB/s; a buffer that is host-visible/GTT reads at PCIe speed (~8 GB/s
+    /// on Gen3 x8). This is how we tell where the scanout and the reference
+    /// actually live, rather than assuming.
+    pub fn memprobe(&self) -> Result<()> {
+        let report = |name: &str, bytes: usize, d: std::time::Duration| {
+            let s = d.as_secs_f64().max(1e-9);
+            eprintln!(
+                "[memprobe] {name:<9} {:>4} MiB read: {:>8.3} ms = {:>6.1} GB/s",
+                bytes / (1024 * 1024),
+                d.as_secs_f64() * 1e3,
+                bytes as f64 / s / 1e9,
+            );
+        };
+        if self.has_scanout {
+            let px = (self.geom.width as usize) * (self.geom.height as usize) * 4;
+            report("scanout", px, self.probe_scanout()?);
+        } else {
+            eprintln!("[memprobe] scanout   (none imported)");
+        }
+        report("reference", self.frame_bytes, self.probe_buf(self.reference, self.frame_bytes / 4)?);
+        report("cur", self.frame_bytes, self.probe_buf(self.cur, self.frame_bytes / 4)?);
+        report("coded", self.coded_len, self.probe_buf(self.coded, self.coded_len / 4)?);
+        Ok(())
+    }
+
+    /// GPU time to stream `words` uints of `buf` once (bindings 4/5).
+    fn probe_buf(&self, buf: u32, words: usize) -> Result<std::time::Duration> {
+        unsafe {
+            (self.gl.use_program)(self.probe_buf_prog);
+            (self.gl.bind_buffer_base)(GL_SHADER_STORAGE_BUFFER, 4, buf);
+            (self.gl.bind_buffer_base)(GL_SHADER_STORAGE_BUFFER, 5, self.probe_out);
+            let c = CString::new("u_words").unwrap();
+            let loc = (self.gl.get_uniform_location)(self.probe_buf_prog, c.as_ptr() as *const u8);
+            if loc >= 0 {
+                (self.gl.uniform1ui)(loc, words as u32);
+            }
+            (self.gl.finish)();
+            let t = std::time::Instant::now();
+            (self.gl.dispatch_compute)(((words as u32) + 255) / 256, 1, 1);
+            (self.gl.memory_barrier)(GL_SHADER_STORAGE_BARRIER_BIT);
+            (self.gl.finish)();
+            Ok(t.elapsed())
+        }
+    }
+
+    /// GPU time to stream the whole imported scanout once, sampling it exactly
+    /// like the encoder (external sampler or texelFetch).
+    fn probe_scanout(&self) -> Result<std::time::Duration> {
+        if !self.has_scanout {
+            bail!("probe_scanout: no scanout imported");
+        }
+        let prog = if self.direct_img != 0 { self.probe_2d_prog } else { self.probe_ext_prog };
+        if prog == 0 {
+            bail!("probe_scanout: no source probe program");
+        }
+        let px = (self.geom.width as u32) * (self.geom.height as u32);
+        unsafe {
+            (self.gl.use_program)(prog);
+            (self.gl.bind_buffer_base)(GL_SHADER_STORAGE_BUFFER, 5, self.probe_out);
+            (self.gl.active_texture)(GL_TEXTURE0);
+            if self.direct_img != 0 {
+                (self.gl.bind_texture)(GL_TEXTURE_2D, self.direct_img);
+            } else {
+                (self.gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, self.src_tex);
+            }
+            let u = |n: &str| {
+                let c = CString::new(n).unwrap();
+                (self.gl.get_uniform_location)(prog, c.as_ptr() as *const u8)
+            };
+            let l = u("u_src");
+            if l >= 0 {
+                (self.gl.uniform1i)(l, 0);
+            }
+            let l = u("u_width");
+            if l >= 0 {
+                (self.gl.uniform1ui)(l, self.geom.width);
+            }
+            let l = u("u_height");
+            if l >= 0 {
+                (self.gl.uniform1ui)(l, self.geom.height);
+            }
+            (self.gl.finish)();
+            let t = std::time::Instant::now();
+            (self.gl.dispatch_compute)((px + 255) / 256, 1, 1);
+            (self.gl.memory_barrier)(GL_SHADER_STORAGE_BARRIER_BIT);
+            (self.gl.finish)();
+            Ok(t.elapsed())
+        }
+    }
+
     /// Read the decoded reference frame back to host memory (validation only).
     pub fn read_frame(&self) -> Result<Vec<u8>> {
         self.read_buf(self.reference)
@@ -1847,6 +1959,61 @@ void main() {
             outb[o] = 0u;
         }
     }
+}
+"#;
+
+/// Read-bandwidth probe: stream `u_words` uints from the buffer at binding 4.
+/// The load is kept live by a data-dependent store, so the compiler cannot
+/// drop it. Reads run at hundreds of GB/s from VRAM but at PCIe speed (~8 GB/s
+/// on Gen3 x8) from host-visible/GTT memory, so this is how we tell where a
+/// surface actually lives.
+const PROBE_BUF_SRC: &str = r#"#version 310 es
+precision highp int;
+layout(local_size_x = 256) in;
+uniform uint u_words;
+layout(std430, binding = 4) readonly buffer Src { uint s[]; };
+layout(std430, binding = 5) writeonly buffer Out { uint o[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= u_words) return;
+    uint v = s[i];
+    if ((v ^ (i * 2654435761u)) == 0xdeadbeefu) o[0] = i;
+}
+"#;
+
+/// Same probe for the imported scanout, sampled exactly like the encoder does.
+const PROBE_EXT_SRC: &str = r#"#version 310 es
+#extension GL_OES_EGL_image_external_essl3 : require
+precision highp int;
+precision highp float;
+layout(local_size_x = 256) in;
+uniform uint u_width, u_height;
+uniform highp samplerExternalOES u_src;
+layout(std430, binding = 5) writeonly buffer Out { uint o[]; };
+uint word(uint x, uint y) {
+    vec2 uv = (vec2(float(x), float(y)) + 0.5) / vec2(float(u_width), float(u_height));
+    return packUnorm4x8(texture(u_src, uv));
+}
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= u_width * u_height) return;
+    uint w = word(i % u_width, i / u_width);
+    if ((w ^ (i * 2654435761u)) == 0xdeadbeefu) o[0] = i;
+}
+"#;
+
+/// Same probe for a linear scanout bound to `GL_TEXTURE_2D` (`texelFetch`).
+const PROBE_2D_SRC: &str = r#"#version 310 es
+precision highp int;
+layout(local_size_x = 256) in;
+uniform uint u_width, u_height;
+uniform highp sampler2D u_src;
+layout(std430, binding = 5) writeonly buffer Out { uint o[]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= u_width * u_height) return;
+    uint w = packUnorm4x8(texelFetch(u_src, ivec2(int(i % u_width), int(i / u_width)), 0));
+    if ((w ^ (i * 2654435761u)) == 0xdeadbeefu) o[0] = i;
 }
 "#;
 
