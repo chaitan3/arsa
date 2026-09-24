@@ -1183,6 +1183,12 @@ fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> 
     let started = std::time::Instant::now();
     // throttles card (re)opens to once a second after a failure
     let mut last_open_attempt: Option<std::time::Instant> = None;
+    // vblank timestamp diagnostic: `emit - t0` and the observed vblank interval.
+    // If the former tracks the latter, the driver's `sequence_ns` is stale by a
+    // full refresh (which would inflate the client's `queue`, `t0d - t0`).
+    let mut vlag: Vec<u64> = Vec::new();
+    let mut vints: Vec<u64> = Vec::new();
+    let mut vns_prev: Option<i64> = None;
     loop {
         if card.is_none() {
             if let Some(t) = last_open_attempt {
@@ -1343,6 +1349,33 @@ fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> 
                     VStep::None => {}
                     VStep::Disabled => disabled(&mut disabled_reported),
                     VStep::Capture(id, t0) => {
+                        // Diagnostic: how long after the stamped capture time the
+                        // poll actually noticed the vblank. If this tracks the
+                        // observed vblank interval, the driver's `sequence_ns` is
+                        // stale by a full refresh (nvidia-drm vblank=1 quirk) and
+                        // the client's `queue` (t0d - t0) is inflated by it.
+                        let now = rdma_display_proto::unix_now_us();
+                        vlag.push(now.saturating_sub(t0));
+                        if let Some(prev) = vns_prev {
+                            vints.push((ns.saturating_sub(prev) / 1000).max(0) as u64);
+                        }
+                        vns_prev = Some(ns);
+                        if vlag.len() >= 240 {
+                            vlag.sort_unstable();
+                            vints.sort_unstable();
+                            let lag = vlag[vlag.len() / 2];
+                            let iv = if vints.is_empty() {
+                                0
+                            } else {
+                                vints[vints.len() / 2]
+                            };
+                            eprintln!(
+                                "[capture-drm] vblank: emit-t0 p50 {lag} us | vblank interval p50 {iv} us ({} samples)",
+                                vlag.len(),
+                            );
+                            vlag.clear();
+                            vints.clear();
+                        }
                         if emit_scanout(&card.as_ref().unwrap().0, id, t0, &tx) {
                             disabled_reported = false;
                         } else {
