@@ -38,6 +38,9 @@ const EGL_CONTEXT_MINOR_VERSION: i32 = 0x30FB;
 const EGL_OPENGL_ES_API: u32 = 0x30A0;
 
 const GL_TEXTURE_2D: u32 = 0x0DE1;
+/// dma-buf EGLImages bind to the external target — the only one NVIDIA's GL
+/// accepts (Mesa also accepts GL_TEXTURE_2D).
+const GL_TEXTURE_EXTERNAL_OES: u32 = 0x8BE7;
 const GL_RGBA8: u32 = 0x8058;
 const GL_RGBA: u32 = 0x1908;
 const GL_UNSIGNED_BYTE: u32 = 0x1401;
@@ -110,6 +113,7 @@ struct Gl {
     get_programiv: unsafe extern "system" fn(u32, u32, *mut i32),
     use_program: unsafe extern "system" fn(u32),
     gen_textures: unsafe extern "system" fn(i32, *mut u32),
+    delete_textures: unsafe extern "system" fn(i32, *const u32),
     bind_texture: unsafe extern "system" fn(u32, u32),
     tex_parameteri: unsafe extern "system" fn(u32, u32, i32),
     tex_image_2d: unsafe extern "system" fn(
@@ -159,6 +163,7 @@ void main() {
 
 const FS_HEAD: &str = r#"#version 300 es
 precision highp float;
+#define SF_SAMPLER sampler2D
 uniform sampler2D tex;
 uniform vec2 u_win;    // buffer (device) size, px
 uniform vec2 u_frame;  // guest frame size, px
@@ -196,7 +201,7 @@ float bicubic_w(float x) {
     if (x < 2.0) return -0.5 * x * x * x + 2.5 * x * x - 4.0 * x + 2.0;
     return 0.0;
 }
-vec4 sf(sampler2D t, vec2 uv, vec2 texel, float fp) {
+vec4 sf(SF_SAMPLER t, vec2 uv, vec2 texel, float fp) {
     if (u_filter == 2) {
         // Catmull-Rom bicubic, 4x4 taps
         vec2 s = uv / texel - 0.5;
@@ -233,9 +238,26 @@ vec4 sf(sampler2D t, vec2 uv, vec2 texel, float fp) {
 // letterbox + vertical flip + scale filter match the RGBA shader.
 const FS_YUV_HEAD: &str = r#"#version 300 es
 precision highp float;
+#define SF_SAMPLER sampler2D
 uniform sampler2D y_tex;
 uniform sampler2D u_tex;
 uniform sampler2D v_tex;
+uniform vec2 u_win;
+uniform vec2 u_frame;
+in vec2 v_uv;
+out vec4 frag;
+"#;
+
+// Same shader for clients whose GL only takes a dma-buf EGLImage on the
+// external target (NVIDIA returns GL_INVALID_OPERATION for GL_TEXTURE_2D).
+// Needs GL_OES_EGL_image_external_essl3; sampling is otherwise identical.
+const FS_YUV_HEAD_EXTERNAL: &str = r#"#version 300 es
+#extension GL_OES_EGL_image_external_essl3 : require
+precision highp float;
+#define SF_SAMPLER samplerExternalOES
+uniform samplerExternalOES y_tex;
+uniform samplerExternalOES u_tex;
+uniform samplerExternalOES v_tex;
 uniform vec2 u_win;
 uniform vec2 u_frame;
 in vec2 v_uv;
@@ -333,6 +355,8 @@ pub struct EglWindow {
     yuv_prog: u32,
     yuv_tex: [u32; 3],
     yuv_egl_images: [*mut c_void; 3],
+    /// true when the planes are bound as GL_TEXTURE_EXTERNAL_OES (NVIDIA)
+    yuv_external: bool,
     yuv_loc_win: i32,
     yuv_loc_frame: i32,
     yuv_loc_tex: [i32; 3],
@@ -491,6 +515,7 @@ impl EglWindow {
             ),
             use_program: glsym!("glUseProgram", unsafe extern "system" fn(u32)),
             gen_textures: glsym!("glGenTextures", unsafe extern "system" fn(i32, *mut u32)),
+            delete_textures: glsym!("glDeleteTextures", unsafe extern "system" fn(i32, *const u32)),
             bind_texture: glsym!("glBindTexture", unsafe extern "system" fn(u32, u32)),
             tex_parameteri: glsym!("glTexParameteri", unsafe extern "system" fn(u32, u32, i32)),
             tex_image_2d: glsym!(
@@ -539,6 +564,7 @@ impl EglWindow {
             yuv_prog: 0,
             yuv_tex: [0; 3],
             yuv_egl_images: [std::ptr::null_mut(); 3],
+            yuv_external: false,
             yuv_loc_win: -1,
             yuv_loc_frame: -1,
             yuv_loc_tex: [-1; 3],
@@ -723,12 +749,21 @@ impl EglWindow {
         self.filter_mode = mode;
     }
 
-    /// Set the currently bound GL_TEXTURE_2D's filter for `mode` (nearest for
-    /// the manual filters; linear only for mode 1).
-    unsafe fn set_filter(&self, mode: u32) {
+    /// Set the currently bound `target` texture's filter for `mode` (nearest
+    /// for the manual filters; linear only for mode 1).
+    unsafe fn set_filter(&self, target: u32, mode: u32) {
         let f = (if mode == 1 { GL_LINEAR } else { GL_NEAREST }) as i32;
-        (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
-        (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
+        (self.gl.tex_parameteri)(target, GL_TEXTURE_MIN_FILTER, f);
+        (self.gl.tex_parameteri)(target, GL_TEXTURE_MAG_FILTER, f);
+    }
+
+    /// The GL target the lossy planes were successfully imported on.
+    fn yuv_target(&self) -> u32 {
+        if self.yuv_external {
+            GL_TEXTURE_EXTERNAL_OES
+        } else {
+            GL_TEXTURE_2D
+        }
     }
 
     /// Guest frame dimensions changed (mid-session resolution change): the
@@ -812,7 +847,7 @@ impl EglWindow {
         (self.gl.uniform_2f)(self.loc_win, self.width as f32, self.height as f32);
         (self.gl.uniform_2f)(self.loc_frame, self.frame_w as f32, self.frame_h as f32);
         (self.gl.bind_texture)(GL_TEXTURE_2D, tex);
-        self.set_filter(mode);
+        self.set_filter(GL_TEXTURE_2D, mode);
         (self.gl.viewport)(0, 0, self.width as i32, self.height as i32);
         (self.gl.draw_arrays)(GL_TRIANGLES, 0, 3);
         (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
@@ -880,7 +915,8 @@ impl EglWindow {
                 Ok(sh)
             };
             let vs = compile(&self.gl, VS, GL_VERTEX_SHADER)?;
-            let fs_src = format!("{FS_YUV_HEAD}{FILTER_GLSL}{FS_YUV_MAIN}");
+            let head = if self.yuv_external { FS_YUV_HEAD_EXTERNAL } else { FS_YUV_HEAD };
+            let fs_src = format!("{head}{FILTER_GLSL}{FS_YUV_MAIN}");
             let fs = compile(&self.gl, &fs_src, GL_FRAGMENT_SHADER)?;
             let prog = (self.gl.create_program)();
             (self.gl.attach_shader)(prog, vs);
@@ -907,10 +943,12 @@ impl EglWindow {
     /// Import the three PyroWave decode planes (linear R8 dma-bufs exported by
     /// the client's Vulkan device) as GL textures. Called once per session:
     /// no per-frame download, no CPU colour conversion.
+    ///
+    /// The EGLImage can, per spec, be used from `GL_TEXTURE_2D`, but drivers
+    /// differ: Mesa accepts `TEXTURE_2D`, NVIDIA's GL only accepts
+    /// `GL_TEXTURE_EXTERNAL_OES` (`TEXTURE_2D` gives GL_INVALID_OPERATION and a
+    /// sampler that reads zeros). Try both and keep whichever binds.
     pub fn import_yuv(&mut self, planes: [(i32, u32, u32, u32); 3]) -> Result<()> {
-        if self.yuv_prog == 0 {
-            self.build_yuv_program()?;
-        }
         // extension entry points, fetched lazily so a missing
         // EGL_EXT_image_dma_buf_import never breaks raw/lossless
         let create_image: unsafe extern "system" fn(
@@ -921,62 +959,143 @@ impl EglWindow {
             *const i32,
         ) -> *mut c_void =
             unsafe { std::mem::transmute(egl_func(&self.egl, "eglCreateImageKHR")?) };
+        let destroy_image: unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32 =
+            unsafe { std::mem::transmute(egl_func(&self.egl, "eglDestroyImageKHR")?) };
         let bind_image: unsafe extern "system" fn(u32, *mut c_void) =
             unsafe { std::mem::transmute(egl_func(&self.egl, "glEGLImageTargetTexture2DOES")?) };
-        unsafe {
-            // clear any stale GL error so the import below is attributed cleanly
-            while (self.gl.get_error)() != 0 {}
-            (self.gl.gen_textures)(3, self.yuv_tex.as_mut_ptr());
-            for (i, (fd, w, h, pitch)) in planes.iter().enumerate() {
-                eprintln!("[eglwin] lossy plane {i}: fd {fd} {w}x{h} pitch {pitch}");
-                let attribs = [
-                    EGL_WIDTH,
-                    *w as i32,
-                    EGL_HEIGHT,
-                    *h as i32,
-                    EGL_LINUX_DRM_FOURCC_EXT,
-                    DRM_FORMAT_R8,
-                    EGL_DMA_BUF_PLANE0_FD_EXT,
-                    *fd,
-                    EGL_DMA_BUF_PLANE0_OFFSET_EXT,
-                    0,
-                    EGL_DMA_BUF_PLANE0_PITCH_EXT,
-                    *pitch as i32,
-                    EGL_NONE,
-                ];
-                let img = create_image(
-                    self.dpy,
-                    std::ptr::null_mut(),
-                    EGL_LINUX_DMA_BUF_EXT,
-                    std::ptr::null_mut(),
-                    attribs.as_ptr(),
-                );
-                if img.is_null() || img as isize == -1 {
-                    bail!(
-                        "eglCreateImageKHR(plane {i}) failed (err {:#06x})",
-                        (self.egl.get_error)()
-                    );
+
+        let mut last_err: Option<anyhow::Error> = None;
+        for (target, external) in [(GL_TEXTURE_2D, false), (GL_TEXTURE_EXTERNAL_OES, true)] {
+            match unsafe {
+                self.try_import_target(
+                    &planes,
+                    target,
+                    &create_image,
+                    &destroy_image,
+                    &bind_image,
+                )
+            } {
+                Ok(()) => {
+                    self.yuv_external = external;
+                    match self.build_yuv_program() {
+                        Ok(()) => {
+                            eprintln!(
+                                "[eglwin] lossy: YUV planes imported as dma-bufs ({}, GPU YUV->RGB)",
+                                if external {
+                                    "GL_TEXTURE_EXTERNAL_OES"
+                                } else {
+                                    "GL_TEXTURE_2D"
+                                }
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            eprintln!("[eglwin] lossy: {target:#06x} shader failed: {e:#}");
+                            unsafe { self.release_yuv_images(&destroy_image) };
+                            last_err = Some(e);
+                        }
+                    }
                 }
-                self.yuv_egl_images[i] = img;
-                (self.gl.bind_texture)(GL_TEXTURE_2D, self.yuv_tex[i]);
-                bind_image(GL_TEXTURE_2D, img);
-                let gl_err = (self.gl.get_error)();
-                if gl_err != 0 {
-                    // A silent failure here is exactly how an unsupported
-                    // import shows up as an all-zero (green) frame, so make it
-                    // loud: the caller falls back to the CPU path on error.
-                    bail!(
-                        "glEGLImageTargetTexture2DOES(plane {i}) failed: glError 0x{gl_err:04x} \
-                         (fd {fd}, {w}x{h}, pitch {pitch})"
-                    );
+                Err(e) => {
+                    unsafe { self.release_yuv_images(&destroy_image) };
+                    eprintln!("[eglwin] lossy: dma-buf import as {target:#06x} failed: {e:#}");
+                    last_err = Some(e);
                 }
-                (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR as i32);
-                (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR as i32);
-                (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
             }
         }
-        eprintln!("[eglwin] lossy: YUV planes imported as dma-bufs (GPU YUV->RGB)");
+        Err(last_err
+            .unwrap_or_else(|| anyhow::anyhow!("lossy: no GL dma-buf import target worked")))
+    }
+
+    /// Create + bind the three plane EGLImages using `target`. On error the
+    /// caller releases the images; nothing is left half-bound.
+    unsafe fn try_import_target(
+        &mut self,
+        planes: &[(i32, u32, u32, u32); 3],
+        target: u32,
+        create_image: &unsafe extern "system" fn(
+            *mut c_void,
+            *mut c_void,
+            i32,
+            *mut c_void,
+            *const i32,
+        ) -> *mut c_void,
+        destroy_image: &unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32,
+        bind_image: &unsafe extern "system" fn(u32, *mut c_void),
+    ) -> Result<()> {
+        self.release_yuv_images(destroy_image);
+        self.release_yuv_textures();
+        // clear any stale GL error so the binds below are attributed cleanly
+        while (self.gl.get_error)() != 0 {}
+        (self.gl.gen_textures)(3, self.yuv_tex.as_mut_ptr());
+        for (i, (fd, w, h, pitch)) in planes.iter().enumerate() {
+            eprintln!(
+                "[eglwin] lossy plane {i}: fd {fd} {w}x{h} pitch {pitch} target {target:#06x}"
+            );
+            let attribs = [
+                EGL_WIDTH,
+                *w as i32,
+                EGL_HEIGHT,
+                *h as i32,
+                EGL_LINUX_DRM_FOURCC_EXT,
+                DRM_FORMAT_R8,
+                EGL_DMA_BUF_PLANE0_FD_EXT,
+                *fd,
+                EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+                0,
+                EGL_DMA_BUF_PLANE0_PITCH_EXT,
+                *pitch as i32,
+                EGL_NONE,
+            ];
+            let img = create_image(
+                self.dpy,
+                std::ptr::null_mut(),
+                EGL_LINUX_DMA_BUF_EXT,
+                std::ptr::null_mut(),
+                attribs.as_ptr(),
+            );
+            if img.is_null() || img as isize == -1 {
+                bail!(
+                    "eglCreateImageKHR(plane {i}) failed (err {:#06x})",
+                    (self.egl.get_error)()
+                );
+            }
+            self.yuv_egl_images[i] = img;
+            (self.gl.bind_texture)(target, self.yuv_tex[i]);
+            bind_image(target, img);
+            let gl_err = (self.gl.get_error)();
+            if gl_err != 0 {
+                // A silent failure here is exactly how an unsupported import
+                // shows up as an all-zero (green) frame, so make it loud.
+                bail!(
+                    "glEGLImageTargetTexture2DOES(plane {i}) failed: glError 0x{gl_err:04x} \
+                     (fd {fd}, {w}x{h}, pitch {pitch})"
+                );
+            }
+            (self.gl.tex_parameteri)(target, GL_TEXTURE_MIN_FILTER, GL_LINEAR as i32);
+            (self.gl.tex_parameteri)(target, GL_TEXTURE_MAG_FILTER, GL_LINEAR as i32);
+            (self.gl.bind_texture)(target, 0);
+        }
         Ok(())
+    }
+
+    unsafe fn release_yuv_images(
+        &mut self,
+        destroy_image: &unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32,
+    ) {
+        for i in 0..3 {
+            if !self.yuv_egl_images[i].is_null() {
+                destroy_image(self.dpy, self.yuv_egl_images[i]);
+                self.yuv_egl_images[i] = std::ptr::null_mut();
+            }
+        }
+    }
+
+    unsafe fn release_yuv_textures(&mut self) {
+        if self.yuv_tex.iter().any(|t| *t != 0) {
+            (self.gl.delete_textures)(3, self.yuv_tex.as_ptr());
+            self.yuv_tex = [0; 3];
+        }
     }
 
     /// Draw the imported YUV planes (letterboxed) + overlay and swap. The
@@ -985,14 +1104,15 @@ impl EglWindow {
         unsafe {
             let t4 = rdma_display_proto::unix_now_us();
             let mode = self.effective_filter();
+            let target = self.yuv_target();
             (self.gl.use_program)(self.yuv_prog);
             (self.gl.uniform_1i)(self.yuv_loc_filter, mode as i32);
             (self.gl.uniform_2f)(self.yuv_loc_win, self.width as f32, self.height as f32);
             (self.gl.uniform_2f)(self.yuv_loc_frame, self.frame_w as f32, self.frame_h as f32);
             for i in 0..3 {
                 (self.gl.active_texture)(GL_TEXTURE0 + i as u32);
-                (self.gl.bind_texture)(GL_TEXTURE_2D, self.yuv_tex[i]);
-                self.set_filter(mode);
+                (self.gl.bind_texture)(target, self.yuv_tex[i]);
+                self.set_filter(target, mode);
                 (self.gl.uniform_1i)(self.yuv_loc_tex[i], i as i32);
             }
             (self.gl.viewport)(0, 0, self.width as i32, self.height as i32);
