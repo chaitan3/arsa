@@ -75,6 +75,25 @@ const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: i32 = 0x3443;
 const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: i32 = 0x3444;
 const EGL_EXTENSIONS: i32 = 0x3055;
 const GL_EXTENSIONS: u32 = 0x1F03;
+// DRM fourccs we might export from Vulkan; queried for importability below.
+const DRM_FORMAT_ARGB8888: i32 = 0x3432_5241;
+const DRM_FORMAT_ABGR8888: i32 = 0x3432_4241;
+const DRM_FORMAT_XRGB8888: i32 = 0x3432_5258;
+const DRM_FORMAT_XBGR8888: i32 = 0x3432_4258;
+
+/// DRM fourcc -> its ASCII name (e.g. 0x20203852 -> "R8  ").
+fn fourcc_name(f: i32) -> String {
+    String::from_utf8_lossy(&f.to_le_bytes()).to_string()
+}
+
+/// Which GL entry point creates the texture from the EGLImage.
+#[derive(Clone, Copy)]
+enum BindFn {
+    /// GL_OES_EGL_image
+    Does(unsafe extern "system" fn(u32, *mut c_void)),
+    /// GL_EXT_EGL_image_storage (recommended on modern drivers)
+    Storage(unsafe extern "system" fn(u32, *mut c_void, *const i32)),
+}
 
 fn sym<T: Copy>(lib: &libloading::Library, name: &str) -> Result<T> {
     unsafe {
@@ -948,6 +967,71 @@ impl EglWindow {
         Ok(())
     }
 
+    /// Log the DRM formats/modifiers this EGL display can import, so a
+    /// rejected import is diagnosable (NVIDIA rejects some formats/tilings).
+    unsafe fn log_dmabuf_support(&self) {
+        let q_formats: unsafe extern "system" fn(*mut c_void, i32, *mut i32, *mut i32) -> u32 =
+            match egl_func(&self.egl, "eglQueryDmaBufFormatsEXT") {
+                Ok(p) => std::mem::transmute(p),
+                Err(_) => return,
+            };
+        let mut n = 0i32;
+        if q_formats(self.dpy, 0, std::ptr::null_mut(), &mut n) == 0 || n <= 0 {
+            return;
+        }
+        let mut fmts = vec![0i32; n as usize];
+        let mut got = n;
+        if q_formats(self.dpy, n, fmts.as_mut_ptr(), &mut got) == 0 || got <= 0 {
+            return;
+        }
+        let names: Vec<String> = fmts[..got as usize].iter().map(|f| fourcc_name(*f)).collect();
+        eprintln!("[eglwin] EGL dma-buf formats ({}): {}", got, names.join(" "));
+
+        let q_mods: unsafe extern "system" fn(
+            *mut c_void,
+            i32,
+            i32,
+            *mut u64,
+            *mut u8,
+            *mut i32,
+        ) -> u32 = match egl_func(&self.egl, "eglQueryDmaBufModifiersEXT") {
+            Ok(p) => std::mem::transmute(p),
+            Err(_) => return,
+        };
+        for f in [
+            DRM_FORMAT_R8,
+            DRM_FORMAT_XRGB8888,
+            DRM_FORMAT_ARGB8888,
+            DRM_FORMAT_ABGR8888,
+            DRM_FORMAT_XBGR8888,
+        ] {
+            let mut m = 0i32;
+            if q_mods(self.dpy, f, 0, std::ptr::null_mut(), std::ptr::null_mut(), &mut m) == 0
+                || m <= 0
+            {
+                eprintln!("[eglwin] EGL {}: not importable", fourcc_name(f).trim());
+                continue;
+            }
+            let mut mods = vec![0u64; m as usize];
+            let mut ext = vec![0u8; m as usize];
+            let mut gm = m;
+            if q_mods(self.dpy, f, m, mods.as_mut_ptr(), ext.as_mut_ptr(), &mut gm) == 0 {
+                continue;
+            }
+            let list: Vec<String> = mods[..gm as usize]
+                .iter()
+                .enumerate()
+                .map(|(k, mm)| format!("0x{mm:x}{}", if ext[k] != 0 { "(ext)" } else { "" }))
+                .collect();
+            eprintln!(
+                "[eglwin] EGL {} modifiers ({}): {}",
+                fourcc_name(f).trim(),
+                gm,
+                list.join(" ")
+            );
+        }
+    }
+
     /// Import the three PyroWave decode planes (linear R8 dma-bufs exported by
     /// the client's Vulkan device) as GL textures. Called once per session:
     /// no per-frame download, no CPU colour conversion.
@@ -969,8 +1053,12 @@ impl EglWindow {
             unsafe { std::mem::transmute(egl_func(&self.egl, "eglCreateImageKHR")?) };
         let destroy_image: unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32 =
             unsafe { std::mem::transmute(egl_func(&self.egl, "eglDestroyImageKHR")?) };
-        let bind_image: unsafe extern "system" fn(u32, *mut c_void) =
+        let does: unsafe extern "system" fn(u32, *mut c_void) =
             unsafe { std::mem::transmute(egl_func(&self.egl, "glEGLImageTargetTexture2DOES")?) };
+        let storage: Option<unsafe extern "system" fn(u32, *mut c_void, *const i32)> =
+            egl_func(&self.egl, "glEGLImageTargetTexStorageEXT")
+                .ok()
+                .map(|p| unsafe { std::mem::transmute(p) });
 
         // Diagnostic: what the driver actually offers for dma-buf -> GL.
         unsafe {
@@ -990,19 +1078,38 @@ impl EglWindow {
                     .collect();
                 eprintln!("[eglwin] GL EGL-image extensions: {}", of.join(" "));
             }
+            self.log_dmabuf_support();
         }
 
+        // Drivers differ on what they accept for a dma-buf EGLImage: the
+        // legacy GL_OES_EGL_image bind vs GL_EXT_EGL_image_storage, the legacy
+        // vs EGL_EXT_image_dma_buf_import_modifiers attribute form, and
+        // GL_TEXTURE_2D vs the external target.
+        let mut attempts: Vec<(u32, bool, bool, BindFn, &str)> = vec![
+            (GL_TEXTURE_2D, false, false, BindFn::Does(does), "does/legacy"),
+            (GL_TEXTURE_2D, false, true, BindFn::Does(does), "does/modifier"),
+        ];
+        if let Some(s) = storage {
+            attempts.push((GL_TEXTURE_2D, false, false, BindFn::Storage(s), "storage/legacy"));
+            attempts.push((GL_TEXTURE_2D, false, true, BindFn::Storage(s), "storage/modifier"));
+        }
+        attempts.push((
+            GL_TEXTURE_EXTERNAL_OES,
+            true,
+            false,
+            BindFn::Does(does),
+            "ext/legacy",
+        ));
+        attempts.push((
+            GL_TEXTURE_EXTERNAL_OES,
+            true,
+            true,
+            BindFn::Does(does),
+            "ext/modifier",
+        ));
+
         let mut last_err: Option<anyhow::Error> = None;
-        // (target, external, use_modifier): drivers differ on which of these
-        // they accept. NVIDIA's GL rejects the legacy non-modifier import on
-        // GL_TEXTURE_2D, so also try the EGL_EXT_image_dma_buf_import_modifiers
-        // form (modifier = DRM_FORMAT_MOD_LINEAR = 0).
-        for (target, external, use_modifier) in [
-            (GL_TEXTURE_2D, false, false),
-            (GL_TEXTURE_2D, false, true),
-            (GL_TEXTURE_EXTERNAL_OES, true, false),
-            (GL_TEXTURE_EXTERNAL_OES, true, true),
-        ] {
+        for (target, external, use_modifier, bind, what) in attempts {
             match unsafe {
                 self.try_import_target(
                     &planes,
@@ -1010,7 +1117,7 @@ impl EglWindow {
                     use_modifier,
                     &create_image,
                     &destroy_image,
-                    &bind_image,
+                    bind,
                 )
             } {
                 Ok(()) => {
@@ -1018,18 +1125,17 @@ impl EglWindow {
                     match self.build_yuv_program() {
                         Ok(()) => {
                             eprintln!(
-                                "[eglwin] lossy: YUV planes imported as dma-bufs ({}, {}, GPU YUV->RGB)",
+                                "[eglwin] lossy: YUV planes imported as dma-bufs ({} {what}, GPU YUV->RGB)",
                                 if external {
                                     "GL_TEXTURE_EXTERNAL_OES"
                                 } else {
                                     "GL_TEXTURE_2D"
                                 },
-                                if use_modifier { "modifier" } else { "legacy" }
                             );
                             return Ok(());
                         }
                         Err(e) => {
-                            eprintln!("[eglwin] lossy: {target:#06x} shader failed: {e:#}");
+                            eprintln!("[eglwin] lossy: {what} shader failed: {e:#}");
                             unsafe { self.release_yuv_images(&destroy_image) };
                             last_err = Some(e);
                         }
@@ -1037,10 +1143,7 @@ impl EglWindow {
                 }
                 Err(e) => {
                     unsafe { self.release_yuv_images(&destroy_image) };
-                    eprintln!(
-                        "[eglwin] lossy: dma-buf import as {target:#06x} ({} ) failed: {e:#}",
-                        if use_modifier { "modifier" } else { "legacy" }
-                    );
+                    eprintln!("[eglwin] lossy: dma-buf import ({what}) failed: {e:#}");
                     last_err = Some(e);
                 }
             }
@@ -1064,7 +1167,7 @@ impl EglWindow {
             *const i32,
         ) -> *mut c_void,
         destroy_image: &unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32,
-        bind_image: &unsafe extern "system" fn(u32, *mut c_void),
+        bind: BindFn,
     ) -> Result<()> {
         self.release_yuv_images(destroy_image);
         self.release_yuv_textures();
@@ -1115,7 +1218,10 @@ impl EglWindow {
             }
             self.yuv_egl_images[i] = img;
             (self.gl.bind_texture)(target, self.yuv_tex[i]);
-            bind_image(target, img);
+            match bind {
+                BindFn::Does(f) => f(target, img),
+                BindFn::Storage(f) => f(target, img, std::ptr::null()),
+            }
             let gl_err = (self.gl.get_error)();
             if gl_err != 0 {
                 // A silent failure here is exactly how an unsupported import
