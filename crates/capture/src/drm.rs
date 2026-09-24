@@ -249,6 +249,18 @@ fn get_sequence(fd: i32, crtc_id: u32) -> Result<(u64, i64)> {
     Ok((s.sequence, s.sequence_ns))
 }
 
+/// Does `CRTC_GET_SEQUENCE` actually advance? A driver can return `Ok` with a
+/// frozen counter and a zero timestamp (nvidia-drm does when its vblank IRQ is
+/// not running), so "the ioctl succeeded" is not enough — that probe used to
+/// pick vblank and then fall back to one-behind ~200 ms later. Sample twice and
+/// report both sequences plus the second timestamp.
+fn probe_vblank(fd: i32, crtc_id: u32) -> Result<(u64, u64, i64)> {
+    let (s1, _) = get_sequence(fd, crtc_id)?;
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    let (s2, ns) = get_sequence(fd, crtc_id)?;
+    Ok((s1, s2, ns))
+}
+
 #[allow(clippy::useless_conversion)] // time_t/c_long: i64 here, i32 elsewhere
 fn clock_us(clk: libc::clockid_t) -> i64 {
     let mut ts = libc::timespec {
@@ -1228,8 +1240,9 @@ fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> 
                             .map(|p| p.crtc_id)
                             .filter(|c| *c != 0),
                     };
-                    let vblank_probe = crtc_id.map(|c| get_sequence(fdi, c));
-                    let vblank_ok = matches!(vblank_probe, Some(Ok(_)));
+                    let vblank_probe = crtc_id.map(|c| probe_vblank(fdi, c));
+                    let vblank_ok =
+                        matches!(&vblank_probe, Some(Ok((s1, s2, _))) if s2 > s1);
                     active = match sync {
                         CaptureSync::Zero => ActiveSync::Zero,
                         CaptureSync::OneBehind => ActiveSync::OneBehind,
@@ -1269,7 +1282,13 @@ fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> 
                                     );
                                 }
                             }
-                            _ => eprintln!(
+                            Some(Ok((s1, s2, ns))) => eprintln!(
+                                "[capture-drm] vblank unavailable: CRTC_GET_SEQUENCE returned Ok but \
+                                 the sequence did not advance ({s1} -> {s2} over 40 ms, ns {ns}) — \
+                                 the kernel's vblank counter is not running; using one-behind. \
+                                 One-behind costs up to one refresh of capture latency."
+                            ),
+                            None => eprintln!(
                                 "[capture-drm] vblank unavailable (no CRTC for the selected \
                                  target); using one-behind"
                             ),
