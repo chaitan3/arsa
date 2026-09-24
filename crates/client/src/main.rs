@@ -94,6 +94,7 @@ fn main() -> Result<()> {
                 println!("  --transport auto|rdma|tcp  video transport (default auto: RDMA/RoCE when available, else TCP); negotiated with the server");
                 println!("  --scale-filter auto|nearest|linear|cubic|area  sampler for the letterboxed frame (default auto: nearest at integer scale, area when downscaling, else linear)");
                 println!("  --lossy-cpu           lossy: decode + download + upload on the CPU instead of the all-GPU Vulkan->GL dma-buf interop (default all-GPU, with an automatic fallback when the interop is unavailable)");
+                println!("  RDMA_DISPLAY_LOSSY_DEBUG=1  lossy: verbose dma-buf import diagnostics (extension strings, importable formats/modifiers, every import attempt)");
                 println!("  Ctrl+Alt+M            (--output egl) grab keyboard+mouse for the guest: the local compositor's");
                 println!("                        own shortcuts (alt-f4, alt-tab, alt-f1, ...) reach the guest too; Ctrl+Alt+M again");
                 println!("                        is the ONLY way to give control back to the desktop");

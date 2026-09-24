@@ -176,6 +176,12 @@ fn egl_func(egl: &EglLib, name: &str) -> Result<*const c_void> {
     Ok(p)
 }
 
+/// `RDMA_DISPLAY_LOSSY_DEBUG=1`: verbose dma-buf import diagnostics (extension
+/// strings, importable formats/modifiers, and every import attempt).
+fn lossy_debug() -> bool {
+    std::env::var_os("RDMA_DISPLAY_LOSSY_DEBUG").is_some()
+}
+
 const VS: &str = r#"#version 300 es
 out vec2 v_uv;
 void main() {
@@ -1063,24 +1069,26 @@ impl EglWindow {
                 .map(|p| unsafe { std::mem::transmute(p) });
 
         // Diagnostic: what the driver actually offers for dma-buf -> GL.
-        unsafe {
-            let e = (self.egl.query_string)(self.dpy, EGL_EXTENSIONS);
-            if !e.is_null() {
-                eprintln!(
-                    "[eglwin] EGL extensions: {}",
-                    std::ffi::CStr::from_ptr(e).to_string_lossy()
-                );
+        if lossy_debug() {
+            unsafe {
+                let e = (self.egl.query_string)(self.dpy, EGL_EXTENSIONS);
+                if !e.is_null() {
+                    eprintln!(
+                        "[eglwin] EGL extensions: {}",
+                        std::ffi::CStr::from_ptr(e).to_string_lossy()
+                    );
+                }
+                let g = (self.gl.get_string)(GL_EXTENSIONS);
+                if !g.is_null() {
+                    let s = std::ffi::CStr::from_ptr(g as *const i8).to_string_lossy();
+                    let of: Vec<&str> = s
+                        .split_whitespace()
+                        .filter(|x| x.contains("EGL_image") || x.contains("dma_buf"))
+                        .collect();
+                    eprintln!("[eglwin] GL EGL-image extensions: {}", of.join(" "));
+                }
+                self.log_dmabuf_support();
             }
-            let g = (self.gl.get_string)(GL_EXTENSIONS);
-            if !g.is_null() {
-                let s = std::ffi::CStr::from_ptr(g as *const i8).to_string_lossy();
-                let of: Vec<&str> = s
-                    .split_whitespace()
-                    .filter(|x| x.contains("EGL_image") || x.contains("dma_buf"))
-                    .collect();
-                eprintln!("[eglwin] GL EGL-image extensions: {}", of.join(" "));
-            }
-            self.log_dmabuf_support();
         }
 
         // Drivers differ on what they accept for a dma-buf EGLImage: the
@@ -1137,7 +1145,9 @@ impl EglWindow {
                             return Ok(());
                         }
                         Err(e) => {
-                            eprintln!("[eglwin] lossy: {what} shader failed: {e:#}");
+                            if lossy_debug() {
+                                eprintln!("[eglwin] lossy: {what} shader failed: {e:#}");
+                            }
                             unsafe { self.release_yuv_images(&destroy_image) };
                             last_err = Some(e);
                         }
@@ -1145,7 +1155,9 @@ impl EglWindow {
                 }
                 Err(e) => {
                     unsafe { self.release_yuv_images(&destroy_image) };
-                    eprintln!("[eglwin] lossy: dma-buf import ({what}) failed: {e:#}");
+                    if lossy_debug() {
+                        eprintln!("[eglwin] lossy: dma-buf import ({what}) failed: {e:#}");
+                    }
                     last_err = Some(e);
                 }
             }
@@ -1177,10 +1189,12 @@ impl EglWindow {
         while (self.gl.get_error)() != 0 {}
         (self.gl.gen_textures)(3, self.yuv_tex.as_mut_ptr());
         for (i, (fd, w, h, pitch)) in planes.iter().enumerate() {
-            eprintln!(
-                "[eglwin] lossy plane {i}: fd {fd} {w}x{h} pitch {pitch} target {target:#06x} {}",
-                if use_modifier { "modifier" } else { "legacy" }
-            );
+            if lossy_debug() {
+                eprintln!(
+                    "[eglwin] lossy plane {i}: fd {fd} {w}x{h} pitch {pitch} target {target:#06x} {}",
+                    if use_modifier { "modifier" } else { "legacy" }
+                );
+            }
             let mut attribs = vec![
                 EGL_WIDTH,
                 *w as i32,
