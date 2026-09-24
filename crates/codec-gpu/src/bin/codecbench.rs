@@ -417,6 +417,7 @@ fn gbm_read_bench(geom: Geometry) -> Result<()> {
     type BoCreatePlain = unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32) -> *mut c_void;
     type BoI32 = unsafe extern "C" fn(*mut c_void) -> i32;
     type BoU32 = unsafe extern "C" fn(*mut c_void) -> u32;
+    type BoOffset = unsafe extern "C" fn(*mut c_void, i32) -> u32;
     type BoU64 = unsafe extern "C" fn(*mut c_void) -> u64;
     type BoDestroy = unsafe extern "C" fn(*mut c_void);
 
@@ -442,7 +443,7 @@ fn gbm_read_bench(geom: Geometry) -> Result<()> {
         let bo_create_plain: BoCreatePlain = *lib.get(b"gbm_bo_create")?;
         let bo_fd: BoI32 = *lib.get(b"gbm_bo_get_fd")?;
         let bo_stride: BoU32 = *lib.get(b"gbm_bo_get_stride")?;
-        let bo_offset: BoU32 = *lib.get(b"gbm_bo_get_offset")?;
+        let bo_offset: BoOffset = *lib.get(b"gbm_bo_get_offset")?;
         let bo_modifier: BoU64 = *lib.get(b"gbm_bo_get_modifier")?;
         let bo_destroy: BoDestroy = *lib.get(b"gbm_bo_destroy")?;
 
@@ -475,7 +476,7 @@ fn gbm_read_bench(geom: Geometry) -> Result<()> {
             let img = rdma_display_codec_gpu::DmabufImage {
                 key: 0,
                 fd: bo_fd(bo),
-                offset: bo_offset(bo),
+                offset: bo_offset(bo, 0),
                 stride: bo_stride(bo),
                 fourcc: XR24,
                 modifier: bo_modifier(bo),
