@@ -28,7 +28,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-PYROWAVE_SRC="${1:-${PYROWAVE_SRC:-/tmp/opencode/pw/pyrowave}}"
+PYROWAVE_SRC="${1:-${PYROWAVE_SRC:-./pyrowave}}"
 OUT_DIR="${2:-${OUT_DIR:-$REPO_ROOT/target/release}}"
 UBUNTU_IMAGE="${UBUNTU_IMAGE:-ubuntu:24.04}"
 
