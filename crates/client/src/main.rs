@@ -35,6 +35,7 @@ fn main() -> Result<()> {
     let mut controller_grab = true;
     let mut fake_gamepad = false;
     let mut transport = rdma_display_rdma::TransportPref::Auto;
+    let mut scale_filter: u32 = 0; // 0=auto 1=nearest 2=linear 3=cubic 4=area
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -61,6 +62,19 @@ fn main() -> Result<()> {
                 transport = rdma_display_rdma::TransportPref::parse(&v)
                     .with_context(|| format!("--transport must be auto|rdma|tcp, got {v:?}"))?;
             }
+            "--scale-filter" => {
+                let v = args.next().expect("--scale-filter needs a value");
+                scale_filter = match v.as_str() {
+                    "auto" => 0,
+                    "nearest" => 1,
+                    "linear" => 2,
+                    "cubic" => 3,
+                    "area" => 4,
+                    other => bail!(
+                        "--scale-filter must be auto|nearest|linear|cubic|area, got {other:?}"
+                    ),
+                };
+            }
             "--help" | "-h" => {
                 println!("usage: rdma-display-client --server HOST:PORT [--device mlx5_0] [--slots 3] [--dump frame.ppm] [--seconds N]");
                 println!("  --slot-mem host|cuda  receive slots: host = pinned RAM (default); cuda = dormant GPU path");
@@ -74,6 +88,7 @@ fn main() -> Result<()> {
                 println!("  --no-controller-grab  leave the gamepad exclusive-grabbable by the local compositor too (default: EVIOCGRAB while streaming)");
                 println!("  --fake-gamepad        synthesize a controller (slot 0) for testing without hardware");
                 println!("  --transport auto|rdma|tcp  video transport (default auto: RDMA/RoCE when available, else TCP); negotiated with the server");
+                println!("  --scale-filter auto|nearest|linear|cubic|area  sampler for the letterboxed frame (default auto: nearest at integer scale, area when downscaling, else linear)");
                 println!("  Ctrl+Alt+M            (--output egl) grab keyboard+mouse for the guest: the local compositor's");
                 println!("                        own shortcuts (alt-f4, alt-tab, alt-f1, ...) reach the guest too; Ctrl+Alt+M again");
                 println!("                        is the ONLY way to give control back to the desktop");
@@ -169,13 +184,14 @@ fn main() -> Result<()> {
                 bail!("--output egl requires --slot-mem host (the upload reads the slot through a CPU pointer)");
             }
             let p = wayland::Presenter::new(link.meta.width, link.meta.height, input_tx, fullscreen)?;
-            let win = eglwin::EglWindow::new(
+            let mut win = eglwin::EglWindow::new(
                 p.wl_display_ptr(),
                 p.wl_surface_ptr(),
                 link.meta.width,
                 link.meta.height,
                 metrics_on,
             )?;
+            win.set_scale_filter(scale_filter);
             Some((p, win))
         }
         other => bail!("--output must be none|egl, got {other:?}"),

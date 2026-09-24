@@ -55,6 +55,9 @@ const GL_FRAGMENT_SHADER: u32 = 0x8B30;
 const GL_COMPILE_STATUS: u32 = 0x8B81;
 const GL_LINK_STATUS: u32 = 0x8B82;
 
+/// Effective sampler names, indexed by `effective_filter()`.
+const FILTER_NAMES: [&str; 4] = ["nearest", "linear", "cubic", "area"];
+
 // --- EGL_EXT_image_dma_buf_import (YUV planes shared from Vulkan) -----------
 const EGL_WIDTH: i32 = 0x3057;
 const EGL_HEIGHT: i32 = 0x3056;
@@ -154,40 +157,81 @@ void main() {
 }
 "#;
 
-const FS: &str = r#"#version 300 es
+const FS_HEAD: &str = r#"#version 300 es
 precision highp float;
 uniform sampler2D tex;
 uniform vec2 u_win;    // buffer (device) size, px
 uniform vec2 u_frame;  // guest frame size, px
 in vec2 v_uv;
 out vec4 frag;
+"#;
+
+const FS_MAIN: &str = r#"
 void main() {
-    // Letterbox: aspect-fit the frame inside the buffer, black bars
-    // elsewhere. Windowed mode is the degenerate case (buffer == frame:
-    // scale 1, origin 0 — identical to the old plain stretch).
+    // Letterbox: aspect-fit the frame inside the buffer, black bars elsewhere.
     vec2 px = v_uv * u_win;              // bottom-left origin
-    // scalar min of the two ratios: preserve the frame aspect (a
-    // componentwise min would stretch the frame to fill the buffer)
     float scl = min(u_win.x / max(u_frame.x, 1.0), u_win.y / max(u_frame.y, 1.0));
     vec2 pic = u_frame * scl;
     vec2 org = (u_win - pic) * 0.5;
     if (all(greaterThanEqual(px, org)) && all(lessThan(px, org + pic))) {
         vec2 uv = (px - org) / pic;
-        // Wire bytes are B,G,R,X uploaded as RGBA — swizzle to true color (.bgra).
-        // Vertical flip: the wire is top-first (row 0 = screen top), but
-        // glTexImage2D places the first row at texture v=0, which maps to
-        // the picture's bottom — mirror v to undo it. (Client-side twin of
-        // the server's OES readback orientation lesson.)
-        frag = texture(tex, vec2(uv.x, 1.0 - uv.y)).bgra;
+        // Wire is top-first; glTexImage2D puts row 0 at v=0 -> mirror v.
+        uv.y = 1.0 - uv.y;
+        // Wire bytes are B,G,R,X uploaded as RGBA — swizzle to true colour.
+        frag = sf(tex, uv, 1.0 / u_frame, 1.0 / max(scl, 1e-3)).bgra;
     } else {
         frag = vec4(0.0, 0.0, 0.0, 1.0);  // letterbox bar
     }
 }
 "#;
 
-// lossy YUV->RGB: the three PyroWave decode planes are shared from Vulkan as
-// linear R8 dma-bufs (no host round trip); letterbox + vertical flip match FS.
-const FS_YUV: &str = r#"#version 300 es
+// Scale filter shared by both letterbox shaders (spliced between the HEAD and
+// MAIN). u_filter: 0=nearest, 1=linear, 2=cubic, 3=area. The manual filters
+// (cubic/area) require the texture in NEAREST mode.
+const FILTER_GLSL: &str = r#"
+uniform int u_filter;
+float bicubic_w(float x) {
+    x = abs(x);
+    if (x < 1.0) return 1.5 * x * x * x - 2.5 * x * x + 1.0;
+    if (x < 2.0) return -0.5 * x * x * x + 2.5 * x * x - 4.0 * x + 2.0;
+    return 0.0;
+}
+vec4 sf(sampler2D t, vec2 uv, vec2 texel, float fp) {
+    if (u_filter == 2) {
+        // Catmull-Rom bicubic, 4x4 taps
+        vec2 s = uv / texel - 0.5;
+        vec2 ip = floor(s);
+        vec2 f = s - ip;
+        vec4 c = vec4(0.0);
+        for (int j = -1; j <= 2; j++) {
+            for (int i = -1; i <= 2; i++) {
+                float w = bicubic_w(float(i) - f.x) * bicubic_w(float(j) - f.y);
+                c += w * texture(t, (ip + vec2(float(i) + 0.5, float(j) + 0.5)) * texel);
+            }
+        }
+        return c;
+    }
+    if (u_filter == 3) {
+        // area/box over the source footprint (fp is in source texels)
+        fp = clamp(fp, 1.0, 4.0);
+        if (fp <= 1.25) return texture(t, uv);
+        vec2 src = uv / texel;
+        vec4 acc = vec4(0.0);
+        for (int j = 0; j < 4; j++) {
+            for (int i = 0; i < 4; i++) {
+                vec2 off = (vec2(float(i), float(j)) + 0.5) * 0.25 - 0.5;
+                acc += texture(t, (src + off * fp) * texel);
+            }
+        }
+        return acc * 0.0625;
+    }
+    return texture(t, uv);   // 0=nearest / 1=linear via the GL texture filter
+}
+"#;
+
+// lossy YUV->RGB from the three PyroWave decode planes (linear R8 dma-bufs);
+// letterbox + vertical flip + scale filter match the RGBA shader.
+const FS_YUV_HEAD: &str = r#"#version 300 es
 precision highp float;
 uniform sampler2D y_tex;
 uniform sampler2D u_tex;
@@ -196,6 +240,9 @@ uniform vec2 u_win;
 uniform vec2 u_frame;
 in vec2 v_uv;
 out vec4 frag;
+"#;
+
+const FS_YUV_MAIN: &str = r#"
 void main() {
     vec2 px = v_uv * u_win;
     float scl = min(u_win.x / max(u_frame.x, 1.0), u_win.y / max(u_frame.y, 1.0));
@@ -203,10 +250,13 @@ void main() {
     vec2 org = (u_win - pic) * 0.5;
     if (all(greaterThanEqual(px, org)) && all(lessThan(px, org + pic))) {
         vec2 uv = (px - org) / pic;
-        uv.y = 1.0 - uv.y;                 // same flip as the RGBA path
-        float y = texture(y_tex, uv).r * 255.0;
-        float u = texture(u_tex, uv).r * 255.0 - 128.0;
-        float v = texture(v_tex, uv).r * 255.0 - 128.0;
+        uv.y = 1.0 - uv.y;
+        vec2 texel_y = 1.0 / u_frame;
+        vec2 texel_c = 2.0 / u_frame;   // chroma planes are half resolution
+        float fp = 1.0 / max(scl, 1e-3);
+        float y = sf(y_tex, uv, texel_y, fp).r * 255.0;
+        float u = sf(u_tex, uv, texel_c, fp * 0.5).r * 255.0 - 128.0;
+        float v = sf(v_tex, uv, texel_c, fp * 0.5).r * 255.0 - 128.0;
         // BT.709 full-range, identical to the old CPU conversion
         float r = clamp(y + 1.5748 * v, 0.0, 255.0);
         float g = clamp(y - 0.1873 * u - 0.4681 * v, 0.0, 255.0);
@@ -271,6 +321,7 @@ pub struct EglWindow {
     /// main program uniform locations for the letterbox shader
     loc_win: i32,
     loc_frame: i32,
+    loc_filter: i32,
     // --metrics overlay (top-left text quad); all zero/disabled when off
     ov_prog: u32,
     ov_tex: u32,
@@ -285,6 +336,9 @@ pub struct EglWindow {
     yuv_loc_win: i32,
     yuv_loc_frame: i32,
     yuv_loc_tex: [i32; 3],
+    yuv_loc_filter: i32,
+    /// 0=auto 1=nearest 2=linear 3=cubic 4=area (see `--scale-filter`)
+    filter_mode: u32,
 }
 
 // all GL/EGL calls happen from the single client loop thread
@@ -476,6 +530,7 @@ impl EglWindow {
             wlegl_resize: wl_egl_window_resize,
             loc_win: -1,
             loc_frame: -1,
+            loc_filter: -1,
             ov_prog: 0,
             ov_tex: 0,
             ov_loc_origin: -1,
@@ -487,6 +542,8 @@ impl EglWindow {
             yuv_loc_win: -1,
             yuv_loc_frame: -1,
             yuv_loc_tex: [-1; 3],
+            yuv_loc_filter: -1,
+            filter_mode: 0,
         };
         me.build_program()?;
         unsafe {
@@ -589,7 +646,8 @@ impl EglWindow {
                 Ok(sh)
             };
             let vs = compile(&self.gl, VS, GL_VERTEX_SHADER)?;
-            let fs = compile(&self.gl, FS, GL_FRAGMENT_SHADER)?;
+            let fs_src = format!("{FS_HEAD}{FILTER_GLSL}{FS_MAIN}");
+            let fs = compile(&self.gl, &fs_src, GL_FRAGMENT_SHADER)?;
             let prog = (self.gl.create_program)();
             (self.gl.attach_shader)(prog, vs);
             (self.gl.attach_shader)(prog, fs);
@@ -606,6 +664,7 @@ impl EglWindow {
             };
             self.loc_win = name("u_win");
             self.loc_frame = name("u_frame");
+            self.loc_filter = name("u_filter");
         }
         Ok(())
     }
@@ -622,24 +681,54 @@ impl EglWindow {
         unsafe { (self.wlegl_resize)(self.window, w as i32, h as i32) };
         self.width = w;
         self.height = h;
-        let scl = (w as f32 / self.frame_w.max(1) as f32)
-            .min(h as f32 / self.frame_h.max(1) as f32);
-        let linear = (scl - scl.round()).abs() > 1e-3;
-        let f = (if linear { GL_LINEAR } else { GL_NEAREST }) as i32;
-        unsafe {
-            (self.gl.bind_texture)(GL_TEXTURE_2D, self.tex);
-            (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
-            (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
-            (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
-        }
+        let scl = self.scale();
         eprintln!(
             "[eglwin] buffer {}x{} (frame {}x{}, scale {scl:.3}, filter {})",
             w,
             h,
             self.frame_w,
             self.frame_h,
-            if linear { "linear" } else { "nearest" }
+            FILTER_NAMES[self.effective_filter() as usize]
         );
+    }
+
+    /// Letterbox scale: device buffer px per frame px (scalar min of the axes).
+    fn scale(&self) -> f32 {
+        (self.width as f32 / self.frame_w.max(1) as f32)
+            .min(self.height as f32 / self.frame_h.max(1) as f32)
+    }
+
+    /// Effective sampler: 0 nearest, 1 linear, 2 cubic, 3 area.
+    fn effective_filter(&self) -> u32 {
+        match self.filter_mode {
+            1 => 0,
+            2 => 1,
+            3 => 2,
+            4 => 3,
+            _ => {
+                let scl = self.scale();
+                if (scl - scl.round()).abs() < 1e-3 {
+                    0 // integer scale: pixel-perfect
+                } else if scl < 1.0 {
+                    3 // downscale: area/box (avoids aliasing)
+                } else {
+                    1 // upscale: bilinear
+                }
+            }
+        }
+    }
+
+    /// `--scale-filter`: 0 auto, 1 nearest, 2 linear, 3 cubic, 4 area.
+    pub fn set_scale_filter(&mut self, mode: u32) {
+        self.filter_mode = mode;
+    }
+
+    /// Set the currently bound GL_TEXTURE_2D's filter for `mode` (nearest for
+    /// the manual filters; linear only for mode 1).
+    unsafe fn set_filter(&self, mode: u32) {
+        let f = (if mode == 1 { GL_LINEAR } else { GL_NEAREST }) as i32;
+        (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
+        (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
     }
 
     /// Guest frame dimensions changed (mid-session resolution change): the
@@ -717,10 +806,13 @@ impl EglWindow {
     /// Shared draw: full-screen letterboxed triangle sampling `tex`, then the
     /// metrics overlay quad if enabled. Does not swap.
     unsafe fn draw_with(&self, tex: u32, overlay: Option<(&[u8], u32, u32)>) {
+        let mode = self.effective_filter();
         (self.gl.use_program)(self.prog);
+        (self.gl.uniform_1i)(self.loc_filter, mode as i32);
         (self.gl.uniform_2f)(self.loc_win, self.width as f32, self.height as f32);
         (self.gl.uniform_2f)(self.loc_frame, self.frame_w as f32, self.frame_h as f32);
         (self.gl.bind_texture)(GL_TEXTURE_2D, tex);
+        self.set_filter(mode);
         (self.gl.viewport)(0, 0, self.width as i32, self.height as i32);
         (self.gl.draw_arrays)(GL_TRIANGLES, 0, 3);
         (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
@@ -788,7 +880,8 @@ impl EglWindow {
                 Ok(sh)
             };
             let vs = compile(&self.gl, VS, GL_VERTEX_SHADER)?;
-            let fs = compile(&self.gl, FS_YUV, GL_FRAGMENT_SHADER)?;
+            let fs_src = format!("{FS_YUV_HEAD}{FILTER_GLSL}{FS_YUV_MAIN}");
+            let fs = compile(&self.gl, &fs_src, GL_FRAGMENT_SHADER)?;
             let prog = (self.gl.create_program)();
             (self.gl.attach_shader)(prog, vs);
             (self.gl.attach_shader)(prog, fs);
@@ -806,6 +899,7 @@ impl EglWindow {
             self.yuv_loc_win = name("u_win");
             self.yuv_loc_frame = name("u_frame");
             self.yuv_loc_tex = [name("y_tex"), name("u_tex"), name("v_tex")];
+            self.yuv_loc_filter = name("u_filter");
         }
         Ok(())
     }
@@ -877,12 +971,15 @@ impl EglWindow {
     pub fn present_yuv(&mut self, overlay: Option<(&[u8], u32, u32)>) -> Result<(u64, u64)> {
         unsafe {
             let t4 = rdma_display_proto::unix_now_us();
+            let mode = self.effective_filter();
             (self.gl.use_program)(self.yuv_prog);
+            (self.gl.uniform_1i)(self.yuv_loc_filter, mode as i32);
             (self.gl.uniform_2f)(self.yuv_loc_win, self.width as f32, self.height as f32);
             (self.gl.uniform_2f)(self.yuv_loc_frame, self.frame_w as f32, self.frame_h as f32);
             for i in 0..3 {
                 (self.gl.active_texture)(GL_TEXTURE0 + i as u32);
                 (self.gl.bind_texture)(GL_TEXTURE_2D, self.yuv_tex[i]);
+                self.set_filter(mode);
                 (self.gl.uniform_1i)(self.yuv_loc_tex[i], i as i32);
             }
             (self.gl.viewport)(0, 0, self.width as i32, self.height as i32);
