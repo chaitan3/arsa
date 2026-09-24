@@ -1002,8 +1002,9 @@ struct FrameCodec {
     scanout: bool,
     /// set once the texture-direct import failed (avoid per-frame log spam)
     scanout_warned: bool,
-    /// periodic texture-direct breakdown (frames since the last print)
-    stat_frames: u64,
+    /// periodic texture-direct breakdown: [activate, blit, encode, ref, copy,
+    /// mat_restore] in µs for the last interval (reported as a p50)
+    stat_buf: Vec<[u64; 6]>,
     /// time the caller spent restoring the materializer context last frame
     mat_activate_us: u64,
 }
@@ -1019,7 +1020,7 @@ impl FrameCodec {
             first: true,
             scanout: false,
             scanout_warned: false,
-            stat_frames: 0,
+            stat_buf: Vec::new(),
             mat_activate_us: 0,
         }
     }
@@ -1197,19 +1198,30 @@ impl FrameCodec {
         let coded = gpu.coded(n);
         out[..n].copy_from_slice(coded);
         let copy = t.elapsed();
-        self.stat_frames += 1;
-        if self.stat_frames % 120 == 0 {
+        self.stat_buf.push([
+            act.as_micros() as u64,
+            blit.as_micros() as u64,
+            enc.as_micros() as u64,
+            rf.as_micros() as u64,
+            copy.as_micros() as u64,
+            self.mat_activate_us,
+        ]);
+        if self.stat_buf.len() >= 120 {
+            let mut med = [0u64; 6];
+            let mut mx = [0u64; 6];
+            for c in 0..6 {
+                let mut v: Vec<u64> = self.stat_buf.iter().map(|r| r[c]).collect();
+                v.sort_unstable();
+                med[c] = v[v.len() / 2];
+                mx[c] = v[v.len() - 1];
+            }
+            let sum: u64 = med.iter().sum();
             eprintln!(
-                "[server] lossless texture us: activate={} blit={} encode={} ref={} copy={} mat_restore={} | tiles={} coded={} B",
-                act.as_micros(),
-                blit.as_micros(),
-                enc.as_micros(),
-                rf.as_micros(),
-                copy.as_micros(),
-                self.mat_activate_us,
-                count,
-                n,
+                "[server] lossless texture p50/xmax us: activate={}/{} blit={}/{} encode={}/{} ref={}/{} copy={}/{} mat_restore={}/{} | p50 sum={} | tiles={} coded={} B",
+                med[0], mx[0], med[1], mx[1], med[2], mx[2], med[3], mx[3],
+                med[4], mx[4], med[5], mx[5], sum, count, n,
             );
+            self.stat_buf.clear();
         }
         let us = (act + blit + enc + rf + copy).as_micros() as u64;
         Ok((

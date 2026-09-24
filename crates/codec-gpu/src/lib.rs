@@ -34,7 +34,7 @@ const GL_COMPUTE_SHADER: u32 = 0x91B9;
 const GL_COMPILE_STATUS: u32 = 0x8B81;
 const GL_LINK_STATUS: u32 = 0x8B82;
 const GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT: u32 = 0x4000;
-const GL_ALL_BARRIER_BITS: u32 = 0xFFFF_FFFF;
+const GL_SHADER_STORAGE_BARRIER_BIT: u32 = 0x0000_2000;
 const GL_RENDERER: u32 = 0x1F01;
 const GL_VERSION: u32 = 0x1F02;
 
@@ -732,9 +732,10 @@ impl GpuCodec {
                     | GL_TEXTURE_FETCH_BARRIER_BIT
                     | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT,
             );
-            // no glFinish here: the encode dispatch follows on the same
-            // command stream, so GPU ordering plus the barrier is enough (the
-            // encode's own finish waits for both)
+            // diagnostic: finishing here attributes the blit's *GPU* time to
+            // `blit` instead of letting the encode's finish absorb it. Cheap
+            // (the encode depends on the blit anyway).
+            (self.gl.finish)();
             let err = (self.gl.get_error)();
             if err != 0 {
                 bail!("source blit glError 0x{err:04x}");
@@ -831,7 +832,7 @@ impl GpuCodec {
             (self.gl.uniform1ui)(u("u_full"), full as u32);
             (self.gl.uniform1ui)(u("u_pbase_words"), self.payload_base_words);
             (self.gl.dispatch_compute)(g.tile_count() as u32, 1, 1);
-            (self.gl.memory_barrier)(GL_ALL_BARRIER_BITS);
+            (self.gl.memory_barrier)(GL_SHADER_STORAGE_BARRIER_BIT);
             (self.gl.finish)();
         }
         let count = unsafe { *self.counter_map } as usize;
@@ -868,7 +869,7 @@ impl GpuCodec {
             (self.gl.uniform1ui)(u("u_count"), count as u32);
             (self.gl.uniform1ui)(u("u_pbase_words"), self.payload_base_words);
             (self.gl.dispatch_compute)(count as u32, 1, 1);
-            (self.gl.memory_barrier)(GL_ALL_BARRIER_BITS);
+            (self.gl.memory_barrier)(GL_SHADER_STORAGE_BARRIER_BIT);
             (self.gl.finish)();
         }
         Ok(())
