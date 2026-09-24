@@ -28,6 +28,10 @@ const EGL_WINDOW_BIT: i32 = 0x0004;
 const EGL_RENDERABLE_TYPE: i32 = 0x3040;
 const EGL_OPENGL_ES3_BIT: i32 = 0x0040;
 const EGL_ALPHA_SIZE: i32 = 0x3021;
+const EGL_BUFFER_SIZE: i32 = 0x3020;
+const EGL_RED_SIZE: i32 = 0x3024;
+const EGL_NATIVE_VISUAL_ID: i32 = 0x302E;
+const EGL_CONFIG_ID: i32 = 0x3028;
 const EGL_NONE: i32 = 0x3038;
 const EGL_CONTEXT_CLIENT_VERSION: i32 = 0x3098;
 const EGL_CONTEXT_MINOR_VERSION: i32 = 0x30FB;
@@ -67,6 +71,8 @@ struct EglLib {
     bind_api: unsafe extern "system" fn(u32) -> u32,
     choose_config:
         unsafe extern "system" fn(*mut c_void, *const i32, *mut *mut c_void, i32, *mut i32) -> u32,
+    get_config_attrib:
+        unsafe extern "system" fn(*mut c_void, *mut c_void, i32, *mut i32) -> u32,
     create_context: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const i32) -> *mut c_void,
     create_window_surface:
         unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const i32) -> *mut c_void,
@@ -271,6 +277,7 @@ impl EglWindow {
             initialize: sym(&lib, "eglInitialize")?,
             bind_api: sym(&lib, "eglBindAPI")?,
             choose_config: sym(&lib, "eglChooseConfig")?,
+            get_config_attrib: sym(&lib, "eglGetConfigAttrib")?,
             create_context: sym(&lib, "eglCreateContext")?,
             create_window_surface: sym(&lib, "eglCreateWindowSurface")?,
             make_current: sym(&lib, "eglMakeCurrent")?,
@@ -308,6 +315,21 @@ impl EglWindow {
             || n < 1
         {
             bail!("no ES3 window-capable EGL config (err {:#06x})", err());
+        }
+        unsafe {
+            let attrib = |a: i32| {
+                let mut v: i32 = -1;
+                (egl.get_config_attrib)(dpy, cfg, a, &mut v);
+                v
+            };
+            eprintln!(
+                "[egl] window config: id={} buffer={} red={} alpha={} native_visual=0x{:x} (alpha=0 => XRGB/opaque, direct-scanout friendly)",
+                attrib(EGL_CONFIG_ID),
+                attrib(EGL_BUFFER_SIZE),
+                attrib(EGL_RED_SIZE),
+                attrib(EGL_ALPHA_SIZE),
+                attrib(EGL_NATIVE_VISUAL_ID),
+            );
         }
         let surf = unsafe { (egl.create_window_surface)(dpy, cfg, window, std::ptr::null()) };
         if surf.is_null() {
