@@ -761,9 +761,12 @@ impl GpuCodec {
             (self.gl.tex_parameteri)(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST as i32);
             (self.gl.tex_parameteri)(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST as i32);
             let mut err = (self.gl.get_error)();
-            if err != 0 && target == GL_TEXTURE_2D && d.modifier != 0 {
+            // If GL_TEXTURE_2D can't take this EGLImage (linear dma-bufs
+            // usually can, but not always; tiled ones only under =2d), fall
+            // back to the external sampler.
+            if err != 0 && target == GL_TEXTURE_2D {
                 eprintln!(
-                    "[gpu] RDMA_LOSSLESS_SRC=2d rejected for modifier {:#x} (glError {err:#06x}); falling back to the external sampler",
+                    "[gpu] EGLImage -> GL_TEXTURE_2D bind failed (glError {err:#06x}, modifier {:#x}); using the external sampler",
                     d.modifier
                 );
                 target = GL_TEXTURE_EXTERNAL_OES;
