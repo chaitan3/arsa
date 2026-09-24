@@ -319,6 +319,9 @@ pub struct GpuCodec {
     src_egl_image: Handle,
     /// test hook only: the `GL_TEXTURE_2D` behind a benchmark EGLImage
     src_tex2d: u32,
+    /// force binding a tiled scanout to GL_TEXTURE_2D (experiment; the driver
+    /// normally rejects non-linear modifiers on GL_TEXTURE_2D)
+    force_2d: bool,
     has_scanout: bool,
     /// cached dmabuf imports, keyed so a repeated scanout buffer isn't
     /// re-imported (the import enqueues ~3 ms of GPU work for 4K — measured)
@@ -464,6 +467,9 @@ impl GpuCodec {
             let force_blit = std::env::var("RDMA_LOSSLESS_SRC")
                 .map(|v| v == "blit")
                 .unwrap_or(false);
+            let force_2d = std::env::var("RDMA_LOSSLESS_SRC")
+                .map(|v| v == "2d")
+                .unwrap_or(false);
             let enc_ext_prog = if force_blit {
                 eprintln!("[gpu] RDMA_LOSSLESS_SRC=blit: forcing the blit + image encode path");
                 0
@@ -603,6 +609,7 @@ impl GpuCodec {
                 src_egl_image: std::ptr::null_mut(),
                 src_tex2d: 0,
                 has_scanout: false,
+                force_2d,
                 src_cache: Vec::new(),
                 cache_hits: 0,
                 cache_misses: 0,
@@ -739,11 +746,12 @@ impl GpuCodec {
             (self.gl.gen_textures)(1, t.as_mut_ptr());
             let tex = t[0];
             // A LINEAR scanout binds as a normal GL_TEXTURE_2D, which the
-            // encode reads with texelFetch (~0.17 ms for 4K). Tiled modifiers
-            // must go through GL_TEXTURE_EXTERNAL_OES, whose sampler costs
-            // ~3.3 ms for 4K on this driver (measured; see codecbench).
-            let linear = d.modifier == 0;
-            let target = if linear {
+            // encode reads with texelFetch (~0.2 ms for 4K). Tiled modifiers
+            // normally require GL_TEXTURE_EXTERNAL_OES; RDMA_LOSSLESS_SRC=2d
+            // forces the GL_TEXTURE_2D attempt (the driver usually rejects it,
+            // in which case we fall back to the external sampler).
+            let try_2d = d.modifier == 0 || self.force_2d;
+            let mut target = if try_2d {
                 GL_TEXTURE_2D
             } else {
                 GL_TEXTURE_EXTERNAL_OES
@@ -752,17 +760,29 @@ impl GpuCodec {
             (itt)(target, img);
             (self.gl.tex_parameteri)(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST as i32);
             (self.gl.tex_parameteri)(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST as i32);
-            if !linear {
-                (self.gl.tex_parameteri)(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE as i32);
-                (self.gl.tex_parameteri)(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE as i32);
+            let mut err = (self.gl.get_error)();
+            if err != 0 && target == GL_TEXTURE_2D && d.modifier != 0 {
+                eprintln!(
+                    "[gpu] RDMA_LOSSLESS_SRC=2d rejected for modifier {:#x} (glError {err:#06x}); falling back to the external sampler",
+                    d.modifier
+                );
+                target = GL_TEXTURE_EXTERNAL_OES;
+                (self.gl.bind_texture)(target, tex);
+                (itt)(target, img);
+                (self.gl.tex_parameteri)(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST as i32);
+                (self.gl.tex_parameteri)(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST as i32);
+                err = (self.gl.get_error)();
             }
-            let err = (self.gl.get_error)();
             if err != 0 {
                 (destroy)(self.dpy, img);
                 bail!("EGLImage -> texture {target:#x} glError 0x{err:04x}");
             }
+            if target == GL_TEXTURE_EXTERNAL_OES {
+                (self.gl.tex_parameteri)(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE as i32);
+                (self.gl.tex_parameteri)(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE as i32);
+            }
             self.src_tex = tex;
-            self.direct_img = if linear { tex } else { 0 };
+            self.direct_img = if target == GL_TEXTURE_2D { tex } else { 0 };
         }
         self.src_egl_image = img;
         self.has_scanout = true;
