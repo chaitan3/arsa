@@ -11,7 +11,7 @@ pub mod gamepad;
 pub mod keymap;
 
 pub const MAGIC: u32 = 0x5244_4453; // "RDDS"
-pub const VERSION: u32 = 11; // v11: per-codec MatTimes stage breakdown in the frame stamp
+pub const VERSION: u32 = 12; // v12: t0p (prepare/import done) stamp in the frame stamp
 
 /// First byte of every connection, so the server routes by an explicit tag
 /// rather than by guessing protocol bytes. Audio uses
@@ -65,6 +65,9 @@ pub enum MsgType {
 /// Server-side pipeline timestamps for one frame (all `unix_now_us`).
 ///   t0  = capture event latched (QEMU D-Bus arrival / DRM scanout poll)
 ///   t0d = the sender picked the frame up (pacing + event-queue wait done)
+///   t0p = the scanout dma-buf import / materializer prepare finished (so
+///         `t0p - t0d` is the per-frame prepare, and `t1s - t0p` is the
+///         staging-slot credit wait — the import no longer pollutes `queue`)
 ///   t1s = a staging slot was available (after any credit wait)
 ///   t1  = the capture → staging-slot work finished (slot holds payload bytes)
 ///   t2  = RDMA WRITE posted
@@ -81,6 +84,7 @@ pub struct FrameStamp {
     pub seq: u64,
     pub t0: u64,
     pub t0d: u64,
+    pub t0p: u64,
     pub t1s: u64,
     pub t1: u64,
     pub t2: u64,
@@ -417,7 +421,7 @@ pub fn send_msg<T: Write>(io: &mut T, msg: &Message) -> std::io::Result<()> {
         Message::Stamp(s) => (
             MsgType::Stamp as u32,
             {
-                let mut v = Vec::with_capacity(112);
+                let mut v = Vec::with_capacity(120);
                 v.extend_from_slice(&s.seq.to_le_bytes());
                 v.extend_from_slice(&s.t0.to_le_bytes());
                 v.extend_from_slice(&s.t0d.to_le_bytes());
@@ -430,6 +434,7 @@ pub fn send_msg<T: Write>(io: &mut T, msg: &Message) -> std::io::Result<()> {
                     v.extend_from_slice(&u.to_le_bytes());
                 }
                 v.extend_from_slice(&s.meta_gen.to_le_bytes());
+                v.extend_from_slice(&s.t0p.to_le_bytes());
                 v
             },
         ),
@@ -582,8 +587,8 @@ impl<T: Read + Write> Conn<T> {
             t if t == MsgType::Bye as u32 => Message::Bye(u32_at(&payload, 0)?),
             t if t == MsgType::Input as u32 => Message::Input(InputEvent::decode(&payload)?),
             t if t == MsgType::Stamp as u32 => {
-                // 56 bytes of stamps + kind + 6 stage u64s + meta_gen
-                const STAMP_LEN: usize = 56 + 1 + MAT_STAGES * 8 + 4;
+                // 56 bytes of stamps + kind + 6 stage u64s + meta_gen + t0p
+                const STAMP_LEN: usize = 56 + 1 + MAT_STAGES * 8 + 4 + 8;
                 if payload.len() < STAMP_LEN {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -608,6 +613,7 @@ impl<T: Read + Write> Conn<T> {
                         us,
                     },
                     meta_gen: u32::from_le_bytes(payload[105..109].try_into().unwrap()),
+                    t0p: u64::from_le_bytes(payload[109..117].try_into().unwrap()),
                 })
             }
             t if t == MsgType::Ping as u32 => {
@@ -673,6 +679,7 @@ mod tests {
                 seq: 0x00ff_ffff,
                 t0: 1_700_000_000_000_123,
                 t0d: 1_700_000_000_001_000,
+                t0p: 1_700_000_000_001_050,
                 t1s: 1_700_000_000_001_100,
                 t1: 1_700_000_000_002_456,
                 t2: 1_700_000_000_002_789,

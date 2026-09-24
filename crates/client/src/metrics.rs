@@ -9,14 +9,16 @@
 //! Server (all `unix_now_us` on the server; differences are exact):
 //!   t0  = capture event latched (QEMU D-Bus arrival / DRM scanout poll)
 //!   t0d = the sender picked the frame up (pacing + event-queue wait done)
+//!   t0p = the scanout dma-buf import / materializer prepare finished
 //!   t1s = a staging slot was free (after any credit wait)
 //!   t1  = materializer readback finished (slot holds the pixels)
 //!   t2  = RDMA WRITE posted to the NIC
 //!   t2c = send CQ reported the WRITE complete (frame written on the client)
 //!
 //!   queue    = t0d - t0    capture queue / pacing
-//!   slot     = t1s - t0d   staging-slot credit wait
-//!   material = t1 - t1s    dmabuf import + blit + readback + fence
+//!   prepare  = t0p - t0d   scanout import / materializer prepare
+//!   slot     = t1s - t0p   staging-slot credit wait
+//!   material = t1 - t1s    blit + readback + fence (codec-dependent)
 //!   post     = t2 - t1     WQE build + post
 //!   transfer = t2c - t2    RDMA WRITE as the SENDER saw it (one-sided)
 //!
@@ -75,7 +77,8 @@ struct Sample {
     seq: u64,
     // --- server-side durations (same host, exact) ------------------------
     q: u64,     // t0d - t0   capture queue / pacing
-    sw: u64,    // t1s - t0d  staging-slot credit wait
+    prep: u64,  // t0p - t0d  scanout import / materializer prepare
+    sw: u64,    // t1s - t0p  staging-slot credit wait
     mat: u64,   // t1 - t1s   materialize / encode span
     /// per-codec breakdown of `mat` (µs) + the labels that belong to it
     mat_kind: MatKind,
@@ -275,17 +278,19 @@ impl Metrics {
             // Server span (t2c - t0) and client span (client_end - t3) are
             // each same-host differences: no cross-clock subtraction.
             let q = s.t0d.saturating_sub(s.t0);
-            let sw = s.t1s.saturating_sub(s.t0d);
+            let prep = s.t0p.saturating_sub(s.t0d);
+            let sw = s.t1s.saturating_sub(s.t0p);
             let mat = s.t1.saturating_sub(s.t1s);
             let post = s.t2.saturating_sub(s.t1);
             let xfer = s.t2c.saturating_sub(s.t2);
             let upl = front.t4.saturating_sub(front.t3);
             let pres = front.t5.saturating_sub(front.t4);
             let disp = tp.map(|us| us.saturating_sub(front.t5)).unwrap_or(0);
-            let e2e = q + sw + mat + post + xfer + upl + pres + disp;
+            let e2e = q + prep + sw + mat + post + xfer + upl + pres + disp;
             let sample = Sample {
                 seq: front.seq,
                 q,
+                prep,
                 sw,
                 mat,
                 mat_kind: s.mat.kind,
@@ -309,10 +314,11 @@ impl Metrics {
             self.samples.push_back(sample);
             if sample.e2e > SPIKE_E2E_US {
                 eprintln!(
-                    "[metrics-spike] seq={} end-to-end {:.2} ms | queue {:.2} slot {:.2} material {:.2} ({}) | post {:.2} transfer {:.2} | upload {:.2} present {:.2} display {:.2}",
+                    "[metrics-spike] seq={} end-to-end {:.2} ms | queue {:.2} prep {:.2} slot {:.2} material {:.2} ({}) | post {:.2} transfer {:.2} | upload {:.2} present {:.2} display {:.2}",
                     sample.seq,
                     sample.e2e as f64 / 1000.0,
                     sample.q as f64 / 1000.0,
+                    sample.prep as f64 / 1000.0,
                     sample.sw as f64 / 1000.0,
                     sample.mat as f64 / 1000.0,
                     stage_str(sample.mat_kind, &sample.mat_us),
@@ -364,9 +370,10 @@ impl Metrics {
             (med, p95)
         };
         let (e2e_m, e2e_p) = stat(|s| s.e2e);
-        let cap = |s: &Sample| s.q + s.sw + s.mat;
+        let cap = |s: &Sample| s.q + s.prep + s.sw + s.mat;
         let (cap_m, cap_p) = stat(cap);
         let (q_m, _) = stat(|s| s.q);
+        let (prep_m, _) = stat(|s| s.prep);
         let (sw_m, _) = stat(|s| s.sw);
         let (mat_m, _) = stat(|s| s.mat);
         // materialize breakdown: use the codec of the most recent sample and
@@ -417,8 +424,8 @@ impl Metrics {
             cap_p
         ));
         t.push_str(&format!(
-            "\n  queue {:>5.2}  slot {:>5.2}  materialize {:>5.2}",
-            q_m, sw_m, mat_m
+            "\n  queue {:>5.2}  prep {:>5.2}  slot {:>5.2}  mat {:>5.2}",
+            q_m, prep_m, sw_m, mat_m
         ));
         // per-codec stage breakdown; always reserve two lines so the sections
         // below do not move between modes
@@ -737,6 +744,7 @@ mod tests {
             seq,
             t0: 1_000,
             t0d: 1_100,
+            t0p: 1_100,
             t1s: 1_150,
             t1: 3_000,
             t2: 3_050,
@@ -814,6 +822,7 @@ mod tests {
             let mut s = stamp(100 + i);
             s.t0 = 1_000_000;
             s.t0d = 1_000_300;
+            s.t0p = 1_000_320;
             s.t1s = 1_000_350;
             s.t1 = 1_002_500;
             s.t2 = 1_002_560;

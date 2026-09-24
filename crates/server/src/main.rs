@@ -499,12 +499,16 @@ fn run_capture(
     // staging mode is a session property; the texture-direct lossless path
     // never pipelines (no readback), so `pipelined` is gated on it below
     let mut pipelined_capable = false;
-    let mut issued: std::collections::VecDeque<(usize, u64, u64, u64)> =
+    let mut issued: std::collections::VecDeque<(usize, u64, u64, u64, u64)> =
         std::collections::VecDeque::new();
     // pickup time of the frame the send step is currently working on (first
     // time it decided to send it); kept across slot-credit retries so the
     // credit wait lands in `slot`, not `queue`
     let mut send_pickup: Option<u64> = None;
+    // prepare-done time of the same frame: first scanout import/materializer
+    // prepare only, kept across slot-credit retries so a retry's idle time is
+    // not billed to `prep` (mirrors send_pickup)
+    let mut send_prep: Option<u64> = None;
     // frame codec state (raw = pass-through); configured per session
     let mut fc = FrameCodec::new();
     // lossy chroma advertised to the client: 0 = 4:2:0, 1 = 4:4:4
@@ -857,6 +861,10 @@ fn run_capture(
                 None if !have_frame => frame_dirty = false,
                 None => {}
             }
+            // The scanout import / materializer prepare is done. Stamped here
+            // (not inside the link) so `queue = t0d - t0` stays the pacing wait
+            // only: the import is `t0p - t0d`, the credit wait `t1s - t0p`.
+            let t0p = *send_prep.get_or_insert_with(rdma_display_proto::unix_now_us);
             // Push a changed display meta (separate message, only when it
             // changes). Only same-size changes are safe without renegotiating
             // slots; a size change is remembered so we don't re-log per frame.
@@ -886,7 +894,7 @@ fn run_capture(
                     let out = link.slot_bytes_mut(slot);
                     match mat.issue_frame(slot, out) {
                         Ok(true) => {
-                            issued.push_back((slot, t0_unix_us, t0d, t1s));
+                            issued.push_back((slot, t0_unix_us, t0d, t0p, t1s));
                             frame_dirty = false;
                         }
                         Ok(false) => {
@@ -931,6 +939,8 @@ fn run_capture(
                         Ok((true, n, t))
                     },
                     t0_unix_us,
+                    t0d,
+                    t0p,
                 ) {
                     Ok(Some(seq)) => {
                         frame_dirty = false;
@@ -953,12 +963,13 @@ fn run_capture(
         // its pickup time so its slot-credit wait is not billed to `queue`)
         if !frame_dirty {
             send_pickup = None;
+            send_prep = None;
         }
         // 5. pipelined: finish + post the oldest issued frame (FIFO preserves
         // frame order; the fence wait is mostly elapsed because the GPU DMA
         // overlapped the previous frame's transfer)
         if pipelined && session.is_some() {
-            while let Some((slot, f_t0, f_t0d, f_t1s)) = issued.front().copied() {
+            while let Some((slot, f_t0, f_t0d, f_t0p, f_t1s)) = issued.front().copied() {
                 let link = session.as_mut().unwrap();
                 let out = link.slot_bytes_mut(slot);
                 let (changed, mat_times) = match mat.finish_frame(slot, out) {
@@ -995,6 +1006,7 @@ fn run_capture(
                     slot,
                     f_t0,
                     f_t0d,
+                    f_t0p,
                     f_t1s,
                     rdma_display_proto::unix_now_us(),
                     post_len,

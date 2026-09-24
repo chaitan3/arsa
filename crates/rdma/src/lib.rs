@@ -669,6 +669,8 @@ impl ServerLink {
                 Ok((true, n, proto::MatTimes::ZERO))
             },
             t0_unix_us,
+            t0_unix_us,
+            t0_unix_us,
         )?
         .ok_or_else(|| anyhow!("frame unexpectedly unchanged"))
     }
@@ -677,14 +679,21 @@ impl ServerLink {
     /// frame content changed and should be sent (`Ok(false)` = skip), returns
     /// the number of bytes to post (`post_len`, e.g. the codec's coded length),
     /// and returns the frame's GPU stage times for the Stamp.
+    ///
+    /// `t0d_unix_us` is the sender's pickup time (pacing/gate done, *before*
+    /// the scanout import) and `t0p_unix_us` the prepare-done time, so
+    /// `queue = t0d - t0` is the pacing wait only and `t1s - t0p` is the
+    /// staging-slot credit wait; neither absorbs the per-frame prepare.
     pub fn send_frame_checked(
         &mut self,
         fill: impl FnOnce(&mut [u8]) -> anyhow::Result<(bool, usize, proto::MatTimes)>,
         t0_unix_us: u64,
+        t0d_unix_us: u64,
+        t0p_unix_us: u64,
     ) -> Result<Option<u64>> {
         match self.transport {
-            Transport::Rdma => self.send_frame_rdma(fill, t0_unix_us),
-            Transport::Tcp => self.send_frame_tcp(fill, t0_unix_us),
+            Transport::Rdma => self.send_frame_rdma(fill, t0_unix_us, t0d_unix_us, t0p_unix_us),
+            Transport::Tcp => self.send_frame_tcp(fill, t0_unix_us, t0d_unix_us, t0p_unix_us),
         }
     }
 
@@ -692,8 +701,9 @@ impl ServerLink {
         &mut self,
         fill: impl FnOnce(&mut [u8]) -> anyhow::Result<(bool, usize, proto::MatTimes)>,
         t0_unix_us: u64,
+        t0d: u64,
+        t0p: u64,
     ) -> Result<Option<u64>> {
-        let t0d = proto::unix_now_us(); // frame picked up for sending
         let slot = self.claim_free_slot_rdma()?;
         let t1s = proto::unix_now_us(); // staging slot available
         let slot_wait_us = t1s.saturating_sub(t0d);
@@ -768,7 +778,7 @@ impl ServerLink {
         };
         self.seq += 1;
         self.send_stamp(
-            seq, t0_unix_us, t0d, t1s, t1_unix_us, t2_unix_us, t2c_unix_us, mat_times,
+            seq, t0_unix_us, t0d, t0p, t1s, t1_unix_us, t2_unix_us, t2c_unix_us, mat_times,
         );
         Ok(Some(seq))
     }
@@ -777,8 +787,9 @@ impl ServerLink {
         &mut self,
         fill: impl FnOnce(&mut [u8]) -> anyhow::Result<(bool, usize, proto::MatTimes)>,
         t0_unix_us: u64,
+        t0d: u64,
+        t0p: u64,
     ) -> Result<Option<u64>> {
-        let t0d = proto::unix_now_us();
         if self.video.is_none() {
             return Ok(None); // client hasn't opened its TAG_VIDEO socket yet
         }
@@ -820,7 +831,7 @@ impl ServerLink {
         };
         self.seq += 1;
         self.send_stamp(
-            seq, t0_unix_us, t0d, t1s, t1_unix_us, t2_unix_us, t2c_unix_us, mat_times,
+            seq, t0_unix_us, t0d, t0p, t1s, t1_unix_us, t2_unix_us, t2c_unix_us, mat_times,
         );
         Ok(Some(seq))
     }
@@ -831,6 +842,7 @@ impl ServerLink {
         seq: u64,
         t0_unix_us: u64,
         t0d: u64,
+        t0p: u64,
         t1s: u64,
         t1: u64,
         t2: u64,
@@ -852,6 +864,7 @@ impl ServerLink {
             seq,
             t0,
             t0d,
+            t0p,
             t1s,
             t1,
             t2,
@@ -867,16 +880,18 @@ impl ServerLink {
 
     /// Pipelined post: WRITE a slot that `issue_frame` already filled (the
     /// materializer completed it via `finish_frame`). `t0d` is the pickup
-    /// time (pacing/queue wait done) and `t1s` the slot-claim time, so the
-    /// stamp keeps the same `queue`/`slot`/`material` split as the serial
-    /// path; `t1` is the fence-completion time. `post_len` is the number of
-    /// bytes to send (the codec's coded length, or the raw frame size).
+    /// time (pacing/queue wait done), `t0p` the prepare (dma-buf import) done
+    /// time, and `t1s` the slot-claim time, so the stamp keeps the same
+    /// `queue`/`prepare`/`slot`/`material` split as the serial path; `t1` is
+    /// the fence-completion time. `post_len` is the number of bytes to send
+    /// (the codec's coded length, or the raw frame size).
     #[allow(clippy::too_many_arguments)]
     pub fn post_filled(
         &mut self,
         slot: usize,
         t0_unix_us: u64,
         t0d_unix_us: u64,
+        t0p_unix_us: u64,
         t1s_unix_us: u64,
         t1_unix_us: u64,
         post_len: usize,
@@ -927,7 +942,8 @@ impl ServerLink {
                 };
                 self.seq += 1;
                 self.send_stamp(
-                    seq, t0_unix_us, t0d_unix_us, t1s_unix_us, t1_unix_us, t2, t2c, mat_times,
+                    seq, t0_unix_us, t0d_unix_us, t0p_unix_us, t1s_unix_us, t1_unix_us, t2, t2c,
+                    mat_times,
                 );
                 Ok(Some(seq))
             }
@@ -961,7 +977,8 @@ impl ServerLink {
                 };
                 self.seq += 1;
                 self.send_stamp(
-                    seq, t0_unix_us, t0d_unix_us, t1s_unix_us, t1_unix_us, t2, t2c, mat_times,
+                    seq, t0_unix_us, t0d_unix_us, t0p_unix_us, t1s_unix_us, t1_unix_us, t2, t2c,
+                    mat_times,
                 );
                 Ok(Some(seq))
             }
