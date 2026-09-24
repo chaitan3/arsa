@@ -35,6 +35,9 @@ const GL_COMPILE_STATUS: u32 = 0x8B81;
 const GL_LINK_STATUS: u32 = 0x8B82;
 const GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT: u32 = 0x4000;
 const GL_SHADER_STORAGE_BARRIER_BIT: u32 = 0x0000_2000;
+/// Repetitions used by the read-bandwidth probe (`memprobe`) so the fixed
+/// per-dispatch launch/finish latency does not dominate a 31 MiB read.
+const PROBE_REPS: u32 = 8;
 const GL_RENDERER: u32 = 0x1F01;
 const GL_VERSION: u32 = 0x1F02;
 
@@ -1290,10 +1293,15 @@ impl GpuCodec {
             }
             (self.gl.finish)();
             let t = std::time::Instant::now();
-            (self.gl.dispatch_compute)(((words as u32) + 255) / 256, 1, 1);
+            // several back-to-back dispatches: the per-dispatch launch/finish
+            // latency is fixed, so amortizing it is the difference between
+            // measuring the launch and measuring the memory
+            for _ in 0..PROBE_REPS {
+                (self.gl.dispatch_compute)(((words as u32) + 255) / 256, 1, 1);
+            }
             (self.gl.memory_barrier)(GL_SHADER_STORAGE_BARRIER_BIT);
             (self.gl.finish)();
-            Ok(t.elapsed())
+            Ok(t.elapsed() / PROBE_REPS)
         }
     }
 
@@ -1335,10 +1343,12 @@ impl GpuCodec {
             }
             (self.gl.finish)();
             let t = std::time::Instant::now();
-            (self.gl.dispatch_compute)((px + 255) / 256, 1, 1);
+            for _ in 0..PROBE_REPS {
+                (self.gl.dispatch_compute)((px + 255) / 256, 1, 1);
+            }
             (self.gl.memory_barrier)(GL_SHADER_STORAGE_BARRIER_BIT);
             (self.gl.finish)();
-            Ok(t.elapsed())
+            Ok(t.elapsed() / PROBE_REPS)
         }
     }
 
