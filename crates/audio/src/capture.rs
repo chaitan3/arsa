@@ -28,6 +28,7 @@
 //! When we already run as the runtime-dir owner (a normal user session),
 //! capture runs in-process — the helper is sudo-only machinery.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -42,29 +43,37 @@ use anyhow::{bail, Context, Result};
 use super::pulse::{Pulse, SampleSpec};
 use super::wire::{self, AudioPacket};
 
-/// Drop-oldest mailbox: realtime valve. While nobody consumes (no client
-/// connected, or a stalled client), newer packets overwrite older ones —
-/// audio never queues up and never exerts backpressure.
+/// Bounded drop-oldest mailbox: realtime valve. While nobody consumes (no
+/// client connected, or a stalled client) newer packets eventually overwrite
+/// the oldest — audio never queues without bound and never exerts
+/// backpressure. The depth is a small safety margin above the single packet a
+/// sender is working on, so a brief socket-write stall no longer drops audio.
+const MAILBOX_DEPTH: usize = 8;
+
 #[derive(Clone)]
 pub struct Mailbox {
-    inner: Arc<(Mutex<Option<AudioPacket>>, std::sync::Condvar)>,
+    inner: Arc<(Mutex<VecDeque<AudioPacket>>, std::sync::Condvar)>,
 }
 
 impl Mailbox {
     fn new() -> Self {
         Mailbox {
-            inner: Arc::new((Mutex::new(None), std::sync::Condvar::new())),
+            inner: Arc::new((Mutex::new(VecDeque::new()), std::sync::Condvar::new())),
         }
     }
 
-    /// returns true if a previous packet was overwritten (dropped)
+    /// Push at the back, dropping the oldest when full.
+    /// Returns true if a packet was dropped.
     fn put_overwrites(&self, pkt: AudioPacket) -> bool {
         let (lock, cv) = &*self.inner;
         let mut g = lock.lock().unwrap();
-        let replaced = g.is_some();
-        *g = Some(pkt);
+        let dropped = g.len() >= MAILBOX_DEPTH;
+        if dropped {
+            g.pop_front();
+        }
+        g.push_back(pkt);
         cv.notify_one();
-        replaced
+        dropped
     }
 
     fn take_wait(&self, timeout: Duration) -> Option<AudioPacket> {
@@ -72,7 +81,7 @@ impl Mailbox {
         let mut g = lock.lock().unwrap();
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if let Some(p) = g.take() {
+            if let Some(p) = g.pop_front() {
                 return Some(p);
             }
             let now = std::time::Instant::now();
@@ -421,11 +430,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mailbox_overwrites_oldest() {
+    fn mailbox_drops_oldest_when_full() {
         let m = Mailbox::new();
-        assert!(!m.put_overwrites(AudioPacket { seq: 1, host_unix_us: 0, frames: 480, data: vec![] }));
-        assert!(m.put_overwrites(AudioPacket { seq: 2, host_unix_us: 0, frames: 480, data: vec![] }));
-        assert_eq!(m.take_wait(Duration::ZERO).unwrap().seq, 2);
+        for i in 0..MAILBOX_DEPTH as u32 {
+            let p = AudioPacket { seq: i, host_unix_us: 0, frames: 96, data: vec![] };
+            assert!(!m.put_overwrites(p), "packet {i} should fit");
+        }
+        // full: this put drops the oldest (seq 0)
+        let p = AudioPacket { seq: MAILBOX_DEPTH as u32, host_unix_us: 0, frames: 96, data: vec![] };
+        assert!(m.put_overwrites(p));
+        assert_eq!(m.take_wait(Duration::ZERO).unwrap().seq, 1);
     }
 
     #[test]
