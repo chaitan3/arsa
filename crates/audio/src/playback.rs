@@ -217,6 +217,10 @@ fn session(addr: std::net::SocketAddr, buffer_ms: u32) -> Result<()> {
         stream.write_all(&payload)?;
         if Instant::now() > next_report {
             next_report += Duration::from_secs(5);
+            let drops = {
+                let (lock, _) = &*shared;
+                lock.lock().unwrap().dropped
+            };
             match stream.latency_us() {
                 Ok(us) => {
                     // drift guard: if backlog exceeds the buffer by a wide
@@ -224,10 +228,10 @@ fn session(addr: std::net::SocketAddr, buffer_ms: u32) -> Result<()> {
                     // flush and resync rather than accumulating latency
                     let backlog_us = us as i64 - (buffer_ms as i64) * 1000;
                     if backlog_us > 150_000 {
-                        eprintln!("[audio] playout latency {} ms > buffer, flushing to resync", us / 1000);
+                        eprintln!("[audio] playout latency {} ms > buffer, flushing to resync (ring drops {drops})", us / 1000);
                         stream.flush()?;
                     } else {
-                        eprintln!("[audio] playout latency ~{} ms", us / 1000);
+                        eprintln!("[audio] playout latency ~{} ms (ring drops {drops})", us / 1000);
                     }
                 }
                 Err(e) => eprintln!("[audio] latency query failed: {e:#}"),
