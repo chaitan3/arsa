@@ -461,9 +461,20 @@ impl VkCore {
                 return Err(std::io::Error::last_os_error())
                     .context("dup dmabuf fd for import");
             }
+            // An imported DRM-format-modifier image needs a dedicated
+            // allocation tied to the image: NVIDIA reports
+            // prefersDedicatedAllocation for it, and PyroWave's own external
+            // import path (Granite) always chains one. Without it the driver
+            // may not associate the memory with the image's modifier layout and
+            // sampling reads zeros (a black frame).
+            let dedicated = vk::MemoryDedicatedAllocateInfo {
+                image,
+                ..Default::default()
+            };
             let imp = vk::ImportMemoryFdInfoKHR {
                 handle_type: vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
                 fd: dup,
+                p_next: &dedicated as *const _ as *mut std::ffi::c_void,
                 ..Default::default()
             };
             let mt = self.find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
