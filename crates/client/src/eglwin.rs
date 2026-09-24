@@ -166,7 +166,9 @@ void main() {
     // elsewhere. Windowed mode is the degenerate case (buffer == frame:
     // scale 1, origin 0 — identical to the old plain stretch).
     vec2 px = v_uv * u_win;              // bottom-left origin
-    vec2 scl = min(u_win / u_frame, vec2(1e6));
+    // scalar min of the two ratios: preserve the frame aspect (a
+    // componentwise min would stretch the frame to fill the buffer)
+    float scl = min(u_win.x / max(u_frame.x, 1.0), u_win.y / max(u_frame.y, 1.0));
     vec2 pic = u_frame * scl;
     vec2 org = (u_win - pic) * 0.5;
     if (all(greaterThanEqual(px, org)) && all(lessThan(px, org + pic))) {
@@ -196,7 +198,7 @@ in vec2 v_uv;
 out vec4 frag;
 void main() {
     vec2 px = v_uv * u_win;
-    vec2 scl = min(u_win / u_frame, vec2(1e6));
+    float scl = min(u_win.x / max(u_frame.x, 1.0), u_win.y / max(u_frame.y, 1.0));
     vec2 pic = u_frame * scl;
     vec2 org = (u_win - pic) * 0.5;
     if (all(greaterThanEqual(px, org)) && all(lessThan(px, org + pic))) {
