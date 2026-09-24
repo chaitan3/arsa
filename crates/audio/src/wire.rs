@@ -18,22 +18,20 @@ pub const TAG_AUDIO: u8 = 0x02;
 pub const SAMPLE_FORMAT: u32 = 5;
 pub const RATE: u32 = 48000;
 pub const CHANNELS: u32 = 2;
-/// 2 ms packetization (96 frames @ 48 kHz). At f32 stereo that is a 768 B
-/// payload against a 16 B header (~2% overhead), i.e. 500 packets/s — fine on
-/// a high-bandwidth / LAN link, and small enough that the client can run a
-/// very lean jitter buffer.
-pub const PACKET_FRAMES: u32 = 96;
+/// 5 ms packetization (240 frames @ 48 kHz) — the same default Moonlight/
+/// Sunshine use for lowest latency. At f32 stereo that is a 1920 B payload
+/// against a 16 B header (~0.8% overhead), i.e. 200 packets/s.
+pub const PACKET_FRAMES: u32 = 240;
 pub const BYTES_PER_FRAME: usize = CHANNELS as usize * 4; // f32 stereo
 pub const PACKET_BYTES: usize = PACKET_FRAMES as usize * BYTES_PER_FRAME;
 
 pub const FORMAT_LEN: usize = 20;
 pub const PACKET_HDR_LEN: usize = 16;
 /// Client playout buffer depth (also the pulse `tlength`/`prebuf` target).
-/// 3 ms is aggressive: it assumes a clean, low-jitter link and no TCP
-/// retransmits. Raise it (or pass `--audio-buffer-ms`) if you hear dropouts.
-/// Note the sink's own quantum (PipeWire's graph period) can floor the
-/// achievable latency no matter how small this is, so measure before trusting.
-pub const BUFFER_MS: u32 = 3;
+/// 5 ms assumes a clean, low-jitter link and a sink whose graph quantum is at
+/// or below it; otherwise the sink's own period floors the latency no matter
+/// what this says. Raise it (or pass `--audio-buffer-ms`) if you hear dropouts.
+pub const BUFFER_MS: u32 = 5;
 
 /// One PCM packet on the wire.
 pub struct AudioPacket {
