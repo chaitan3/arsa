@@ -1032,8 +1032,9 @@ struct FrameCodec {
     import_misses: u64,
     /// one-shot startup benchmark: iterations left (RDMA_LOSSLESS_BENCH=N)
     bench_left: u32,
-    /// one-shot memory-placement diagnostic (RDMA_MEMPROBE=1)
-    memprobe_left: bool,
+    /// run the memprobe every N encodes (0 = off; RDMA_MEMPROBE=N)
+    memprobe_every: u32,
+    enc_frames: u64,
 }
 
 impl FrameCodec {
@@ -1055,9 +1056,11 @@ impl FrameCodec {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
-            memprobe_left: std::env::var("RDMA_MEMPROBE")
-                .map(|v| v != "0")
-                .unwrap_or(false),
+            memprobe_every: std::env::var("RDMA_MEMPROBE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            enc_frames: 0,
         }
     }
 
@@ -1263,8 +1266,13 @@ impl FrameCodec {
             self.bench_left = 0;
             self.bench_scanout_read(n_iter)?;
         }
-        if self.memprobe_left {
-            self.memprobe_left = false;
+        self.enc_frames += 1;
+        if self.memprobe_every > 0 && self.enc_frames % self.memprobe_every as u64 == 0 {
+            eprintln!(
+                "[memprobe] --- encode #{} | gpu: {} ---",
+                self.enc_frames,
+                gpu_clocks()
+            );
             if let Some(gpu) = self.gpu.as_mut() {
                 gpu.memprobe()?;
             }
@@ -1363,6 +1371,21 @@ impl FrameCodec {
 /// Input-connection worker: validate the session nonce, forward input events
 /// to the injection sink, and release everything the client held when the
 /// socket dies — a network blip must never leave a key stuck down.
+/// Best-effort GPU clocks/power for the memprobe, to spot throttling.
+fn gpu_clocks() -> String {
+    std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=clocks.sm,clocks.mem,pstate,temperature.gpu,power.draw,utilization.gpu",
+            "--format=csv,noheader",
+        ])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
 fn serve_input(
     mut stream: std::net::TcpStream,
     nonce_cell: std::sync::Arc<std::sync::atomic::AtomicU64>,
