@@ -417,11 +417,17 @@ fn gbm_read_bench(geom: Geometry) -> Result<()> {
     type BoU64 = unsafe extern "C" fn(*mut c_void) -> u64;
     type BoDestroy = unsafe extern "C" fn(*mut c_void);
 
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/dri/renderD128")
-        .map_err(|e| anyhow::anyhow!("open renderD128: {e} (run under sudo)"))?;
+    let file = ["/dev/dri/renderD128", "/dev/dri/card0"]
+        .iter()
+        .find_map(|p| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(p)
+                .map_err(|e| eprintln!("[gbm] open {p}: {e}"))
+                .ok()
+        })
+        .ok_or_else(|| anyhow::anyhow!("open no DRM node (run under sudo)"))?;
     let fd = file.as_raw_fd();
     let lib = unsafe { libloading::Library::new("libgbm.so.1") }?;
     unsafe {
@@ -467,6 +473,18 @@ fn gbm_read_bench(geom: Geometry) -> Result<()> {
                 height: geom.height,
             };
             let mut gpu = GpuCodec::new(geom)?;
+            eprintln!(
+                "[gbm] {name:13} fd={:3} stride={:6} offset={:3} modifier=0x{:016x}",
+                img.fd,
+                img.stride,
+                img.offset,
+                img.modifier
+            );
+            if img.fd < 0 {
+                eprintln!("[gbm] {name}: gbm_bo_get_fd failed (no exportable buffer)");
+                bo_destroy(bo);
+                continue;
+            }
             if let Err(e) = gpu.set_scanout(&img) {
                 eprintln!("[gbm] {name}: import failed: {e:#}");
                 bo_destroy(bo);
