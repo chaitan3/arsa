@@ -1,30 +1,34 @@
-//! Best-effort NVIDIA GPU clock pinning for `--gpu-power`.
+//! Best-effort NVIDIA GPU clock flooring for `--gpu-power`.
 //!
-//! The lossless encode path on the reference box is memory-bandwidth bound, and
-//! the driver was caught toggling between the fast P5 state (mem 810 MHz) and
-//! the slow idle P8 state (mem 405 MHz) mid-session, swinging `encode` between
-//! ~0.3 ms and ~4 ms. nvidia-smi cannot select a P-state directly, so we pin
-//! the clock limits instead: `p5` uses the operating point we measured, `p0`
-//! pins the card's maximum, and `<sm>[,<mem>]` takes explicit MHz. nvidia-smi
-//! (not nvidia-settings) is used deliberately: the lock commands work headless,
-//! with no X/NV-CONTROL display.
+//! `nvidia-smi --lock-gpu-clocks=<min>,<max>` constrains the graphics clock to
+//! the inclusive range [min, max]: with `min == max` it pins the clock, but with
+//! `min < max` the driver may still boost freely up to `max`. We only ever want
+//! the floor. The lossless encode path on the reference box is bandwidth bound
+//! and the driver was caught dropping to the idle P8 state (mem 405 MHz)
+//! mid-session, swinging `encode` between ~0.3 ms and ~4 ms; we want to stop
+//! that drop without capping the boost. So every preset is a *minimum* and the
+//! ceiling is always the card's `clocks.max.*`.
 //!
-//! Everything here is advisory. Clock locking needs root and a supporting GPU;
-//! a missing nvidia-smi, a permission error, or an unsupported clock is logged
-//! and the session runs on with the driver's own power management. The two
-//! failure modes seen on the reference 2080 Ti are handled explicitly:
-//! `-lgc` needs root and prints "does not have permission" to *stdout* with a
-//! non-zero exit, while `-lmc` is not supported on GeForce at all and prints
-//! "not supported" to stdout with exit 0 — so `lock()` inspects the output
-//! rather than trusting the status alone.
+//! nvidia-smi (not nvidia-settings) is used deliberately: these commands work
+//! headless, with no X/NV-CONTROL display.
+//!
+//! Everything here is advisory. Clock floors need root and a supporting GPU; a
+//! missing nvidia-smi, a permission error, or an unsupported clock is logged and
+//! the session runs on with the driver's own power management. The two failure
+//! modes seen on the reference 2080 Ti are handled explicitly: `-lgc` needs root
+//! and prints "does not have permission" to *stdout* with a non-zero exit, while
+//! `-lmc` is not supported on GeForce at all and prints "not supported" to
+//! stdout with exit 0 — so `lock_range()` inspects the output, not just the exit
+//! status.
 
 use anyhow::{bail, Context, Result};
 
 /// The P5 operating point measured on the reference GPU (nvidia-smi
 /// `clocks.sm` / `clocks.mem` while the memprobe reported the fast state).
-/// Override with `--gpu-power <sm>[,<mem>]` on different hardware. Note the
-/// memory half is rejected on GeForce cards (the reference 2080 Ti included);
-/// there the graphics lock alone has to hold PowerMizer out of P8.
+/// These are *floors*: the GPU is free to boost above them. Override with
+/// `--gpu-power <sm>[,<mem>]` on different hardware. The memory half is
+/// rejected on GeForce cards (the reference 2080 Ti included); there the
+/// graphics floor alone has to hold PowerMizer out of P8.
 const P5_SM_MHZ: u32 = 435;
 const P5_MEM_MHZ: u32 = 810;
 
@@ -32,11 +36,11 @@ const P5_MEM_MHZ: u32 = 810;
 pub enum GpuPower {
     /// Leave the driver's power management alone (default).
     Off,
-    /// Pin to the observed P5 operating point.
+    /// Floor at the observed P5 operating point, boost allowed.
     P5,
-    /// Pin to the card's maximum graphics and memory clocks (P0).
+    /// Floor at the card's maximum (effectively pinned there).
     Max,
-    /// Pin to explicit `<sm>[,<mem>]` MHz; memory is optional.
+    /// Floor at explicit `<sm>[,<mem>]` MHz, boost allowed; memory is optional.
     Custom { sm: u32, mem: Option<u32> },
 }
 
@@ -67,19 +71,26 @@ impl GpuPower {
         }
     }
 
-    /// Apply the pin. Returns an error for display only: the caller logs it and
-    /// keeps streaming, so this is never fatal.
+    /// Apply the floor. Returns an error for display only: the caller logs it
+    /// and keeps streaming, so this is never fatal.
     pub fn apply(self) -> Result<()> {
         match self {
             Self::Off => Ok(()),
-            Self::P5 => pin(P5_SM_MHZ, Some(P5_MEM_MHZ), "p5"),
+            Self::P5 => pin(P5_SM_MHZ, Some(P5_MEM_MHZ), max_clocks()?, "p5"),
             Self::Max => {
-                let (sm, mem) = max_clocks()?;
-                pin(sm, Some(mem), "p0/max")
+                let ceil = max_clocks()?;
+                pin(ceil.sm, Some(ceil.mem), ceil, "p0/max")
             }
-            Self::Custom { sm, mem } => pin(sm, mem, "custom"),
+            Self::Custom { sm, mem } => pin(sm, mem, max_clocks()?, "custom"),
         }
     }
+}
+
+/// The card's boost clocks, used as the ceiling so a floor never caps boost.
+#[derive(Clone, Copy, Debug)]
+struct MaxClocks {
+    sm: u32,
+    mem: u32,
 }
 
 /// Run nvidia-smi against GPU 0. stdout and stderr are merged because some
@@ -107,12 +118,28 @@ fn nvidia_smi(args: &[&str]) -> Result<String> {
     Ok(text)
 }
 
-/// Apply one `-lgc`/`-lmc` pin. nvidia-smi reports "not supported" and "does
+/// `clocks.max.sm` / `clocks.max.mem` for GPU 0.
+fn max_clocks() -> Result<MaxClocks> {
+    let s = nvidia_smi(&[
+        "--query-gpu=clocks.max.sm,clocks.max.mem",
+        "--format=csv,noheader,nounits",
+    ])?;
+    let line = s.lines().next().unwrap_or("").trim();
+    let (sm, mem) = line
+        .split_once(',')
+        .with_context(|| format!("unexpected nvidia-smi clock output: {line:?}"))?;
+    Ok(MaxClocks {
+        sm: sm.trim().parse().context("parsing clocks.max.sm")?,
+        mem: mem.trim().parse().context("parsing clocks.max.mem")?,
+    })
+}
+
+/// Apply one `-lgc`/`-lmc` range. nvidia-smi reports "not supported" and "does
 /// not have permission" as a *successful* exit with the reason on stdout
-/// (GeForce cards reject the memory lock this way), so the exit status alone
+/// (GeForce cards reject the memory range this way), so the exit status alone
 /// does not mean the clock moved.
-fn lock(flag: &str, mhz: u32) -> Result<()> {
-    let out = nvidia_smi(&[flag, &format!("{mhz},{mhz}")])?;
+fn lock_range(flag: &str, min: u32, max: u32) -> Result<()> {
+    let out = nvidia_smi(&[flag, &format!("{min},{max}")])?;
     let low = out.to_ascii_lowercase();
     for bad in [
         "not supported",
@@ -128,62 +155,53 @@ fn lock(flag: &str, mhz: u32) -> Result<()> {
     Ok(())
 }
 
-/// `clocks.max.sm` / `clocks.max.mem` for GPU 0.
-fn max_clocks() -> Result<(u32, u32)> {
-    let s = nvidia_smi(&[
-        "--query-gpu=clocks.max.sm,clocks.max.mem",
-        "--format=csv,noheader,nounits",
-    ])?;
-    let line = s.lines().next().unwrap_or("").trim();
-    let (sm, mem) = line
-        .split_once(',')
-        .with_context(|| format!("unexpected nvidia-smi clock output: {line:?}"))?;
-    Ok((
-        sm.trim().parse().context("parsing clocks.max.sm")?,
-        mem.trim().parse().context("parsing clocks.max.mem")?,
-    ))
-}
-
-/// Lock the graphics (and optionally memory) clock to a fixed value. Each lock
-/// is attempted independently so a card that rejects one still gets the other;
+/// Floor the graphics (and optionally memory) clock at `floor`, leaving the
+/// ceiling at the card maximum so the GPU may still boost. Each clock is
+/// attempted independently so a card that rejects one still gets the other;
 /// only a complete failure is reported.
-fn pin(sm: u32, mem: Option<u32>, label: &str) -> Result<()> {
-    // persistence mode keeps the driver resident so the locks survive idle;
+fn pin(sm_floor: u32, mem_floor: Option<u32>, ceil: MaxClocks, label: &str) -> Result<()> {
+    // persistence mode keeps the driver resident so the floors survive idle;
     // best-effort — a permission error here is not fatal on its own
     if let Err(e) = nvidia_smi(&["-pm", "1"]) {
         eprintln!("[gpu-power] {label}: persistence mode not set ({e:#})");
     }
 
-    let mut locked = Vec::new();
-    match lock("-lgc", sm) {
+    let mut floored = Vec::new();
+    match lock_range("-lgc", sm_floor, ceil.sm) {
         Ok(()) => {
-            locked.push(format!("sm {sm} MHz"));
-            eprintln!("[gpu-power] {label}: locked graphics clock to {sm} MHz");
+            floored.push(format!("sm >= {sm_floor} MHz"));
+            eprintln!(
+                "[gpu-power] {label}: graphics clock floored at {sm_floor} MHz (may boost to {})",
+                ceil.sm
+            );
         }
-        Err(e) => eprintln!("[gpu-power] {label}: graphics clock lock failed: {e:#}"),
+        Err(e) => eprintln!("[gpu-power] {label}: graphics clock floor failed: {e:#}"),
     }
-    if let Some(mem) = mem {
-        match lock("-lmc", mem) {
+    if let Some(mem_floor) = mem_floor {
+        match lock_range("-lmc", mem_floor, ceil.mem) {
             Ok(()) => {
-                locked.push(format!("mem {mem} MHz"));
-                eprintln!("[gpu-power] {label}: locked memory clock to {mem} MHz");
+                floored.push(format!("mem >= {mem_floor} MHz"));
+                eprintln!(
+                    "[gpu-power] {label}: memory clock floored at {mem_floor} MHz (may boost to {})",
+                    ceil.mem
+                );
             }
-            Err(e) => eprintln!("[gpu-power] {label}: memory clock lock failed: {e:#}"),
+            Err(e) => eprintln!("[gpu-power] {label}: memory clock floor failed: {e:#}"),
         }
     }
-    if locked.is_empty() {
-        bail!("{label}: no clock could be locked (need root / a supported GPU)");
+    if floored.is_empty() {
+        bail!("{label}: no clock floor could be set (need root / a supported GPU)");
     }
     if let Ok(state) = nvidia_smi(&[
         "--query-gpu=pstate,clocks.sm,clocks.mem",
         "--format=csv,noheader",
     ]) {
         eprintln!(
-            "[gpu-power] {label}: pinned ({}) -> {state}",
-            locked.join(", ")
+            "[gpu-power] {label}: floored ({}) -> {state}",
+            floored.join(", ")
         );
     }
-    // otherwise the pins outlive this process; say how to undo them
+    // otherwise the floors outlive this process; say how to undo them
     eprintln!("[gpu-power] release with: nvidia-smi -i 0 -rgc -rmc");
     Ok(())
 }
@@ -202,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_explicit_clocks() {
+    fn parses_explicit_floors() {
         assert_eq!(
             GpuPower::parse("435,810").unwrap(),
             GpuPower::Custom {
