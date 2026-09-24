@@ -10,7 +10,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use anyhow::{bail, Context, Result};
 use rdma_display_capture::materializer::FrameMaterializer;
 use rdma_display_capture::{CaptureEvent, DmabufScanout, FrameFormat};
-use rdma_display_proto::MatTimes;
+use rdma_display_proto::{MatKind, MatTimes};
 use rdma_display_vkcore::ash::vk;
 use rdma_display_vkcore::pyrowave::{
     Chroma, Pyrowave, PyrowaveDevice, PyrowaveEncoder, PyrowaveImageView, PyrowaveRateControl,
@@ -197,9 +197,11 @@ impl FrameMaterializer for LossyMaterializer {
         let frame = self
             .pw
             .encode_to(enc, &info, &rate, PACKET_BOUNDARY, PACKET_PADDING, &mut self.temp)?;
+        let encode_us = t.elapsed().as_micros() as u64;
         let n = frame.packets.len();
         let hdr = 4 + 4 * n;
         anyhow::ensure!(hdr + frame.len <= out.len(), "lossy: slot too small ({} + {} > {})", hdr, frame.len, out.len());
+        let t = std::time::Instant::now();
         out[0..4].copy_from_slice(&(n as u32).to_le_bytes());
         let mut off = hdr;
         for (i, (po, ps)) in frame.packets.iter().enumerate() {
@@ -207,13 +209,12 @@ impl FrameMaterializer for LossyMaterializer {
             out[off..off + ps].copy_from_slice(&self.temp[*po..*po + *ps]);
             off += ps;
         }
-        let us = t.elapsed().as_micros() as u64;
+        let packetize_us = t.elapsed().as_micros() as u64;
         self.last_len = off;
-        self.last_mat = MatTimes {
-            blit_us: us,
-            read_us: 0,
-            fin_us: 0,
-        };
+        self.last_mat = MatTimes::new(
+            MatKind::Lossy,
+            [encode_us, packetize_us, 0, 0, 0, 0],
+        );
         self.dirty = false;
         Ok((true, self.last_mat))
     }

@@ -49,7 +49,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use rdma_display_proto::FrameStamp;
+use rdma_display_proto::{FrameStamp, MatKind, MAT_STAGES};
 use rdma_display_rdma::ControlEvent;
 
 /// Rolling sample window for medians/p95.
@@ -60,7 +60,7 @@ const PENDING_CAP: usize = 256;
 /// old UI in each dimension), `COLS` columns, `LINES` lines.
 const FONT_SCALE: usize = 2;
 const COLS: usize = 50;
-const LINES: usize = 11;
+const LINES: usize = 12;
 pub const OVERLAY_W: u32 = ((COLS * 8 + 8) * FONT_SCALE) as u32;
 pub const OVERLAY_H: u32 = ((LINES * 8 + 8) * FONT_SCALE) as u32;
 /// Milliseconds between overlay text refreshes.
@@ -76,10 +76,10 @@ struct Sample {
     // --- server-side durations (same host, exact) ------------------------
     q: u64,     // t0d - t0   capture queue / pacing
     sw: u64,    // t1s - t0d  staging-slot credit wait
-    mat: u64,   // t1 - t1s   materialize
-    blit: u64,  // draw-call latency (from the materializer)
-    read: u64,  // readback DMA (from the materializer)
-    fin: u64,   // fence/glFinish residual (from the materializer)
+    mat: u64,   // t1 - t1s   materialize / encode span
+    /// per-codec breakdown of `mat` (µs) + the labels that belong to it
+    mat_kind: MatKind,
+    mat_us: [u64; MAT_STAGES],
     post: u64,  // t2 - t1    WQE build + post
     xfer: u64,  // t2c - t2   RDMA WRITE as the sender saw it
     // --- client-side durations (same host, exact) ------------------------
@@ -288,9 +288,8 @@ impl Metrics {
                 q,
                 sw,
                 mat,
-                blit: s.blit_us,
-                read: s.read_us,
-                fin: s.fin_us,
+                mat_kind: s.mat.kind,
+                mat_us: s.mat.us,
                 post,
                 xfer,
                 t5: front.t5,
@@ -310,15 +309,13 @@ impl Metrics {
             self.samples.push_back(sample);
             if sample.e2e > SPIKE_E2E_US {
                 eprintln!(
-                    "[metrics-spike] seq={} end-to-end {:.2} ms | queue {:.2} slot {:.2} material {:.2} (blit {:.2} read {:.2} finish {:.2}) | post {:.2} transfer {:.2} | upload {:.2} present {:.2} display {:.2}",
+                    "[metrics-spike] seq={} end-to-end {:.2} ms | queue {:.2} slot {:.2} material {:.2} ({}) | post {:.2} transfer {:.2} | upload {:.2} present {:.2} display {:.2}",
                     sample.seq,
                     sample.e2e as f64 / 1000.0,
                     sample.q as f64 / 1000.0,
                     sample.sw as f64 / 1000.0,
                     sample.mat as f64 / 1000.0,
-                    sample.blit as f64 / 1000.0,
-                    sample.read as f64 / 1000.0,
-                    sample.fin as f64 / 1000.0,
+                    stage_str(sample.mat_kind, &sample.mat_us),
                     sample.post as f64 / 1000.0,
                     sample.xfer as f64 / 1000.0,
                     sample.upl as f64 / 1000.0,
@@ -372,9 +369,23 @@ impl Metrics {
         let (q_m, _) = stat(|s| s.q);
         let (sw_m, _) = stat(|s| s.sw);
         let (mat_m, _) = stat(|s| s.mat);
-        let (b_m, _) = stat(|s| s.blit);
-        let (r_m, _) = stat(|s| s.read);
-        let (f_m, _) = stat(|s| s.fin);
+        // materialize breakdown: use the codec of the most recent sample and
+        // take the median of each populated stage slot independently
+        let kind = self
+            .samples
+            .iter()
+            .next_back()
+            .map(|s| s.mat_kind)
+            .unwrap_or(MatKind::None);
+        let labels = kind.labels();
+        let mut stage_med = [0.0f64; MAT_STAGES];
+        for (i, m) in stage_med.iter_mut().enumerate() {
+            let mut v: Vec<u64> = self.samples.iter().map(|s| s.mat_us[i]).collect();
+            if !v.is_empty() {
+                v.sort_unstable();
+                *m = v[v.len() / 2] as f64 / 1000.0;
+            }
+        }
         let send = |s: &Sample| s.post + s.xfer;
         let (send_m, send_p) = stat(send);
         let (po_m, _) = stat(|s| s.post);
@@ -400,17 +411,42 @@ impl Metrics {
             e2e_m, e2e_p
         ));
         t.push_str(&format!(
-            "\ncapture      p50 {:>6.2}   p95 {:>6.2} ms",
-            cap_m, cap_p
+            "\ncapture ({}) p50 {:>6.2}   p95 {:>6.2} ms",
+            kind.name(),
+            cap_m,
+            cap_p
         ));
         t.push_str(&format!(
             "\n  queue {:>5.2}  slot {:>5.2}  materialize {:>5.2}",
             q_m, sw_m, mat_m
         ));
-        t.push_str(&format!(
-            "\n  blit {:>5.2}  readback {:>5.2}  finish {:>5.2}",
-            b_m, r_m, f_m
-        ));
+        // per-codec stage breakdown; always reserve two lines so the sections
+        // below do not move between modes
+        let mut line = String::from("  ");
+        let mut n = 0usize;
+        let mut emitted = 0usize;
+        for i in 0..MAT_STAGES {
+            if labels[i].is_empty() {
+                continue;
+            }
+            line.push_str(&format!("{} {:>5.2}  ", labels[i], stage_med[i]));
+            n += 1;
+            if n == 3 {
+                t.push('\n');
+                t.push_str(line.trim_end());
+                line = String::from("  ");
+                n = 0;
+                emitted += 1;
+            }
+        }
+        if n > 0 {
+            t.push('\n');
+            t.push_str(line.trim_end());
+            emitted += 1;
+        }
+        for _ in emitted..2 {
+            t.push('\n');
+        }
         t.push_str(&format!(
             "\nserver send  p50 {:>6.2}   p95 {:>6.2} ms",
             send_m, send_p
@@ -466,6 +502,20 @@ fn set_disp(s: &mut Sample, presented: u64) {
         s.e2e = s.e2e.saturating_sub(s.disp).saturating_add(d);
         s.disp = d;
     }
+}
+
+/// Render a sample's materialize breakdown with its codec's labels, e.g.
+/// `" activate 0.01 encode 2.07 ref 0.08"`. Used by the spike line.
+fn stage_str(kind: MatKind, us: &[u64; MAT_STAGES]) -> String {
+    let labels = kind.labels();
+    let mut s = String::new();
+    for i in 0..MAT_STAGES {
+        if labels[i].is_empty() {
+            continue;
+        }
+        s.push_str(&format!(" {} {:.2}", labels[i], us[i] as f64 / 1000.0));
+    }
+    s
 }
 
 /// Headless (`--output none`) one-line stats print for `--metrics`.
@@ -679,6 +729,7 @@ const RAW: [[u8; 8]; 128] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rdma_display_proto::MatTimes;
     use rdma_display_rdma::ControlEvent;
 
     fn stamp(seq: u64) -> FrameStamp {
@@ -690,9 +741,7 @@ mod tests {
             t1: 3_000,
             t2: 3_050,
             t2c: 5_050,
-            blit_us: 100,
-            read_us: 1_500,
-            fin_us: 50,
+            mat: MatTimes::new(MatKind::Raw, [100, 1_500, 50, 0, 0, 0]),
             meta_gen: 0,
         }
     }
@@ -778,5 +827,36 @@ mod tests {
             assert!(n <= COLS, "overlay line {n} > {COLS} cols: {line:?}");
         }
         assert_eq!(t.matches('\n').count(), LINES - 1);
+    }
+
+    /// The materialize breakdown must use the codec's own stage labels, not a
+    /// fixed raw-oriented set (lossless used to render its whole GPU encode
+    /// under "blit" with "readback 0.00").
+    #[test]
+    fn breakdown_is_labeled_per_codec() {
+        let mut m = Metrics::new();
+        m.record(1, 10_000, 10_200, 10_500, Some(7));
+        let mut s = stamp(1);
+        s.mat = MatTimes::new(MatKind::Lossless, [11, 0, 2069, 77, 2, 23]);
+        m.on_control(ControlEvent::Stamp(s));
+        let t = m.refresh().expect("text changed");
+        assert!(t.contains("capture (lossless)"), "{t}");
+        for want in ["activate", "encode", "ref", "copy", "restore"] {
+            assert!(t.contains(want), "missing {want:?} in:\n{t}");
+        }
+        assert!(!t.contains("readback"), "raw label leaked into lossless:\n{t}");
+    }
+
+    /// The raw (EGL) materializer keeps its blit/readback/sync split.
+    #[test]
+    fn raw_breakdown_is_labeled() {
+        let mut m = Metrics::new();
+        m.record(1, 10_000, 10_200, 10_500, Some(7));
+        m.on_control(ControlEvent::Stamp(stamp(1)));
+        let t = m.refresh().expect("text changed");
+        assert!(t.contains("capture (raw)"), "{t}");
+        for want in ["blit", "readback", "sync"] {
+            assert!(t.contains(want), "missing {want:?} in:\n{t}");
+        }
     }
 }

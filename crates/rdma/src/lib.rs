@@ -849,9 +849,7 @@ impl ServerLink {
             t1,
             t2,
             t2c,
-            blit_us: mat_times.blit_us,
-            read_us: mat_times.read_us,
-            fin_us: mat_times.fin_us,
+            mat: mat_times,
             meta_gen: self.meta_gen,
         };
         if let Err(e) = proto::send_msg(w, &Message::Stamp(s)) {

@@ -11,7 +11,7 @@ pub mod gamepad;
 pub mod keymap;
 
 pub const MAGIC: u32 = 0x5244_4453; // "RDDS"
-pub const VERSION: u32 = 10; // v10: transport negotiation (RDMA/TCP video)
+pub const VERSION: u32 = 11; // v11: per-codec MatTimes stage breakdown in the frame stamp
 
 /// First byte of every connection, so the server routes by an explicit tag
 /// rather than by guessing protocol bytes. Audio uses
@@ -66,7 +66,7 @@ pub enum MsgType {
 ///   t0  = capture event latched (QEMU D-Bus arrival / DRM scanout poll)
 ///   t0d = the sender picked the frame up (pacing + event-queue wait done)
 ///   t1s = a staging slot was available (after any credit wait)
-///   t1  = materializer readback finished (slot holds the pixels)
+///   t1  = the capture → staging-slot work finished (slot holds payload bytes)
 ///   t2  = RDMA WRITE posted
 ///   t2c = send CQ reported the WRITE fully written on the client —
 ///         the true transfer time is `t2c - t2`, same-host (no clock skew)
@@ -85,39 +85,102 @@ pub struct FrameStamp {
     pub t1: u64,
     pub t2: u64,
     pub t2c: u64,
-    /// materializer stage times of this frame (µs, all server-local,
-    /// wall-clock split): blit = draw-call latency (the draw is queued, not
-    /// awaited), read = GPU round trip from draw-queued to pixels-in-host-RAM
-    /// (blit execution + readback DMA + driver delivery), fin = residual
-    /// glFinish
-    pub blit_us: u64,
-    pub read_us: u64,
-    pub fin_us: u64,
+    /// breakdown of the `t1 - t1s` span (the capture → staging-slot work),
+    /// tagged with the codec/materializer that produced it: see [`MatTimes`].
+    pub mat: MatTimes,
     /// which `DisplayMeta` generation this frame was produced with (see
     /// `Message::Meta`). Mid-session meta changes are not yet negotiated, so
     /// this is 0 today; it makes the frame↔meta association explicit.
     pub meta_gen: u32,
 }
 
-/// Materializer stage times for one frame (µs, server-local wall clock,
-/// coarse split — the draw is queued, not awaited, so these are CPU stamps):
-///   blit = glDrawArrays return (CPU call latency)
-///   read = glReadPixels return: GPU round trip from draw-queued to
-///          pixels-in-host-RAM (draw execution + readback DMA + delivery)
-///   fin  = glFinish residual drain
+/// Stages in a [`MatTimes`] breakdown. Six slots; the meaning of `us[i]` is
+/// given by [`MatKind::labels`] (unused slots are zero).
+pub const MAT_STAGES: usize = 6;
+
+/// Which capture path produced a frame, so its stage labels are unambiguous.
+/// Every codec has a *different* set of stages inside the `t1 - t1s` span;
+/// reporting them under one fixed label was actively misleading — lossless's
+/// whole GPU encode used to surface as "blit" with "readback 0.00".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MatKind {
+    /// No breakdown (plain host-memory / QEMU materializer).
+    None = 0,
+    /// EGL dmabuf materializer (`raw`): shader blit → glReadPixels → sync.
+    Raw = 1,
+    /// GPU lossless (codec-gpu): texture-direct, or readback + encode.
+    Lossless = 2,
+    /// PyroWave lossy materializer.
+    Lossy = 3,
+}
+
+impl MatKind {
+    pub fn from_u8(v: u8) -> MatKind {
+        match v {
+            1 => MatKind::Raw,
+            2 => MatKind::Lossless,
+            3 => MatKind::Lossy,
+            _ => MatKind::None,
+        }
+    }
+
+    /// Short name for logs and the metrics overlay.
+    pub fn name(self) -> &'static str {
+        match self {
+            MatKind::None => "plain",
+            MatKind::Raw => "raw",
+            MatKind::Lossless => "lossless",
+            MatKind::Lossy => "lossy",
+        }
+    }
+
+    /// Short human labels for `MatTimes::us`, in order; `""` = unused slot.
+    pub fn labels(self) -> [&'static str; MAT_STAGES] {
+        match self {
+            MatKind::None => ["", "", "", "", "", ""],
+            // blit = shader blit (detile + channel normalize); readback =
+            // glReadPixels into the staging PBO; sync = EGL fence / glFinish.
+            // NB with a single reused FBO the draw can block on the previous
+            // frame's readback, in which case that backpressure lands here.
+            MatKind::Raw => ["blit", "readback", "sync", "", "", ""],
+            // texture-direct GPU lossless: activate = make the codec's EGL
+            // context current; blit = optional source blit (0 on the
+            // external-sampler path); encode = dispatch + glFinish (reads the
+            // scanout, XORs tiles, codes changes); ref = advance the delta
+            // reference; copy = coded bytes into the slot; restore = make the
+            // materializer's context current again.
+            MatKind::Lossless => ["activate", "blit", "encode", "ref", "copy", "restore"],
+            // encode = PyroWave GPU encode; packetize = packet framing + copy
+            // into the slot. (The Vulkan dmabuf import happens in prepare,
+            // before the t1s stamp, so it is not part of this span.)
+            MatKind::Lossy => ["encode", "packetize", "", "", "", ""],
+        }
+    }
+}
+
+/// Per-codec stage breakdown of the `t1 - t1s` span (µs, all server-local).
+/// `kind` selects the meaning of `us`; see [`MatKind::labels`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MatTimes {
-    pub blit_us: u64,
-    pub read_us: u64,
-    pub fin_us: u64,
+    pub kind: MatKind,
+    pub us: [u64; MAT_STAGES],
 }
 
 impl MatTimes {
     pub const ZERO: MatTimes = MatTimes {
-        blit_us: 0,
-        read_us: 0,
-        fin_us: 0,
+        kind: MatKind::None,
+        us: [0; MAT_STAGES],
     };
+
+    pub fn new(kind: MatKind, us: [u64; MAT_STAGES]) -> Self {
+        MatTimes { kind, us }
+    }
+
+    /// Sum of the populated stages (the whole `t1 - t1s` span).
+    pub fn total(&self) -> u64 {
+        self.us.iter().sum()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -353,7 +416,7 @@ pub fn send_msg<T: Write>(io: &mut T, msg: &Message) -> std::io::Result<()> {
         Message::Stamp(s) => (
             MsgType::Stamp as u32,
             {
-                let mut v = Vec::with_capacity(84);
+                let mut v = Vec::with_capacity(112);
                 v.extend_from_slice(&s.seq.to_le_bytes());
                 v.extend_from_slice(&s.t0.to_le_bytes());
                 v.extend_from_slice(&s.t0d.to_le_bytes());
@@ -361,9 +424,10 @@ pub fn send_msg<T: Write>(io: &mut T, msg: &Message) -> std::io::Result<()> {
                 v.extend_from_slice(&s.t1.to_le_bytes());
                 v.extend_from_slice(&s.t2.to_le_bytes());
                 v.extend_from_slice(&s.t2c.to_le_bytes());
-                v.extend_from_slice(&s.blit_us.to_le_bytes());
-                v.extend_from_slice(&s.read_us.to_le_bytes());
-                v.extend_from_slice(&s.fin_us.to_le_bytes());
+                v.push(s.mat.kind as u8);
+                for u in s.mat.us {
+                    v.extend_from_slice(&u.to_le_bytes());
+                }
                 v.extend_from_slice(&s.meta_gen.to_le_bytes());
                 v
             },
@@ -517,11 +581,18 @@ impl<T: Read + Write> Conn<T> {
             t if t == MsgType::Bye as u32 => Message::Bye(u32_at(&payload, 0)?),
             t if t == MsgType::Input as u32 => Message::Input(InputEvent::decode(&payload)?),
             t if t == MsgType::Stamp as u32 => {
-                if payload.len() < 84 {
+                // 56 bytes of stamps + kind + 6 stage u64s + meta_gen
+                const STAMP_LEN: usize = 56 + 1 + MAT_STAGES * 8 + 4;
+                if payload.len() < STAMP_LEN {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "short stamp payload",
                     ));
+                }
+                let mut us = [0u64; MAT_STAGES];
+                for (i, u) in us.iter_mut().enumerate() {
+                    let o = 57 + i * 8;
+                    *u = u64::from_le_bytes(payload[o..o + 8].try_into().unwrap());
                 }
                 Message::Stamp(FrameStamp {
                     seq: u64::from_le_bytes(payload[0..8].try_into().unwrap()),
@@ -531,10 +602,11 @@ impl<T: Read + Write> Conn<T> {
                     t1: u64::from_le_bytes(payload[32..40].try_into().unwrap()),
                     t2: u64::from_le_bytes(payload[40..48].try_into().unwrap()),
                     t2c: u64::from_le_bytes(payload[48..56].try_into().unwrap()),
-                    blit_us: u64::from_le_bytes(payload[56..64].try_into().unwrap()),
-                    read_us: u64::from_le_bytes(payload[64..72].try_into().unwrap()),
-                    fin_us: u64::from_le_bytes(payload[72..80].try_into().unwrap()),
-                    meta_gen: u32::from_le_bytes(payload[80..84].try_into().unwrap()),
+                    mat: MatTimes {
+                        kind: MatKind::from_u8(payload[56]),
+                        us,
+                    },
+                    meta_gen: u32::from_le_bytes(payload[105..109].try_into().unwrap()),
                 })
             }
             t if t == MsgType::Ping as u32 => {
@@ -604,9 +676,7 @@ mod tests {
                 t1: 1_700_000_000_002_456,
                 t2: 1_700_000_000_002_789,
                 t2c: 1_700_000_000_004_000,
-                blit_us: 980,
-                read_us: 11_120,
-                fin_us: 680,
+                mat: MatTimes::new(MatKind::Lossless, [11, 0, 2069, 77, 2, 23]),
                 meta_gen: 2,
             }),
             Message::Ping(1_700_000_000_003_111),

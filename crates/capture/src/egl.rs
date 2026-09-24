@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use rdma_display_proto::MatTimes;
+use rdma_display_proto::{MatKind, MatTimes};
 
 use crate::{CaptureEvent, DmabufScanout, FrameFormat, FrameMaterializer};
 
@@ -965,11 +965,10 @@ impl crate::FrameMaterializer for EglMaterializer {
                     };
                     (self.gl.bind_buffer)(GL_PIXEL_PACK_BUFFER, 0);
                     let _ = i;
-                    self.last_mat = MatTimes {
-                        blit_us: blit.as_micros() as u64,
-                        read_us: read.as_micros() as u64,
-                        fin_us: fin.as_micros() as u64,
-                    };
+                    self.last_mat = MatTimes::new(
+                        MatKind::Raw,
+                        [blit.as_micros() as u64, read.as_micros() as u64, fin.as_micros() as u64, 0, 0, 0],
+                    );
                 }
                 None => {
                     (self.gl.read_pixels)(
@@ -984,11 +983,17 @@ impl crate::FrameMaterializer for EglMaterializer {
                     let t_after_read = t0.elapsed(); // draw queued + readback DMA done
                     (self.gl.finish)(); // v1 sync; QEMU Fence-based sync comes later
                     let total = t0.elapsed();
-                    self.last_mat = MatTimes {
-                        blit_us: blit.as_micros() as u64,
-                        read_us: (t_after_read - blit).as_micros() as u64,
-                        fin_us: (total - t_after_read).as_micros() as u64,
-                    };
+                    self.last_mat = MatTimes::new(
+                        MatKind::Raw,
+                        [
+                            blit.as_micros() as u64,
+                            (t_after_read - blit).as_micros() as u64,
+                            (total - t_after_read).as_micros() as u64,
+                            0,
+                            0,
+                            0,
+                        ],
+                    );
                 }
             }
             let gl_err = (self.gl.get_error)();
@@ -1077,11 +1082,10 @@ impl crate::FrameMaterializer for EglMaterializer {
             if r != EGL_CONDITION_SATISFIED_KHR as i32 {
                 bail!("finish_frame: EGL fence wait failed ({r:#06x})");
             }
-            self.last_mat = MatTimes {
-                blit_us: work.blit_us,
-                read_us: work.read_us,
-                fin_us: t1.elapsed().as_micros() as u64,
-            };
+            self.last_mat = MatTimes::new(
+                MatKind::Raw,
+                [work.blit_us, work.read_us, t1.elapsed().as_micros() as u64, 0, 0, 0],
+            );
         }
         let _ = create;
         Ok((true, self.last_mat))
@@ -2227,8 +2231,8 @@ unsafe fn bench_event_mode(
                 mat.mark_dirty();
                 let (_, mt) = mat.copy_frame(&mut scratch)?;
                 v0s.push(BSample {
-                    issue_us: mt.blit_us,
-                    sync_us: mt.read_us + mt.fin_us,
+                    issue_us: mt.us[0],
+                    sync_us: mt.us[1] + mt.us[2],
                 });
                 let v0_sum = bench_checksum(&scratch);
                 // C: PBO read of the same content
@@ -2369,8 +2373,8 @@ pub fn run_readback_bench(
         mat.mark_dirty();
         let (_, mt) = mat.copy_frame(&mut base)?;
         samples.push(BSample {
-            issue_us: mt.blit_us,
-            sync_us: mt.read_us + mt.fin_us,
+            issue_us: mt.us[0],
+            sync_us: mt.us[1] + mt.us[2],
         });
     }
     let chk: VCheck = (

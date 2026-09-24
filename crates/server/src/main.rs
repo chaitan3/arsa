@@ -1282,15 +1282,22 @@ impl FrameCodec {
             );
             self.stat_buf.clear();
         }
-        let us = (act + blit + enc + rf + copy).as_micros() as u64;
         Ok((
             changed,
             n,
-            rdma_display_proto::MatTimes {
-                blit_us: us,
-                read_us: 0,
-                fin_us: 0,
-            },
+            rdma_display_proto::MatTimes::new(
+                rdma_display_proto::MatKind::Lossless,
+                [
+                    act.as_micros() as u64,
+                    blit.as_micros() as u64,
+                    enc.as_micros() as u64,
+                    rf.as_micros() as u64,
+                    copy.as_micros() as u64,
+                    // context restore is measured after this returns; report the
+                    // running value (same staleness as the p50 line above)
+                    self.mat_activate_us,
+                ],
+            ),
         ))
     }
 
