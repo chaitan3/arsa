@@ -269,8 +269,9 @@ fn texture_encode(geom: Geometry, frames: &[Vec<u32>]) -> Result<()> {
         ssbo.update_reference()?;
     }
     eprintln!(
-        "[texture] {} frames: image-input encode bit-identical to SSBO encode; steady delta {:.2} ms",
+        "[texture] {} frames: image-input encode bit-identical to SSBO encode; full {:.2} ms, steady delta {:.2} ms",
         frames.len(),
+        tex_us[0],
         tex_us[1..].iter().sum::<f64>() / (tex_us.len() - 1) as f64
     );
     Ok(())
@@ -327,8 +328,10 @@ fn external_encode(geom: Geometry, frames: &[Vec<u32>]) -> Result<()> {
     }
     let d = |v: &[f64]| v[1..].iter().sum::<f64>() / (v.len() - 1) as f64;
     eprintln!(
-        "[external] {} frames bit-identical to SSBO encode | steady delta: direct ext {:.2} ms, blit+image {:.2} ms",
+        "[external] {} frames bit-identical to SSBO encode | full {:.2}/{:.2} ms, steady delta: direct ext {:.2} ms, blit+image {:.2} ms",
         frames.len(),
+        ext_us[0],
+        path_us[0],
         d(&ext_us),
         d(&path_us)
     );
@@ -368,8 +371,9 @@ fn fetch_encode(geom: Geometry, frames: &[Vec<u32>]) -> Result<()> {
         // fetch writes its reference in-pass (see ENC_FETCH_SRC)
     }
     eprintln!(
-        "[fetch] {} frames bit-identical to SSBO encode | steady delta {:.2} ms (sampler2D texelFetch)",
+        "[fetch] {} frames bit-identical to SSBO encode | full {:.2} ms, steady delta {:.2} ms (sampler2D texelFetch)",
         frames.len(),
+        us[0],
         us[1..].iter().sum::<f64>() / (us.len() - 1) as f64
     );
     Ok(())
@@ -499,49 +503,61 @@ fn gbm_read_bench(geom: Geometry) -> Result<()> {
                 bo_destroy(bo);
                 continue;
             }
-            // 10-frame sequence on the *same* imported dma-buf:
-            //   frame 0  = full encode (all tiles coded) — the 5 ms case
-            //   frames 1..9 = deltas in which a handful of tiles "changed". We
-            //                 simulate that by poking those tiles in the
-            //                 reference, which is equivalent to the source
-            //                 having changed there and avoids writing the
-            //                 (tiled) BO. Only those tiles' payload leaves the
-            //                 GPU, so a delta must be cheap.
+            // Measure the two regimes that matter, on the same imported BO:
+            //   full  = every tile coded (a full-damage frame): coded ≈ raw, so
+            //           the payload write dominates — the expensive case
+            //   delta = k tiles changed: only those tiles' payload leaves the
+            //           GPU — the steady-state case
+            // A "changed" tile is simulated by poking one word of it in the
+            // reference (equivalent to the source changing there, and it avoids
+            // writing the tiled BO). The shader resets it in-pass each time.
+            //
+            // frame 0 is the first encode after import (cold); the following
+            // full frames are warm, and only those are comparable to a server
+            // steady state.
             gpu.sync();
             let t = Instant::now();
             let n_full = gpu.encode_ext(true)?;
-            let full_ms = t.elapsed().as_secs_f64() * 1e3;
+            let cold_full = t.elapsed().as_secs_f64() * 1e3;
             let p50 = |v: &mut Vec<f64>| {
                 v.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 v[v.len() / 2]
             };
+            let mut full_v = Vec::new();
+            for _ in 0..5 {
+                gpu.sync();
+                let t = Instant::now();
+                gpu.encode_ext(true)?;
+                full_v.push(t.elapsed().as_secs_f64() * 1e3);
+            }
             let stride_px = geom.width as usize; // bench geometry: stride = width*4
             let tiles_x = geom.tiles_x() as usize;
-            let poke_tiles = [0usize, 7, 63, 64, 511, 1000, 1500, 2047];
-            let mut deltas = Vec::new();
-            let mut coded = Vec::new();
-            for _ in 1..10 {
-                for &tid in &poke_tiles {
+            fn poke(gpu: &GpuCodec, k: usize, stride_px: usize, tiles_x: usize) {
+                for tid in 0..k {
                     let (tx, ty) = (tid % tiles_x, tid / tiles_x);
                     let at = (ty * 64) * stride_px + tx * 64;
                     gpu.debug_poke_reference(at, &[0xdead_beefu32]);
                 }
+            }
+            let mut curve = Vec::new();
+            for k in [8usize, 256, 1024, 2040] {
+                poke(&gpu, k, stride_px, tiles_x);
                 gpu.sync();
                 let t = Instant::now();
                 let n = gpu.encode_ext(false)?;
-                deltas.push(t.elapsed().as_secs_f64() * 1e3);
-                coded.push(n);
+                curve.push((k, t.elapsed().as_secs_f64() * 1e3, n));
             }
             eprintln!(
-                "[gbm] {name:13} modifier=0x{:016x} stride={:6} | frame0 full {:.2} ms ({} B) | delta p50 {:.2} ms over frames 1..9 ({} tiles changed, coded {} B)",
+                "[gbm] {name:13} modifier=0x{:016x} stride={:6} | frame0 full {:.2} ms (cold, {} B) | full warm p50 {:.2} ms",
                 img.modifier,
                 img.stride,
-                full_ms,
+                cold_full,
                 n_full,
-                p50(&mut deltas),
-                poke_tiles.len(),
-                coded[coded.len() / 2],
+                p50(&mut full_v),
             );
+            for (k, ms, n) in &curve {
+                eprintln!("[gbm]     {:4} tiles changed -> {:6.2} ms ({:8} B coded)", k, ms, n);
+            }
             bo_destroy(bo);
         }
         device_destroy(dev);
