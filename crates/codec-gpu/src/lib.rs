@@ -49,6 +49,10 @@ const EGL_DMA_BUF_PLANE0_OFFSET_EXT: i32 = 0x3273;
 const EGL_DMA_BUF_PLANE0_PITCH_EXT: i32 = 0x3274;
 const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: i32 = 0x3443;
 const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: i32 = 0x3444;
+// EGL_KHR_gl_texture_2D_image (benchmark hook: wrap a GL texture as an image)
+const EGL_GL_TEXTURE_2D_KHR: u32 = 0x30B1;
+const EGL_IMAGE_PRESERVED_KHR: i32 = 0x30D2;
+const EGL_TRUE: i32 = 1;
 
 const GL_TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
 const GL_TEXTURE0: u32 = 0x84C0;
@@ -267,6 +271,14 @@ pub struct DmabufImage {
     pub height: u32,
 }
 
+/// A cached dmabuf import (EGLImage + texture target).
+struct SrcImport {
+    key: (i32, u32, u32, u32, u64, u32, u32),
+    img: Handle,
+    tex: u32,
+    linear: bool,
+}
+
 /// GPU codec instance: owns the EGL context and the SSBOs.
 pub struct GpuCodec {
     geom: Geometry,
@@ -284,6 +296,14 @@ pub struct GpuCodec {
     /// blit program + program that encodes from the source image
     blit_prog: u32,
     enc_tex_prog: u32,
+    /// program that samples the imported external texture directly in compute
+    /// (no blit / intermediate image); 0 = unsupported by the driver
+    enc_ext_prog: u32,
+    /// program that reads the source as a normal `sampler2D` (texelFetch); used
+    /// when the scanout is linear and can bind to `GL_TEXTURE_2D`
+    enc_fetch_prog: u32,
+    /// source bound as `GL_TEXTURE_2D` (linear scanout) or 0
+    direct_img: u32,
     cur: u32,
     reference: u32,
     coded: u32,
@@ -294,7 +314,12 @@ pub struct GpuCodec {
     src_img: u32,
     src_fbo: u32,
     src_egl_image: Handle,
+    /// test hook only: the `GL_TEXTURE_2D` behind a benchmark EGLImage
+    src_tex2d: u32,
     has_scanout: bool,
+    /// cached dmabuf imports, keyed so a repeated scanout buffer isn't
+    /// re-imported (the import enqueues ~3 ms of GPU work for 4K — measured)
+    src_cache: Vec<SrcImport>,
     coded_map: *mut u8,
     coded_len: usize,
     counter_map: *mut u32,
@@ -425,6 +450,20 @@ impl GpuCodec {
             let dec_prog = build_program(&gl, &dec_src())?;
             let blit_prog = build_graphics_program(&gl, BLIT_VS, BLIT_FS)?;
             let enc_tex_prog = build_program(&gl, ENC_TEX_SRC)?;
+            // Sampling an imported external texture from a compute shader is
+            // the fast path (no blit). Not all drivers allow it; if the shader
+            // does not compile we keep the blit + image path.
+            let enc_ext_prog = match build_program(&gl, ENC_EXT_SRC) {
+                Ok(p) => {
+                    eprintln!("[gpu] external-texture compute encode available (no blit)");
+                    p
+                }
+                Err(e) => {
+                    eprintln!("[gpu] external-texture compute encode unavailable ({e:#}); using blit path");
+                    0
+                }
+            };
+            let enc_fetch_prog = build_program(&gl, ENC_FETCH_SRC)?;
 
             let frame_bytes = geom.frame_bytes();
             let index_cap = geom.tile_count();
@@ -535,6 +574,9 @@ impl GpuCodec {
                 dec_prog,
                 blit_prog,
                 enc_tex_prog,
+                enc_ext_prog,
+                enc_fetch_prog,
+                direct_img: 0,
                 cur,
                 reference,
                 coded,
@@ -543,7 +585,9 @@ impl GpuCodec {
                 src_img,
                 src_fbo,
                 src_egl_image: std::ptr::null_mut(),
+                src_tex2d: 0,
                 has_scanout: false,
+                src_cache: Vec::new(),
                 coded_map: coded_map as *mut u8,
                 coded_len,
                 counter_map: counter_map as *mut u32,
@@ -603,14 +647,22 @@ impl GpuCodec {
         self.last_count
     }
 
-    /// Import (or re-import) a scanout dmabuf as an external texture and blit
-    /// it into the RGBA8 source image, so [`encode_tex`](Self::encode_tex)
-    /// encodes straight from GPU memory — no full-frame readback to host and no
-    /// re-upload. Makes the codec's EGL context current itself. Errors (missing
-    /// `EGL_EXT_image_dma_buf_import`, unsupported modifier, ...) are returned
-    /// so the caller can fall back to the readback+upload path.
+    /// Import a scanout dmabuf for direct encoding, caching the import so a
+    /// previously seen buffer is not re-imported. `eglCreateImageKHR` +
+    /// `glEGLImageTargetTexture2DOES` enqueue ~3 ms of GPU work for 4K on this
+    /// driver (measured), so re-importing every frame dominates the encode. A
+    /// linear scanout binds as `GL_TEXTURE_2D` (texelFetch, fast); a tiled one
+    /// as `GL_TEXTURE_EXTERNAL_OES`. Makes the codec's EGL context current.
     pub fn set_scanout(&mut self, d: &DmabufImage) -> Result<()> {
         self.activate()?;
+        let key = (d.fd, d.offset, d.stride, d.fourcc, d.modifier, d.width, d.height);
+        if let Some(e) = self.src_cache.iter().find(|e| e.key == key) {
+            self.src_egl_image = e.img;
+            self.src_tex = e.tex;
+            self.direct_img = if e.linear { e.tex } else { 0 };
+            self.has_scanout = true;
+            return Ok(());
+        }
         let create = self
             .create_image
             .context("no eglCreateImageKHR (EGL_EXT_image_dma_buf_import absent)")?;
@@ -619,21 +671,6 @@ impl GpuCodec {
             .gl
             .image_target_texture
             .context("no glEGLImageTargetTexture2DOES")?;
-
-        // release the previous import (unbind before deleting either object)
-        if !self.src_egl_image.is_null() {
-            unsafe {
-                (self.gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, 0);
-                if self.src_tex != 0 {
-                    let t = [self.src_tex];
-                    (self.gl.delete_textures)(1, t.as_ptr());
-                }
-                (destroy)(self.dpy, self.src_egl_image);
-            }
-            self.src_egl_image = std::ptr::null_mut();
-            self.src_tex = 0;
-            self.has_scanout = false;
-        }
 
         let attrs: [i32; 17] = [
             EGL_WIDTH,
@@ -671,36 +708,159 @@ impl GpuCodec {
         unsafe {
             let mut t = [0u32; 1];
             (self.gl.gen_textures)(1, t.as_mut_ptr());
-            (self.gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, t[0]);
-            (itt)(GL_TEXTURE_EXTERNAL_OES, img);
-            (self.gl.tex_parameteri)(
-                GL_TEXTURE_EXTERNAL_OES,
-                GL_TEXTURE_MIN_FILTER,
-                GL_NEAREST as i32,
-            );
-            (self.gl.tex_parameteri)(
-                GL_TEXTURE_EXTERNAL_OES,
-                GL_TEXTURE_MAG_FILTER,
-                GL_NEAREST as i32,
-            );
-            (self.gl.tex_parameteri)(
-                GL_TEXTURE_EXTERNAL_OES,
-                GL_TEXTURE_WRAP_S,
-                GL_CLAMP_TO_EDGE as i32,
-            );
-            (self.gl.tex_parameteri)(
-                GL_TEXTURE_EXTERNAL_OES,
-                GL_TEXTURE_WRAP_T,
-                GL_CLAMP_TO_EDGE as i32,
-            );
+            let tex = t[0];
+            // A LINEAR scanout binds as a normal GL_TEXTURE_2D, which the
+            // encode reads with texelFetch (~0.17 ms for 4K). Tiled modifiers
+            // must go through GL_TEXTURE_EXTERNAL_OES, whose sampler costs
+            // ~3.3 ms for 4K on this driver (measured; see codecbench).
+            let linear = d.modifier == 0;
+            let target = if linear {
+                GL_TEXTURE_2D
+            } else {
+                GL_TEXTURE_EXTERNAL_OES
+            };
+            (self.gl.bind_texture)(target, tex);
+            (itt)(target, img);
+            (self.gl.tex_parameteri)(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST as i32);
+            (self.gl.tex_parameteri)(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST as i32);
+            if !linear {
+                (self.gl.tex_parameteri)(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE as i32);
+                (self.gl.tex_parameteri)(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE as i32);
+            }
             let err = (self.gl.get_error)();
             if err != 0 {
                 (destroy)(self.dpy, img);
-                bail!("EGLImage -> external texture glError 0x{err:04x}");
+                bail!("EGLImage -> texture {target:#x} glError 0x{err:04x}");
             }
-            self.src_tex = t[0];
+            self.src_tex = tex;
+            self.direct_img = if linear { tex } else { 0 };
         }
         self.src_egl_image = img;
+        self.has_scanout = true;
+        // keep the import cached (bounded) so a repeat of this buffer is a
+        // lookup, not a re-import; evict the oldest non-current entry
+        let tex = self.src_tex;
+        self.src_cache.push(SrcImport {
+            key,
+            img,
+            tex,
+            linear: self.direct_img != 0,
+        });
+        while self.src_cache.len() > 4 {
+            match self.src_cache.iter().position(|e| e.img != self.src_egl_image) {
+                Some(i) => {
+                    let e = self.src_cache.remove(i);
+                    unsafe {
+                        if e.tex != 0 {
+                            let t = [e.tex];
+                            (self.gl.delete_textures)(1, t.as_ptr());
+                        }
+                        (destroy)(self.dpy, e.img);
+                    }
+                }
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Test/benchmark hook: make the encode source a `GL_TEXTURE_2D` built from
+    /// `frame` (wire bytes), wrapped as an EGLImage external texture via
+    /// `EGL_KHR_gl_texture_2D_image`. No dmabuf needed, so the external-sample
+    /// shader (`encode_ext`) can be validated and timed headlessly. The
+    /// sampling cost is optimistic vs a tiled/compressed dmabuf, but the
+    /// shader's memory/instruction behaviour is the same.
+    pub fn set_scanout_test_frame(&mut self, frame: &[u8], linear: bool) -> Result<()> {
+        assert_eq!(frame.len(), self.frame_bytes);
+        self.activate()?;
+        let create = self
+            .create_image
+            .context("no eglCreateImageKHR (EGL_KHR_gl_texture_2D_image absent)")?;
+        let destroy = self.destroy_image.context("no eglDestroyImageKHR")?;
+        let itt = self
+            .gl
+            .image_target_texture
+            .context("no glEGLImageTargetTexture2DOES")?;
+
+        // release the previous import (external texture, image, 2D texture)
+        if !self.src_egl_image.is_null() {
+            unsafe {
+                (self.gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, 0);
+                (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
+                if self.src_tex != 0 {
+                    let t = [self.src_tex];
+                    (self.gl.delete_textures)(1, t.as_ptr());
+                }
+                (destroy)(self.dpy, self.src_egl_image);
+                if self.src_tex2d != 0 {
+                    let t = [self.src_tex2d];
+                    (self.gl.delete_textures)(1, t.as_ptr());
+                }
+            }
+            self.src_egl_image = std::ptr::null_mut();
+            self.src_tex = 0;
+            self.src_tex2d = 0;
+            self.has_scanout = false;
+        }
+
+        let (w, h) = (self.geom.width as i32, self.geom.height as i32);
+        let tex2d = unsafe {
+            let mut t = [0u32; 1];
+            (self.gl.gen_textures)(1, t.as_mut_ptr());
+            (self.gl.bind_texture)(GL_TEXTURE_2D, t[0]);
+            (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST as i32);
+            (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST as i32);
+            (self.gl.tex_storage_2d)(GL_TEXTURE_2D, 1, GL_RGBA8, w, h);
+            (self.gl.tex_sub_image_2d)(
+                GL_TEXTURE_2D,
+                0,
+                0,
+                0,
+                w,
+                h,
+                GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                frame.as_ptr() as *const c_void,
+            );
+            // finish the upload outside the caller's timed region
+            (self.gl.finish)();
+            t[0]
+        };
+        let attrs = [EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE];
+        let img = unsafe {
+            (create)(
+                self.dpy,
+                self.ctx,
+                EGL_GL_TEXTURE_2D_KHR,
+                tex2d as usize as Handle,
+                attrs.as_ptr(),
+            )
+        };
+        if img.is_null() {
+            let e = self.egl_get_error.map(|f| unsafe { f() }).unwrap_or(0);
+            bail!("eglCreateImageKHR(GL_TEXTURE_2D) failed (err {e:#06x})");
+        }
+        unsafe {
+            let mut t = [0u32; 1];
+            (self.gl.gen_textures)(1, t.as_mut_ptr());
+            let target = if linear {
+                GL_TEXTURE_2D
+            } else {
+                GL_TEXTURE_EXTERNAL_OES
+            };
+            (self.gl.bind_texture)(target, t[0]);
+            (itt)(target, img);
+            (self.gl.tex_parameteri)(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST as i32);
+            (self.gl.tex_parameteri)(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST as i32);
+            let err = (self.gl.get_error)();
+            if err != 0 {
+                bail!("test external texture glError 0x{err:04x}");
+            }
+            self.src_tex = t[0];
+            self.direct_img = if linear { t[0] } else { 0 };
+        }
+        self.src_egl_image = img;
+        self.src_tex2d = tex2d;
         self.has_scanout = true;
         Ok(())
     }
@@ -767,6 +927,125 @@ impl GpuCodec {
             }
         }
         Ok(n)
+    }
+
+    /// True when the driver can sample the imported external texture directly
+    /// in compute, so no blit is needed.
+    pub fn has_ext_encode(&self) -> bool {
+        self.enc_ext_prog != 0
+    }
+
+    /// Encode straight from the imported external texture — no blit, no
+    /// intermediate RGBA8 image. Requires `set_scanout`.
+    pub fn encode_ext(&mut self, full: bool) -> Result<usize> {
+        if !self.has_scanout {
+            bail!("encode_ext: no scanout imported");
+        }
+        if self.enc_ext_prog == 0 {
+            bail!("encode_ext: external-texture compute encode unavailable");
+        }
+        unsafe {
+            (self.gl.get_error)(); // clear any stale error
+            (self.gl.use_program)(self.enc_ext_prog);
+            (self.gl.active_texture)(GL_TEXTURE0);
+            (self.gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, self.src_tex);
+            let c = CString::new("u_src").unwrap();
+            let loc = (self.gl.get_uniform_location)(self.enc_ext_prog, c.as_ptr() as *const u8);
+            if loc >= 0 {
+                (self.gl.uniform1i)(loc, 0);
+            }
+            let e = (self.gl.get_error)();
+            if e != 0 {
+                bail!("encode_ext: bind external texture glError 0x{e:04x}");
+            }
+        }
+        let prog = self.enc_ext_prog;
+        let n = self.encode_with(prog, full)?;
+        unsafe {
+            let e = (self.gl.get_error)();
+            if e != 0 {
+                bail!("encode_ext: glError 0x{e:04x} after dispatch");
+            }
+        }
+        Ok(n)
+    }
+
+    /// True when a linear scanout is bound as a normal `GL_TEXTURE_2D` source.
+    pub fn has_fetch_encode(&self) -> bool {
+        self.direct_img != 0
+    }
+
+    /// Encode reading the source as a normal `sampler2D` (`texelFetch`) — the
+    /// fast path for a linear scanout whose EGLImage binds to `GL_TEXTURE_2D`.
+    pub fn encode_fetch(&mut self, full: bool) -> Result<usize> {
+        if self.direct_img == 0 {
+            bail!("encode_fetch: no GL_TEXTURE_2D source");
+        }
+        unsafe {
+            (self.gl.get_error)();
+            (self.gl.use_program)(self.enc_fetch_prog);
+            (self.gl.active_texture)(GL_TEXTURE0);
+            (self.gl.bind_texture)(GL_TEXTURE_2D, self.direct_img);
+            let c = CString::new("u_src").unwrap();
+            let loc = (self.gl.get_uniform_location)(self.enc_fetch_prog, c.as_ptr() as *const u8);
+            if loc >= 0 {
+                (self.gl.uniform1i)(loc, 0);
+            }
+            let e = (self.gl.get_error)();
+            if e != 0 {
+                bail!("encode_fetch: bind source glError 0x{e:04x}");
+            }
+        }
+        let prog = self.enc_fetch_prog;
+        let n = self.encode_with(prog, full)?;
+        unsafe {
+            let e = (self.gl.get_error)();
+            if e != 0 {
+                bail!("encode_fetch: glError 0x{e:04x} after dispatch");
+            }
+        }
+        Ok(n)
+    }
+
+    /// Test/benchmark hook: make the source a plain immutable `GL_TEXTURE_2D`
+    /// holding `frame` (wire bytes), for `encode_fetch`. This is what a linear
+    /// dmabuf EGLImage bound to `GL_TEXTURE_2D` provides in production.
+    pub fn set_source_texture_frame(&mut self, frame: &[u8]) -> Result<()> {
+        assert_eq!(frame.len(), self.frame_bytes);
+        self.activate()?;
+        let (w, h) = (self.geom.width as i32, self.geom.height as i32);
+        unsafe {
+            if self.direct_img == 0 {
+                let mut t = [0u32; 1];
+                (self.gl.gen_textures)(1, t.as_mut_ptr());
+                self.direct_img = t[0];
+                (self.gl.bind_texture)(GL_TEXTURE_2D, self.direct_img);
+                (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST as i32);
+                (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST as i32);
+                (self.gl.tex_storage_2d)(GL_TEXTURE_2D, 1, GL_RGBA8, w, h);
+            }
+            (self.gl.bind_texture)(GL_TEXTURE_2D, self.direct_img);
+            (self.gl.tex_sub_image_2d)(
+                GL_TEXTURE_2D,
+                0,
+                0,
+                0,
+                w,
+                h,
+                GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                frame.as_ptr() as *const c_void,
+            );
+            // finish the upload OUTSIDE the caller's timed region, so the
+            // benchmark measures the encode, not the 33 MB host->GPU copy
+            (self.gl.finish)();
+            let e = (self.gl.get_error)();
+            if e != 0 {
+                bail!("set_source_texture_frame glError 0x{e:04x}");
+            }
+        }
+        self.has_scanout = true;
+        Ok(())
     }
 
     /// Test hook: fill the source image from tightly-packed wire bytes
@@ -1285,12 +1564,135 @@ void main() {
     uint vh = min(TILE, u_height - y0);
     bool changed = (u_full != 0u);
     if (!changed) {
+        // accumulate XOR deltas: every lane stays independent (no data-dependent
+        // break), so the loads pipeline instead of serializing on the compare
+        uint acc = 0u;
         for (uint i = tid; i < TW; i += 256u) {
             uint lx = i % TILE, ly = i / TILE;
             if (lx >= vw || ly >= vh) continue;
             uint gi = (y0 + ly) * u_stride_px + (x0 + lx);
-            if (word(x0 + lx, y0 + ly) != ref[gi]) { changed = true; break; }
+            acc |= (word(x0 + lx, y0 + ly) ^ ref[gi]);
         }
+        changed = (acc != 0u);
+    }
+    if (tid == 0u) s_changed = 0u;
+    barrier();
+    if (changed) atomicOr(s_changed, 1u);
+    barrier();
+    if (s_changed == 0u) return;
+    if (tid == 0u) { uint k = atomicAdd(count, 1u); s_k = k; outb[8u + k] = tile_id; }
+    barrier();
+    uint base = u_pbase_words + s_k * TW;
+    for (uint i = tid; i < TW; i += 256u) {
+        uint lx = i % TILE, ly = i / TILE;
+        uint o = base + i;
+        if (lx < vw && ly < vh) {
+            outb[o] = word(x0 + lx, y0 + ly);
+        } else {
+            outb[o] = 0u;
+        }
+    }
+}
+"#;
+
+/// Encode straight from the imported external texture: no blit and no
+/// intermediate RGBA8 image, so the source is read exactly once. Requires the
+/// driver to allow `samplerExternalOES` in a compute shader (checked at build
+/// time; otherwise the blit path is used).
+const ENC_EXT_SRC: &str = r#"#version 310 es
+#extension GL_OES_EGL_image_external_essl3 : require
+precision highp int;
+precision highp float;
+layout(local_size_x = 256) in;
+uniform uint u_width, u_height, u_stride_px, u_tiles_x, u_full, u_pbase_words;
+uniform highp samplerExternalOES u_src;
+layout(std430, binding = 1) readonly buffer Ref { uint ref[]; };
+layout(std430, binding = 2) writeonly buffer Out { uint outb[]; };
+layout(std430, binding = 3) buffer Cnt { uint count; };
+const uint TILE = 64u;
+const uint TW = TILE * TILE;
+shared uint s_changed;
+shared uint s_k;
+uint word(uint x, uint y) {
+    vec2 uv = (vec2(float(x), float(y)) + 0.5) / vec2(float(u_width), float(u_height));
+    return packUnorm4x8(texture(u_src, uv));
+}
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint tile_id = gl_WorkGroupID.x;
+    uint tx = tile_id % u_tiles_x;
+    uint ty = tile_id / u_tiles_x;
+    uint x0 = tx * TILE, y0 = ty * TILE;
+    uint vw = min(TILE, u_width - x0);
+    uint vh = min(TILE, u_height - y0);
+    bool changed = (u_full != 0u);
+    if (!changed) {
+        uint acc = 0u;
+        for (uint i = tid; i < TW; i += 256u) {
+            uint lx = i % TILE, ly = i / TILE;
+            if (lx >= vw || ly >= vh) continue;
+            uint gi = (y0 + ly) * u_stride_px + (x0 + lx);
+            acc |= (word(x0 + lx, y0 + ly) ^ ref[gi]);
+        }
+        changed = (acc != 0u);
+    }
+    if (tid == 0u) s_changed = 0u;
+    barrier();
+    if (changed) atomicOr(s_changed, 1u);
+    barrier();
+    if (s_changed == 0u) return;
+    if (tid == 0u) { uint k = atomicAdd(count, 1u); s_k = k; outb[8u + k] = tile_id; }
+    barrier();
+    uint base = u_pbase_words + s_k * TW;
+    for (uint i = tid; i < TW; i += 256u) {
+        uint lx = i % TILE, ly = i / TILE;
+        uint o = base + i;
+        if (lx < vw && ly < vh) {
+            outb[o] = word(x0 + lx, y0 + ly);
+        } else {
+            outb[o] = 0u;
+        }
+    }
+}
+"#;
+
+/// Encode reading the source as a normal `sampler2D` via `texelFetch`. Used
+/// when the scanout is linear and its EGLImage binds to `GL_TEXTURE_2D`: the
+/// normal texture path is ~15x faster than the external sampler on this driver.
+const ENC_FETCH_SRC: &str = r#"#version 310 es
+precision highp int;
+precision highp float;
+layout(local_size_x = 256) in;
+uniform uint u_width, u_height, u_stride_px, u_tiles_x, u_full, u_pbase_words;
+uniform highp sampler2D u_src;
+layout(std430, binding = 1) readonly buffer Ref { uint ref[]; };
+layout(std430, binding = 2) writeonly buffer Out { uint outb[]; };
+layout(std430, binding = 3) buffer Cnt { uint count; };
+const uint TILE = 64u;
+const uint TW = TILE * TILE;
+shared uint s_changed;
+shared uint s_k;
+uint word(uint x, uint y) {
+    return packUnorm4x8(texelFetch(u_src, ivec2(int(x), int(y)), 0));
+}
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint tile_id = gl_WorkGroupID.x;
+    uint tx = tile_id % u_tiles_x;
+    uint ty = tile_id / u_tiles_x;
+    uint x0 = tx * TILE, y0 = ty * TILE;
+    uint vw = min(TILE, u_width - x0);
+    uint vh = min(TILE, u_height - y0);
+    bool changed = (u_full != 0u);
+    if (!changed) {
+        uint acc = 0u;
+        for (uint i = tid; i < TW; i += 256u) {
+            uint lx = i % TILE, ly = i / TILE;
+            if (lx >= vw || ly >= vh) continue;
+            uint gi = (y0 + ly) * u_stride_px + (x0 + lx);
+            acc |= (word(x0 + lx, y0 + ly) ^ ref[gi]);
+        }
+        changed = (acc != 0u);
     }
     if (tid == 0u) s_changed = 0u;
     barrier();

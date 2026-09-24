@@ -1174,11 +1174,23 @@ impl FrameCodec {
         let t = std::time::Instant::now();
         gpu.activate()?;
         let act = t.elapsed();
+        // source path: linear scanout -> texelFetch (fast); else the external
+        // sampler (no blit either way); else blit + image encode
+        let fetch = gpu.has_fetch_encode();
+        let ext = gpu.has_ext_encode();
         let t = std::time::Instant::now();
-        gpu.blit_source()?;
+        if !fetch && !ext {
+            gpu.blit_source()?;
+        }
         let blit = t.elapsed();
         let t = std::time::Instant::now();
-        let n = gpu.encode_tex(full)?;
+        let n = if fetch {
+            gpu.encode_fetch(full)?
+        } else if ext {
+            gpu.encode_ext(full)?
+        } else {
+            gpu.encode_tex(full)?
+        };
         let enc = t.elapsed();
         let count = gpu.last_count();
         let changed = full || count > 0;

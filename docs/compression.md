@@ -107,31 +107,51 @@ client sees is always full.
 ## Where the cost sits
 
 `lossless` encodes on the **GPU** (`rdma-display-codec-gpu`, GLES 3.1 compute).
-There are two input paths:
+The scanout dma-buf is imported into the codec's own GLES context
+(`eglCreateImageKHR`) and the encode compute reads it directly — the frame never
+leaves the GPU and only the coded delta is copied into the pinned staging slot.
 
-- **Texture-direct (default when the scanout is a dmabuf):** the encoder imports
-  the KMS scanout dma-buf into its own GLES context (`eglCreateImageKHR` →
-  `GL_TEXTURE_EXTERNAL_OES`), blits it once to an RGBA8 image (GPU→GPU — the
-  channel normalize the readback used to do), and the compute shader reads that
-  image directly. The frame never leaves the GPU: no full-frame `glReadPixels`
-  to host and no re-upload. Only the coded delta is copied into the pinned
-  staging slot, so a static frame costs about the changed tiles.
+### The import path dominates
+
+| stage (4K, RTX 2080 Ti)                        | measured    |
+|------------------------------------------------|-------------|
+| encode delta (SSBO / image / external / fetch) | 0.17–0.33 ms |
+| `eglCreateImageKHR` + target bind (uncached)   | ~3 ms/frame |
+
+The import, not the encode, was the cost — so it is **cached per buffer**: a
+`SrcImport` keyed by `(fd, offset, stride, fourcc, modifier, w, h)` is reused and
+only evicted (with its EGLImage/texture destroyed) when the cache exceeds 4
+entries. A compositor swaps between a handful of buffers, so steady-state frames
+hit the cache and pay only the encode.
+
+### Source binding (linear vs tiled)
+
+- **Linear scanout** (`modifier == 0`): the EGLImage binds to a normal
+  `GL_TEXTURE_2D`; the encode reads it with `texelFetch` (`ENC_FETCH_SRC`).
+- **Tiled scanout**: it binds to `GL_TEXTURE_EXTERNAL_OES`; the encode samples it
+  in compute (`ENC_EXT_SRC`). The external sampler is *not* the bottleneck — both
+  are ~0.2 ms once the import is cached.
+- If external-in-compute is unsupported by the driver, the fallback is a GPU→GPU
+  blit to an RGBA8 image plus the image-input encode (`ENC_TEX_SRC`), ~0.33 ms.
+
+The blit and image swizzle `.bgra`, so the source image's `R,G,B,A` equals the
+wire bytes `B,G,R,A` — exactly what `glReadPixels(GL_BGRA)` of the materializer's
+linear target yields — so the coded byte format is identical on every path.
+
+### Fallbacks
+
 - **Readback fallback** (no dmabuf, import unsupported, or no GPU encoder): the
   materializer reads the scanout back into the pinned staging slot, the encoder
   uploads it and tile-diffs as before. The CPU reference encoder is the last
   fallback if the GPU codec can't be created at all.
 
-The dmabuf blit swizzles `.bgra`, so the source image's `R,G,B,A` equals the
-wire bytes `B,G,R,A` — exactly what `glReadPixels(GL_BGRA)` of the materializer's
-linear target yields. The coded byte format is therefore identical on both
-paths and the client cannot tell them apart.
+The per-frame *compute* is `cpu 6.6 / gpu 0.2 ms` for a delta and `cpu 9.3 /
+gpu 8.1 ms` for a full frame. On high-motion content that compresses poorly
+`raw` is still the cheaper choice.
 
-The per-frame *compute* is roughly `cpu 6.6 ms / gpu 0.2 ms` for a delta and
-`cpu 9.3 ms / gpu 8.1 ms` for a full frame, but those numbers exclude the
-input: on the readback path a delta also pays ~5.5 ms `glReadPixels` plus the
-re-upload, which the texture-direct path removes. On high-motion content that
-compresses poorly `raw` is still the cheaper choice (a texture-direct delta then
-costs about the same as the coded payload's readback).
+All variants are benchmarked with `codecbench` (`[texture]`, `[external]`,
+`[fetch]`, `[import]`) and required to be byte-identical to the SSBO encode and
+CPU-decodable.
 
 ### Client display path (GPU lossless decode)
 

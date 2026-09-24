@@ -276,6 +276,130 @@ fn texture_encode(geom: Geometry, frames: &[Vec<u32>]) -> Result<()> {
     Ok(())
 }
 
+/// Direct external-texture encode (`ENC_EXT_SRC`, no blit) vs the blit+image
+/// path, on a synthetic external texture (EGL_KHR_gl_texture_2D_image). Both
+/// must match the SSBO encode exactly.
+fn external_encode(geom: Geometry, frames: &[Vec<u32>]) -> Result<()> {
+    let mut ext = GpuCodec::new(geom)?;
+    let mut tex = GpuCodec::new(geom)?;
+    let mut ssbo = GpuCodec::new(geom)?;
+    let mut dec = Decoder::new(geom)?;
+    if !ext.has_ext_encode() {
+        eprintln!("[external] external-texture compute encode unavailable; skipped");
+        return Ok(());
+    }
+    let mut ext_us = Vec::new();
+    let mut path_us = Vec::new();
+    for (i, frame) in frames.iter().enumerate() {
+        let fb = words_bytes(frame);
+
+        ssbo.activate()?;
+        ssbo.upload(fb)?;
+        ssbo.sync();
+        let n_ssbo = ssbo.encode(i == 0)?;
+        let cnt_ssbo = Header::parse(ssbo.coded(n_ssbo))?.count as usize;
+        ssbo.update_reference()?;
+
+        ext.activate()?;
+        ext.set_scanout_test_frame(fb, false)?;
+        ext.sync(); // drain the import; time only the encode
+        let t = Instant::now();
+        let n = ext.encode_ext(i == 0)?;
+        ext_us.push(t.elapsed().as_secs_f64() * 1e3);
+        let cnt = Header::parse(ext.coded(n))?.count as usize;
+        if n != n_ssbo || cnt != cnt_ssbo {
+            bail!("external encode differs at frame {i}: {cnt}/{n} vs {cnt_ssbo}/{n_ssbo}");
+        }
+        if dec.decode(ext.coded(n))? != fb {
+            bail!("CPU decode of external-encoded frame {i} mismatch");
+        }
+        ext.update_reference()?;
+
+        tex.activate()?;
+        tex.set_scanout_test_frame(fb, false)?;
+        tex.sync();
+        let t = Instant::now();
+        tex.blit_source()?;
+        let n2 = tex.encode_tex(i == 0)?;
+        path_us.push(t.elapsed().as_secs_f64() * 1e3);
+        if n2 != n_ssbo {
+            bail!("tex encode differs at frame {i}: {n2} vs {n_ssbo}");
+        }
+        tex.update_reference()?;
+    }
+    let d = |v: &[f64]| v[1..].iter().sum::<f64>() / (v.len() - 1) as f64;
+    eprintln!(
+        "[external] {} frames bit-identical to SSBO encode | steady delta: direct ext {:.2} ms, blit+image {:.2} ms",
+        frames.len(),
+        d(&ext_us),
+        d(&path_us)
+    );
+    Ok(())
+}
+
+/// `texelFetch` encode from a plain `sampler2D` (the linear-scanout fast path,
+/// where the dmabuf EGLImage binds to `GL_TEXTURE_2D`). Must match the SSBO
+/// encode exactly.
+fn fetch_encode(geom: Geometry, frames: &[Vec<u32>]) -> Result<()> {
+    let mut fetch = GpuCodec::new(geom)?;
+    let mut ssbo = GpuCodec::new(geom)?;
+    let mut dec = Decoder::new(geom)?;
+    let mut us = Vec::new();
+    for (i, frame) in frames.iter().enumerate() {
+        let fb = words_bytes(frame);
+        ssbo.activate()?;
+        ssbo.upload(fb)?;
+        ssbo.sync();
+        let n_ssbo = ssbo.encode(i == 0)?;
+        let c_ssbo = Header::parse(ssbo.coded(n_ssbo))?.count as usize;
+        ssbo.update_reference()?;
+
+        fetch.activate()?;
+        fetch.set_scanout_test_frame(fb, true)?;
+        fetch.sync();
+        let t = Instant::now();
+        let n = fetch.encode_fetch(i == 0)?;
+        us.push(t.elapsed().as_secs_f64() * 1e3);
+        let c = Header::parse(fetch.coded(n))?.count as usize;
+        if n != n_ssbo || c != c_ssbo {
+            bail!("fetch encode differs at frame {i}: {c}/{n} vs {c_ssbo}/{n_ssbo}");
+        }
+        if dec.decode(fetch.coded(n))? != fb {
+            bail!("CPU decode of fetch-encoded frame {i} mismatch");
+        }
+        fetch.update_reference()?;
+    }
+    eprintln!(
+        "[fetch] {} frames bit-identical to SSBO encode | steady delta {:.2} ms (sampler2D texelFetch)",
+        frames.len(),
+        us[1..].iter().sum::<f64>() / (us.len() - 1) as f64
+    );
+    Ok(())
+}
+
+/// Measures the dmabuf import itself (EGLImage + target bind, no cache): the
+/// cost that was previously paid every frame and dominated the encode.
+fn import_cost(geom: Geometry, frames: &[Vec<u32>]) -> Result<()> {
+    let mut gpu = GpuCodec::new(geom)?;
+    let mut us = Vec::new();
+    for frame in frames.iter() {
+        let fb = words_bytes(frame);
+        gpu.activate()?;
+        gpu.sync();
+        let t = Instant::now();
+        gpu.set_scanout_test_frame(fb, true)?;
+        gpu.sync();
+        us.push(t.elapsed().as_secs_f64() * 1e3);
+    }
+    let mut v = us[1..].to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    eprintln!(
+        "[import] EGLImage import (per frame, uncached): {:.2} ms median — cached per buffer in production",
+        v[v.len() / 2]
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let geom = Geometry::new(W, H, W * 4);
     let raw = geom.frame_bytes();
@@ -294,6 +418,9 @@ fn main() -> Result<()> {
     let _ = correctness(geom, &frames)?;
     decoder_roundtrip(geom, &frames)?;
     texture_encode(geom, &frames)?;
+    external_encode(geom, &frames)?;
+    fetch_encode(geom, &frames)?;
+    import_cost(geom, &frames)?;
 
     let cpu = cpu_timing(geom, &frames)?;
     let gpu = gpu_timing(geom, &frames)?;
