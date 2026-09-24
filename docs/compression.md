@@ -46,6 +46,15 @@ The slot is `budget + 1 MiB` (packet framing overhead). The negotiated
 planes to match. Because it is intra-only there is no reference-chain
 invariant and no CRC: every frame is independently decodable.
 
+### Building `libpyrowave-shared.so`
+
+The `.so` is `dlopen`ed from beside the binaries (see
+`.cargo/config.toml`'s `$ORIGIN` rpath), so it is dropped into
+`target/release`. Build it against the lab's glibc with
+`scripts/build-pyrowave-docker.sh` (Ubuntu 24.04 / glibc 2.39). Building on a
+newer host bakes in symbol versions the lab lacks (e.g. `GLIBC_2.43` from
+`sqrtf`/`acosf`) and the `dlopen` fails.
+
 ## Lossless format (v1)
 
 Full specification and the CPU reference implementation live in
