@@ -264,7 +264,7 @@ fn texture_encode(geom: Geometry, frames: &[Vec<u32>]) -> Result<()> {
         if dec.decode(gpu.coded(n))? != fb {
             bail!("CPU decode of texture-encoded frame {i} mismatch");
         }
-        gpu.update_reference()?;
+        // the texture encode writes the reference in-pass; no update_reference
         ssbo.activate()?;
         ssbo.update_reference()?;
     }
@@ -313,8 +313,7 @@ fn external_encode(geom: Geometry, frames: &[Vec<u32>]) -> Result<()> {
         if dec.decode(ext.coded(n))? != fb {
             bail!("CPU decode of external-encoded frame {i} mismatch");
         }
-        ext.update_reference()?;
-
+        // ext writes its reference in-pass (see ENC_EXT_SRC)
         tex.activate()?;
         tex.set_scanout_test_frame(fb, false)?;
         tex.sync();
@@ -325,7 +324,6 @@ fn external_encode(geom: Geometry, frames: &[Vec<u32>]) -> Result<()> {
         if n2 != n_ssbo {
             bail!("tex encode differs at frame {i}: {n2} vs {n_ssbo}");
         }
-        tex.update_reference()?;
     }
     let d = |v: &[f64]| v[1..].iter().sum::<f64>() / (v.len() - 1) as f64;
     eprintln!(
@@ -367,7 +365,7 @@ fn fetch_encode(geom: Geometry, frames: &[Vec<u32>]) -> Result<()> {
         if dec.decode(fetch.coded(n))? != fb {
             bail!("CPU decode of fetch-encoded frame {i} mismatch");
         }
-        fetch.update_reference()?;
+        // fetch writes its reference in-pass (see ENC_FETCH_SRC)
     }
     eprintln!(
         "[fetch] {} frames bit-identical to SSBO encode | steady delta {:.2} ms (sampler2D texelFetch)",
@@ -501,49 +499,48 @@ fn gbm_read_bench(geom: Geometry) -> Result<()> {
                 bo_destroy(bo);
                 continue;
             }
-            // Seed the reference from the buffer, then measure three things on
-            // the *same* imported dma-buf so the read is separated from the
-            // coding:
-            //   detection = encode_ext(false) with a matching reference: reads
-            //               the whole buffer and XORs, codes nothing (this is
-            //               the "0.14 ms" number the docs/summary quote)
-            //   full      = encode_ext(true): reads the whole buffer and writes
-            //               a payload for every tile — the dynamic-screen case
-            //   full+ref  = full plus update_reference — the real t1-t1s span
+            // 10-frame sequence on the *same* imported dma-buf:
+            //   frame 0  = full encode (all tiles coded) — the 5 ms case
+            //   frames 1..9 = deltas in which a handful of tiles "changed". We
+            //                 simulate that by poking those tiles in the
+            //                 reference, which is equivalent to the source
+            //                 having changed there and avoids writing the
+            //                 (tiled) BO. Only those tiles' payload leaves the
+            //                 GPU, so a delta must be cheap.
+            gpu.sync();
+            let t = Instant::now();
             let n_full = gpu.encode_ext(true)?;
-            gpu.update_reference()?;
+            let full_ms = t.elapsed().as_secs_f64() * 1e3;
             let p50 = |v: &mut Vec<f64>| {
                 v.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 v[v.len() / 2]
             };
-            let mut det = Vec::new();
-            let mut full = Vec::new();
-            let mut full_ref = Vec::new();
-            for _ in 0..20 {
+            let stride_px = geom.width as usize; // bench geometry: stride = width*4
+            let tiles_x = geom.tiles_x() as usize;
+            let poke_tiles = [0usize, 7, 63, 64, 511, 1000, 1500, 2047];
+            let mut deltas = Vec::new();
+            let mut coded = Vec::new();
+            for _ in 1..10 {
+                for &tid in &poke_tiles {
+                    let (tx, ty) = (tid % tiles_x, tid / tiles_x);
+                    let at = (ty * 64) * stride_px + tx * 64;
+                    gpu.debug_poke_reference(at, &[0xdead_beefu32]);
+                }
                 gpu.sync();
                 let t = Instant::now();
-                gpu.encode_ext(false)?;
-                det.push(t.elapsed().as_secs_f64() * 1e3);
-
-                gpu.sync();
-                let t = Instant::now();
-                gpu.encode_ext(true)?;
-                full.push(t.elapsed().as_secs_f64() * 1e3);
-
-                gpu.sync();
-                let t = Instant::now();
-                gpu.encode_ext(true)?;
-                gpu.update_reference()?;
-                full_ref.push(t.elapsed().as_secs_f64() * 1e3);
+                let n = gpu.encode_ext(false)?;
+                deltas.push(t.elapsed().as_secs_f64() * 1e3);
+                coded.push(n);
             }
             eprintln!(
-                "[gbm] {name:13} modifier=0x{:016x} stride={:6} coded={:8}B → detection {:.2} ms | full {:.2} ms | full+ref {:.2} ms (p50 of 20)",
+                "[gbm] {name:13} modifier=0x{:016x} stride={:6} | frame0 full {:.2} ms ({} B) | delta p50 {:.2} ms over frames 1..9 ({} tiles changed, coded {} B)",
                 img.modifier,
                 img.stride,
+                full_ms,
                 n_full,
-                p50(&mut det),
-                p50(&mut full),
-                p50(&mut full_ref),
+                p50(&mut deltas),
+                poke_tiles.len(),
+                coded[coded.len() / 2],
             );
             bo_destroy(bo);
         }

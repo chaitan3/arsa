@@ -1237,8 +1237,10 @@ impl FrameCodec {
         let changed = full || count > 0;
         let t = std::time::Instant::now();
         if changed {
-            // advance the reference only for frames the client will receive
-            gpu.update_reference()?;
+            // The encode shader advances the reference in-pass (it writes each
+            // coded tile's words back into `ref`), so there is no separate
+            // decode-to-reference pass: the previous ref up-call was a second
+            // pass over the coded payload (a PCIe read for every changed tile).
             self.first = false;
         }
         let rf = t.elapsed();

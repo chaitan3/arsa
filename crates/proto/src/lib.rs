@@ -147,9 +147,10 @@ impl MatKind {
             // texture-direct GPU lossless: activate = make the codec's EGL
             // context current; blit = optional source blit (0 on the
             // external-sampler path); encode = dispatch + glFinish (reads the
-            // scanout, XORs tiles, codes changes); ref = advance the delta
-            // reference; copy = coded bytes into the slot; restore = make the
-            // materializer's context current again.
+            // scanout, XORs tiles, codes changes, and advances the reference
+            // in-pass); ref = legacy separate reference pass (now ~0); copy =
+            // coded bytes into the slot; restore = make the materializer's
+            // context current again.
             MatKind::Lossless => ["activate", "blit", "encode", "ref", "copy", "restore"],
             // encode = PyroWave GPU encode; packetize = packet framing + copy
             // into the slot. (The Vulkan dmabuf import happens in prepare,

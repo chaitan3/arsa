@@ -648,6 +648,22 @@ impl GpuCodec {
         self.decode(self.last_count)
     }
 
+    /// Test/bench hook: overwrite `words` at word offset `at` in the reference
+    /// buffer. Writing a word inside a tile makes the next delta encode see that
+    /// tile as changed — a way to simulate "the source changed here" without
+    /// having to write the (possibly tiled) source itself.
+    pub fn debug_poke_reference(&self, at_word: usize, words: &[u32]) {
+        unsafe {
+            (self.gl.bind_buffer)(GL_SHADER_STORAGE_BUFFER, self.reference);
+            (self.gl.buffer_sub_data)(
+                GL_SHADER_STORAGE_BUFFER,
+                (at_word * 4) as isize,
+                (words.len() * 4) as isize,
+                words.as_ptr() as *const c_void,
+            );
+        }
+    }
+
     pub fn upload(&self, frame: &[u8]) -> Result<()> {
         assert_eq!(frame.len(), self.frame_bytes);
         unsafe {
@@ -1599,7 +1615,7 @@ precision highp int;
 layout(local_size_x = 256) in;
 uniform uint u_width, u_height, u_stride_px, u_tiles_x, u_full, u_pbase_words;
 layout(rgba8, binding = 0) readonly uniform highp image2D u_src;
-layout(std430, binding = 1) readonly buffer Ref { uint ref[]; };
+layout(std430, binding = 1) buffer Ref { uint ref[]; };
 layout(std430, binding = 2) writeonly buffer Out { uint outb[]; };
 layout(std430, binding = 3) buffer Cnt { uint count; };
 const uint TILE = 64u;
@@ -1642,7 +1658,12 @@ void main() {
         uint lx = i % TILE, ly = i / TILE;
         uint o = base + i;
         if (lx < vw && ly < vh) {
-            outb[o] = word(x0 + lx, y0 + ly);
+            uint w = word(x0 + lx, y0 + ly);
+            outb[o] = w;
+            // advance the reference in the same pass: lossless, so the decoded
+            // tile equals the source word. This replaces a separate
+            // decode-to-reference pass over the coded payload.
+            ref[(y0 + ly) * u_stride_px + (x0 + lx)] = w;
         } else {
             outb[o] = 0u;
         }
@@ -1661,7 +1682,7 @@ precision highp float;
 layout(local_size_x = 256) in;
 uniform uint u_width, u_height, u_stride_px, u_tiles_x, u_full, u_pbase_words;
 uniform highp samplerExternalOES u_src;
-layout(std430, binding = 1) readonly buffer Ref { uint ref[]; };
+layout(std430, binding = 1) buffer Ref { uint ref[]; };
 layout(std430, binding = 2) writeonly buffer Out { uint outb[]; };
 layout(std430, binding = 3) buffer Cnt { uint count; };
 const uint TILE = 64u;
@@ -1703,7 +1724,12 @@ void main() {
         uint lx = i % TILE, ly = i / TILE;
         uint o = base + i;
         if (lx < vw && ly < vh) {
-            outb[o] = word(x0 + lx, y0 + ly);
+            uint w = word(x0 + lx, y0 + ly);
+            outb[o] = w;
+            // advance the reference in the same pass (lossless: the decoded
+            // tile equals the source word), replacing a separate
+            // decode-to-reference pass over the coded payload
+            ref[(y0 + ly) * u_stride_px + (x0 + lx)] = w;
         } else {
             outb[o] = 0u;
         }
@@ -1720,7 +1746,7 @@ precision highp float;
 layout(local_size_x = 256) in;
 uniform uint u_width, u_height, u_stride_px, u_tiles_x, u_full, u_pbase_words;
 uniform highp sampler2D u_src;
-layout(std430, binding = 1) readonly buffer Ref { uint ref[]; };
+layout(std430, binding = 1) buffer Ref { uint ref[]; };
 layout(std430, binding = 2) writeonly buffer Out { uint outb[]; };
 layout(std430, binding = 3) buffer Cnt { uint count; };
 const uint TILE = 64u;
@@ -1761,7 +1787,12 @@ void main() {
         uint lx = i % TILE, ly = i / TILE;
         uint o = base + i;
         if (lx < vw && ly < vh) {
-            outb[o] = word(x0 + lx, y0 + ly);
+            uint w = word(x0 + lx, y0 + ly);
+            outb[o] = w;
+            // advance the reference in the same pass (lossless: the decoded
+            // tile equals the source word), replacing a separate
+            // decode-to-reference pass over the coded payload
+            ref[(y0 + ly) * u_stride_px + (x0 + lx)] = w;
         } else {
             outb[o] = 0u;
         }
