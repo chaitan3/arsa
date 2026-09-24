@@ -1258,7 +1258,7 @@ impl GpuCodec {
     /// of GB/s; a buffer that is host-visible/GTT reads at PCIe speed (~8 GB/s
     /// on Gen3 x8). This is how we tell where the scanout and the reference
     /// actually live, rather than assuming.
-    pub fn memprobe(&self) -> Result<()> {
+    pub fn memprobe(&mut self) -> Result<()> {
         let report = |name: &str, bytes: usize, d: std::time::Duration| {
             let s = d.as_secs_f64().max(1e-9);
             eprintln!(
@@ -1277,6 +1277,21 @@ impl GpuCodec {
         report("reference", self.frame_bytes, self.probe_buf(self.reference, self.frame_bytes / 4)?);
         report("cur", self.frame_bytes, self.probe_buf(self.cur, self.frame_bytes / 4)?);
         report("coded", self.coded_len, self.probe_buf(self.coded, self.coded_len / 4)?);
+        // The number that actually matters: run the real encode dispatch, in the
+        // same conditions as the probes above. With the reference already
+        // matching (in-pass write on the previous frame) this is a pure
+        // detection pass, so any gap versus `scanout` is the shader itself, not
+        // the read.
+        if self.has_scanout {
+            unsafe { (self.gl.finish)() };
+            let t = std::time::Instant::now();
+            for _ in 0..PROBE_REPS {
+                self.encode_ext(false)?;
+            }
+            let d = t.elapsed() / PROBE_REPS;
+            // a detection pass reads the scanout AND the reference
+            report("encode", self.frame_bytes * 2, d);
+        }
         Ok(())
     }
 

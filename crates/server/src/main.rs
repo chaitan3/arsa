@@ -1265,7 +1265,7 @@ impl FrameCodec {
         }
         if self.memprobe_left {
             self.memprobe_left = false;
-            if let Some(gpu) = self.gpu.as_ref() {
+            if let Some(gpu) = self.gpu.as_mut() {
                 gpu.memprobe()?;
             }
         }

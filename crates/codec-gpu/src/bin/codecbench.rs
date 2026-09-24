@@ -576,7 +576,7 @@ fn main() -> Result<()> {
         // plain glBufferData. The contrast calibrates what "host-visible" reads
         // like versus VRAM before running RDMA_MEMPROBE on the real scanout.
         let geom = Geometry::new(W, H, W * 4);
-        let gpu = GpuCodec::new(geom)?;
+        let mut gpu = GpuCodec::new(geom)?;
         gpu.activate()?;
         gpu.memprobe()?;
         return Ok(());
