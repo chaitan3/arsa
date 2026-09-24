@@ -400,7 +400,107 @@ fn import_cost(geom: Geometry, frames: &[Vec<u32>]) -> Result<()> {
     Ok(())
 }
 
+/// Allocate a real dma-buf with GBM (linear and NVIDIA 16BX2 block-linear) and
+/// time the encoder's *detection read* of it — no compositor, no writer. This
+/// isolates "the tiled layout is slow to read" from "someone else is writing
+/// the scanout". Run under sudo on a host with /dev/dri/renderD128.
+#[cfg(target_os = "linux")]
+fn gbm_read_bench(geom: Geometry) -> Result<()> {
+    use std::ffi::c_void;
+    use std::os::fd::AsRawFd;
+    type CreateDevice = unsafe extern "C" fn(i32) -> *mut c_void;
+    type DeviceDestroy = unsafe extern "C" fn(*mut c_void);
+    type BoCreateMods =
+        unsafe extern "C" fn(*mut c_void, u32, u32, u32, *const u64, u32) -> *mut c_void;
+    type BoI32 = unsafe extern "C" fn(*mut c_void) -> i32;
+    type BoU32 = unsafe extern "C" fn(*mut c_void) -> u32;
+    type BoU64 = unsafe extern "C" fn(*mut c_void) -> u64;
+    type BoDestroy = unsafe extern "C" fn(*mut c_void);
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/dri/renderD128")
+        .map_err(|e| anyhow::anyhow!("open renderD128: {e} (run under sudo)"))?;
+    let fd = file.as_raw_fd();
+    let lib = unsafe { libloading::Library::new("libgbm.so.1") }?;
+    unsafe {
+        let create_device: CreateDevice = *lib.get(b"gbm_create_device")?;
+        let device_destroy: DeviceDestroy = *lib.get(b"gbm_device_destroy")?;
+        let bo_create: BoCreateMods = *lib.get(b"gbm_bo_create_with_modifiers")?;
+        let bo_fd: BoI32 = *lib.get(b"gbm_bo_get_fd")?;
+        let bo_stride: BoU32 = *lib.get(b"gbm_bo_get_stride")?;
+        let bo_offset: BoU32 = *lib.get(b"gbm_bo_get_offset")?;
+        let bo_modifier: BoU64 = *lib.get(b"gbm_bo_get_modifier")?;
+        let bo_destroy: BoDestroy = *lib.get(b"gbm_bo_destroy")?;
+
+        let dev = create_device(fd);
+        if dev.is_null() {
+            anyhow::bail!("gbm_create_device failed");
+        }
+        const XR24: u32 = 0x3432_5258;
+        let cases: [(&str, [u64; 1]); 2] = [
+            ("linear", [0u64]),
+            ("nvidia-16bx2", [0x0300_0000_0060_6014u64]),
+        ];
+        for (name, mods) in cases {
+            let bo = bo_create(
+                dev,
+                geom.width,
+                geom.height,
+                XR24,
+                mods.as_ptr(),
+                mods.len() as u32,
+            );
+            if bo.is_null() {
+                eprintln!("[gbm] {name}: gbm_bo_create_with_modifiers failed");
+                continue;
+            }
+            let img = rdma_display_codec_gpu::DmabufImage {
+                key: 0,
+                fd: bo_fd(bo),
+                offset: bo_offset(bo),
+                stride: bo_stride(bo),
+                fourcc: XR24,
+                modifier: bo_modifier(bo),
+                width: geom.width,
+                height: geom.height,
+            };
+            let mut gpu = GpuCodec::new(geom)?;
+            if let Err(e) = gpu.set_scanout(&img) {
+                eprintln!("[gbm] {name}: import failed: {e:#}");
+                bo_destroy(bo);
+                continue;
+            }
+            // seed the reference from the buffer, then time detection-only reads
+            gpu.encode_ext(true)?;
+            gpu.update_reference()?;
+            let mut us = Vec::new();
+            for _ in 0..20 {
+                gpu.sync();
+                let t = Instant::now();
+                gpu.encode_ext(false)?;
+                us.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eprintln!(
+                "[gbm] {name:13} modifier=0x{:016x} stride={:6} → detection read {:.2} ms (p50 of 20)",
+                img.modifier,
+                img.stride,
+                us[us.len() / 2]
+            );
+            bo_destroy(bo);
+        }
+        device_destroy(dev);
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    if std::env::args().any(|a| a == "--gbm") {
+        let geom = Geometry::new(W, H, W * 4);
+        return gbm_read_bench(geom);
+    }
     let geom = Geometry::new(W, H, W * 4);
     let raw = geom.frame_bytes();
     eprintln!(
