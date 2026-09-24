@@ -27,6 +27,7 @@ use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_client::protocol::wl_keyboard::{self, KeyState, WlKeyboard};
 use wayland_client::protocol::wl_pointer::{self, Axis, ButtonState, WlPointer};
 use wayland_client::protocol::wl_registry::WlRegistry;
+use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_seat::{self, Capability, WlSeat};
 use wayland_client::protocol::wl_surface::{self, WlSurface};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
@@ -429,7 +430,7 @@ impl Presenter {
             bail!("window closed before first configure");
         }
         // configure received; frame presentation attaches + commits content
-        me.state.apply_scale(); // apply scale if preferred_scale already arrived
+        me.state.apply_scale(&qh); // apply scale if preferred_scale already arrived
         me.pump(0)?;
         Ok(me)
     }
@@ -683,30 +684,49 @@ impl St {
     /// compositor's output scale — buffer stays native (W×H, the guest
     /// frame verbatim), the viewport destination becomes native/scale so
     /// the compositor maps the buffer 1:1 onto physical pixels.
-    fn apply_scale(&mut self) {
+    fn apply_scale(&mut self, qh: &QueueHandle<St>) {
         if self.fullscreened {
             // fullscreen: the logical size is configure-driven (output
             // size); a scale change only shifts the device-pixel buffer
             // size (e.g. output moved to a monitor with another scale)
             self.queue_egl_resize();
+            self.set_opaque(qh, self.logical_w, self.logical_h);
             return;
         }
         let lw = (self.width as u64 * 120 / self.scale120.max(1) as u64) as u32;
         let lh = (self.height as u64 * 120 / self.scale120.max(1) as u64) as u32;
         if (lw, lh) == (self.logical_w, self.logical_h) {
+            self.set_opaque(qh, lw, lh);
             return;
         }
-        self.apply_mode(lw, lh);
+        self.apply_mode(qh, lw, lh);
+    }
+
+    /// Mark the whole surface opaque for the current logical size. KWin will
+    /// only direct-scanout (skip compositing) a fullscreen surface it knows is
+    /// fully opaque; without this the buffer is treated as possibly
+    /// translucent and always composited. Re-set on every size change; the
+    /// compositor copies the region when it processes the request, so the
+    /// wl_region is destroyed immediately.
+    fn set_opaque(&self, qh: &QueueHandle<St>, w: u32, h: u32) {
+        let region = self.compositor.create_region(qh, ());
+        region.add(0, 0, w.max(1) as i32, h.max(1) as i32);
+        self.surface.set_opaque_region(Some(&region));
+        region.destroy();
+        eprintln!(
+            "[wl] opaque region {w}x{h} (direct scanout eligible when fullscreen)"
+        );
     }
 
     /// Apply a target logical size: viewport destination, window geometry,
     /// min/max (windowed only), EGL buffer resize, commit. Called from the
     /// xdg_surface.ack_configure path so the ack precedes our commit.
-    fn apply_mode(&mut self, lw: u32, lh: u32) {
+    fn apply_mode(&mut self, qh: &QueueHandle<St>, lw: u32, lh: u32) {
         self.logical_w = lw;
         self.logical_h = lh;
         self.viewport.set_destination(lw as i32, lh as i32);
         self.xdg_surface.set_window_geometry(0, 0, lw as i32, lh as i32);
+        self.set_opaque(qh, lw, lh);
         if !self.fullscreened {
             self.toplevel.set_min_size(lw as i32, lh as i32);
             self.toplevel.set_max_size(lw as i32, lh as i32);
@@ -795,6 +815,7 @@ impl Dispatch<WlRegistry, GlobalListContents> for St {
 }
 
 quiet!(WlCompositor => ());
+quiet!(WlRegion => ());
 quiet!(WpCursorShapeManagerV1 => ());
 quiet!(WpCursorShapeDeviceV1 => ());
 quiet!(WpViewporter => ());
@@ -1013,12 +1034,12 @@ impl Dispatch<WpFractionalScaleV1, ()> for St {
         ev: <WpFractionalScaleV1 as Proxy>::Event,
         _: &(),
         _: &Connection,
-        _: &QueueHandle<St>,
+        qh: &QueueHandle<St>,
     ) {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale, .. } = ev {
             if state.scale120 != scale {
                 state.scale120 = scale;
-                state.apply_scale();
+                state.apply_scale(qh);
             }
         }
     }
@@ -1331,7 +1352,7 @@ impl Dispatch<XdgSurface, ()> for St {
         ev: <XdgSurface as Proxy>::Event,
         _: &(),
         _: &Connection,
-        _: &QueueHandle<St>,
+        qh: &QueueHandle<St>,
     ) {
         if let xdg_surface::Event::Configure { serial } = ev {
             obj.ack_configure(serial);
@@ -1340,7 +1361,7 @@ impl Dispatch<XdgSurface, ()> for St {
             // the ack: xdg-shell requires the ack to precede any commit
             // that adapts to the configure.
             if let Some((lw, lh)) = state.pending_mode.take() {
-                state.apply_mode(lw, lh);
+                state.apply_mode(qh, lw, lh);
             }
         }
     }

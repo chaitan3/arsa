@@ -27,6 +27,7 @@ const EGL_SURFACE_TYPE: i32 = 0x3033;
 const EGL_WINDOW_BIT: i32 = 0x0004;
 const EGL_RENDERABLE_TYPE: i32 = 0x3040;
 const EGL_OPENGL_ES3_BIT: i32 = 0x0040;
+const EGL_ALPHA_SIZE: i32 = 0x3021;
 const EGL_NONE: i32 = 0x3038;
 const EGL_CONTEXT_CLIENT_VERSION: i32 = 0x3098;
 const EGL_CONTEXT_MINOR_VERSION: i32 = 0x30FB;
@@ -295,6 +296,10 @@ impl EglWindow {
         let cfg_attribs = [
             EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
             EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+            // no alpha in the window buffer (XRGB): the video frame is fully
+            // opaque, and an XRGB buffer + the surface's opaque region lets
+            // KWin direct-scanout instead of compositing
+            EGL_ALPHA_SIZE, 0,
             EGL_NONE,
         ];
         let mut cfg: *mut c_void = std::ptr::null_mut();
