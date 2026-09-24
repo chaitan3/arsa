@@ -35,6 +35,29 @@ fn fourcc_to_vk(fourcc: u32) -> Option<vk::Format> {
     })
 }
 
+/// Identifies an imported scanout buffer: the DRM fb id plus the properties
+/// that determine the import layout. The compositor cycles a handful of
+/// buffers, so keying the import on this turns the per-frame Vulkan import
+/// (and its `device_wait_idle`) into a lookup — mirrors the lossless codec's
+/// `SrcImport` cache in `codec-gpu`.
+type ImportKey = (u32, u32, u32, u64, u32, u32, u32);
+
+fn import_key(fmt: &FrameFormat, d: &DmabufScanout) -> ImportKey {
+    (
+        d.fb_id,
+        fmt.width,
+        fmt.height,
+        fmt.modifier,
+        d.strides.first().copied().unwrap_or(fmt.stride),
+        d.offsets.first().copied().unwrap_or(0),
+        fmt.fourcc,
+    )
+}
+
+/// Maximum number of imported scanout buffers kept alive (the compositor
+/// swaps between a handful; 4 covers triple/double buffering plus a spare).
+const IMPORT_CACHE: usize = 4;
+
 pub struct LossyMaterializer {
     budget: usize,
     chroma444: bool,
@@ -48,7 +71,11 @@ pub struct LossyMaterializer {
     modifier: u64,
     stride: u32,
     offset: u32,
-    image: Option<Image>,
+    /// currently selected import (what `copy_frame` samples)
+    cur: Option<(ImportKey, Image)>,
+    /// other recently imported scanout buffers, reused when the compositor
+    /// flips back to one (key == `cur` is always excluded)
+    imports: Vec<(ImportKey, Image)>,
     dirty: bool,
     last_len: usize,
     last_mat: MatTimes,
@@ -83,7 +110,8 @@ impl LossyMaterializer {
             modifier: 0,
             stride: 0,
             offset: 0,
-            image: None,
+            cur: None,
+            imports: Vec::new(),
             dirty: false,
             last_len: 0,
             last_mat: MatTimes::ZERO,
@@ -105,11 +133,16 @@ impl LossyMaterializer {
         Ok(())
     }
 
-    fn import(&mut self, fmt: &FrameFormat) -> Result<()> {
-        if let Some(img) = self.image.take() {
-            self.vk.device_wait_idle()?;
-            self.vk.destroy_image(img);
-        }
+    /// A fresh import: record the plane geometry for `d`, then import.
+    fn import_scanout(&mut self, fmt: &FrameFormat, d: &DmabufScanout) -> Result<Image> {
+        self.fd = Some(d.fds[0].try_clone().context("dup scanout fd")?);
+        self.modifier = fmt.modifier;
+        self.stride = d.strides[0];
+        self.offset = d.offsets[0];
+        self.import(fmt)
+    }
+
+    fn import(&mut self, fmt: &FrameFormat) -> Result<Image> {
         let fd = self.fd.as_ref().context("no dmabuf fd")?;
         let vkfmt = fourcc_to_vk(fmt.fourcc)
             .with_context(|| format!("lossy: unsupported fourcc {:#010x} '{}'", fmt.fourcc, rdma_display_capture::fourcc_name(fmt.fourcc)))?;
@@ -128,8 +161,7 @@ impl LossyMaterializer {
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             vk::ImageAspectFlags::COLOR,
         )?;
-        self.image = Some(img);
-        Ok(())
+        Ok(img)
     }
 }
 
@@ -147,13 +179,40 @@ impl FrameMaterializer for LossyMaterializer {
         if d.fds.len() != 1 || fmt.num_planes != 1 {
             bail!("lossy: multi-plane scanout not supported (planes={})", d.fds.len());
         }
-        self.fd = Some(d.fds[0].try_clone().context("dup scanout fd")?);
-        self.modifier = fmt.modifier;
-        self.stride = d.strides[0];
-        self.offset = d.offsets[0];
-        self.fmt = Some(fmt.clone());
         self.ensure_encoder(fmt.width, fmt.height)?;
-        self.import(fmt)?;
+        // Reuse a cached import when the compositor flips back to a buffer we
+        // have already imported; otherwise import it once and cache it. The
+        // import (and its `device_wait_idle`) used to run every frame.
+        let key = import_key(fmt, d);
+        if d.fb_id == 0 {
+            // no stable buffer id (e.g. QEMU D-Bus scanouts): re-import every
+            // frame rather than risk reusing the previous image for a new buf
+            let img = self.import_scanout(fmt, d)?;
+            if let Some((_, old)) = self.cur.replace((key, img)) {
+                self.vk.device_wait_idle()?;
+                self.vk.destroy_image(old);
+            }
+        } else if self.cur.as_ref().map(|(k, _)| *k) != Some(key) {
+            if let Some(pos) = self.imports.iter().position(|(k, _)| *k == key) {
+                let hit = self.imports.remove(pos);
+                if let Some(old) = self.cur.replace(hit) {
+                    self.imports.push(old);
+                }
+            } else {
+                let img = self.import_scanout(fmt, d)?;
+                if let Some(old) = self.cur.replace((key, img)) {
+                    self.imports.push(old);
+                }
+            }
+            // bound the cache. Destroying is safe without a wait: the encode
+            // is synchronous and has already returned, so nothing references
+            // the evicted image.
+            while self.imports.len() > IMPORT_CACHE {
+                let (_, e) = self.imports.remove(0);
+                self.vk.destroy_image(e);
+            }
+        }
+        self.fmt = Some(fmt.clone());
         self.dirty = true;
         Ok(())
     }
@@ -163,7 +222,7 @@ impl FrameMaterializer for LossyMaterializer {
             return Ok((false, MatTimes::ZERO));
         }
         let fmt = self.fmt.clone().context("lossy: no scanout")?;
-        let img = self.image.as_ref().context("lossy: no imported image")?;
+        let img = &self.cur.as_ref().context("lossy: no imported image")?.1;
         let enc = self.enc.context("lossy: no encoder")?;
         let vkfmt = fourcc_to_vk(fmt.fourcc).context("lossy: unsupported fourcc")?;
         let view = PyrowaveImageView {
