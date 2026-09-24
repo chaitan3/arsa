@@ -1091,7 +1091,8 @@ pub struct ClientLink {
     pub codec: rdma_display_codec::Codec,
     /// lossy chroma subsampling: 0 = 4:2:0, 1 = 4:4:4
     pub codec_chroma: u8,
-    /// bytes per receive slot (raw frame, or the codec's worst case)
+    /// bytes per receive slot: the raw frame, the lossless worst case, or the
+    /// lossy downlink budget
     slot_len: usize,
     /// decode state for codec != Raw (kept here so the presenter just calls
     /// [`ClientLink::frame`])
@@ -1235,7 +1236,19 @@ impl ClientLink {
             "server chose codec {} which this client cannot decode",
             codec.name()
         );
-        anyhow::ensure!(slot_len >= meta.frame_bytes as usize, "nonsensical slot size {slot_len}");
+        // raw and lossless advertise a slot sized for the worst case (a full
+        // frame), so a slot that cannot hold one is a protocol mismatch. lossy
+        // instead advertises its downlink budget, deliberately smaller than the
+        // raw frame; only reject a degenerate slot there.
+        match codec {
+            rdma_display_codec::Codec::Lossy => {
+                anyhow::ensure!(slot_len > 0, "nonsensical slot size {slot_len}")
+            }
+            _ => anyhow::ensure!(
+                slot_len >= meta.frame_bytes as usize,
+                "nonsensical slot size {slot_len}"
+            ),
+        }
         let geom = rdma_display_codec::Geometry::new(meta.width, meta.height, meta.stride);
         let decoder = match codec {
             rdma_display_codec::Codec::Lossless => Some(rdma_display_codec::Decoder::new(geom)?),
