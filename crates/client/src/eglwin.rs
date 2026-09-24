@@ -992,7 +992,7 @@ impl EglWindow {
             i32,
             i32,
             *mut u64,
-            *mut u8,
+            *mut i32,
             *mut i32,
         ) -> u32 = match egl_func(&self.egl, "eglQueryDmaBufModifiersEXT") {
             Ok(p) => std::mem::transmute(p),
@@ -1013,7 +1013,9 @@ impl EglWindow {
                 continue;
             }
             let mut mods = vec![0u64; m as usize];
-            let mut ext = vec![0u8; m as usize];
+            // EGLBoolean is 32-bit: passing a byte-per-element buffer made the
+            // driver write 4x the allocation and corrupt the heap.
+            let mut ext = vec![0i32; m as usize];
             let mut gm = m;
             if q_mods(self.dpy, f, m, mods.as_mut_ptr(), ext.as_mut_ptr(), &mut gm) == 0 {
                 continue;
