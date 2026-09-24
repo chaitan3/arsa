@@ -732,7 +732,9 @@ impl GpuCodec {
                     | GL_TEXTURE_FETCH_BARRIER_BIT
                     | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT,
             );
-            (self.gl.finish)();
+            // no glFinish here: the encode dispatch follows on the same
+            // command stream, so GPU ordering plus the barrier is enough (the
+            // encode's own finish waits for both)
             let err = (self.gl.get_error)();
             if err != 0 {
                 bail!("source blit glError 0x{err:04x}");

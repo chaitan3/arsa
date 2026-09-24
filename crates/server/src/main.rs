@@ -865,7 +865,9 @@ fn run_capture(
                             // dmabuf, write the coded delta into the slot
                             let r = fc.encode_scanout(out)?;
                             // the codec's EGL context is current; restore ours
+                            let t = std::time::Instant::now();
                             mat.activate()?;
+                            fc.mat_activate_us = t.elapsed().as_micros() as u64;
                             return Ok(r);
                         }
                         let (changed, t) = mat.copy_frame(out)?;
@@ -1000,6 +1002,10 @@ struct FrameCodec {
     scanout: bool,
     /// set once the texture-direct import failed (avoid per-frame log spam)
     scanout_warned: bool,
+    /// periodic texture-direct breakdown (frames since the last print)
+    stat_frames: u64,
+    /// time the caller spent restoring the materializer context last frame
+    mat_activate_us: u64,
 }
 
 impl FrameCodec {
@@ -1013,6 +1019,8 @@ impl FrameCodec {
             first: true,
             scanout: false,
             scanout_warned: false,
+            stat_frames: 0,
+            mat_activate_us: 0,
         }
     }
 
@@ -1158,28 +1166,52 @@ impl FrameCodec {
         &mut self,
         out: &mut [u8],
     ) -> Result<(bool, usize, rdma_display_proto::MatTimes)> {
-        let t = std::time::Instant::now();
         let full = self.first;
         let Some(gpu) = self.gpu.as_mut() else {
             anyhow::bail!("no GPU encoder");
         };
+        let t = std::time::Instant::now();
         gpu.activate()?;
+        let act = t.elapsed();
+        let t = std::time::Instant::now();
         gpu.blit_source()?;
+        let blit = t.elapsed();
+        let t = std::time::Instant::now();
         let n = gpu.encode_tex(full)?;
-        let changed = full || gpu.last_count() > 0;
+        let enc = t.elapsed();
+        let count = gpu.last_count();
+        let changed = full || count > 0;
+        let t = std::time::Instant::now();
         if changed {
             // advance the reference only for frames the client will receive
             gpu.update_reference()?;
             self.first = false;
         }
+        let rf = t.elapsed();
         anyhow::ensure!(
             n <= out.len(),
             "coded frame {n} exceeds staging slot {}",
             out.len()
         );
+        let t = std::time::Instant::now();
         let coded = gpu.coded(n);
         out[..n].copy_from_slice(coded);
-        let us = t.elapsed().as_micros() as u64;
+        let copy = t.elapsed();
+        self.stat_frames += 1;
+        if self.stat_frames % 120 == 0 {
+            eprintln!(
+                "[server] lossless texture us: activate={} blit={} encode={} ref={} copy={} mat_restore={} | tiles={} coded={} B",
+                act.as_micros(),
+                blit.as_micros(),
+                enc.as_micros(),
+                rf.as_micros(),
+                copy.as_micros(),
+                self.mat_activate_us,
+                count,
+                n,
+            );
+        }
+        let us = (act + blit + enc + rf + copy).as_micros() as u64;
         Ok((
             changed,
             n,
