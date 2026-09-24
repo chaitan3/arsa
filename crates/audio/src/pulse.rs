@@ -151,7 +151,7 @@ impl Pulse {
                 // LITERAL 0 to frame_size (8 bytes) — maxlength=8 then makes
                 // every graph cycle hit the overrun-recovery path
                 // (skip-to-latest, send one fragsize per cycle), throttling
-                // the capture to 8 bytes/cycle ≈ one 10 ms packet per 2.5 s.
+                // the capture to 8 bytes/cycle ≈ one packet per 2.5 s.
                 // PulseAudio proper treats 0 as default; pipewire-pulse
                 // (fix_record_buffer_attr) only treats -1 as default.
                 maxlength: u32::MAX,
@@ -173,10 +173,14 @@ impl Pulse {
         server: Option<&str>,
         spec: SampleSpec,
         buffer_ms: u32,
+        minreq_bytes: u32,
     ) -> Result<Simple> {
         let tlength = (spec.rate as u64 * buffer_ms as u64 / 1000 * 4 * spec.channels as u64)
             as u32;
-        let minreq = (spec.rate as u64 * 10 / 1000 * 4 * spec.channels as u64) as u32;
+        // minreq should track the wire packet size, not a fixed 10 ms: a large
+        // minreq forces the server to batch requests and floors the latency
+        // above a small tlength.
+        let minreq = minreq_bytes.max(1);
         self.open(
             server,
             PA_STREAM_PLAYBACK,

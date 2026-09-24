@@ -15,7 +15,7 @@
 //! PA_ERR_CONNECTIONREFUSED; the device name is never queried). Since our
 //! capture server must stay root for DRM/KMS, we spawn a helper CHILD that
 //! drops privileges to the runtime-dir owner and runs the pulse stream
-//! there, streaming raw 10 ms packets back over a pipe:
+//! there, streaming raw PCM packets back over a pipe:
 //!
 //!   fork + (child: PDEATHSIG, setgroups(0), setresgid, setresuid,
 //!           HOME=<target user's home>, dup2(pipe, stdout), exec our own
@@ -151,7 +151,12 @@ fn in_process_loop(pulse: Pulse, dev: String, mbox: Mailbox) -> ! {
     loop {
         match open_capture_stream(&pulse, &dev) {
             Ok(stream) => {
-                eprintln!("[audio] capturing {dev:?} (f32le {} Hz, {}ch, 10 ms packets)", wire::RATE, wire::CHANNELS);
+                eprintln!(
+                    "[audio] capturing {dev:?} (f32le {} Hz, {}ch, {:.1} ms packets)",
+                    wire::RATE,
+                    wire::CHANNELS,
+                    wire::PACKET_FRAMES as f64 * 1000.0 / wire::RATE as f64
+                );
                 match capture_into(&stream, |pkt| {
                     fed += 1;
                     if mbox.put_overwrites(pkt) {
@@ -175,7 +180,7 @@ fn in_process_loop(pulse: Pulse, dev: String, mbox: Mailbox) -> ! {
     }
 }
 
-/// Read 10 ms packets from a pulse record stream and hand each (freshly
+/// Read wire packets from a pulse record stream and hand each (freshly
 /// stamped) to `sink` until the stream dies.
 fn capture_into(
     stream: &super::pulse::Simple,

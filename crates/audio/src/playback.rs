@@ -51,6 +51,7 @@ fn session(addr: std::net::SocketAddr, buffer_ms: u32) -> Result<()> {
         None,
         SampleSpec { rate: wire::RATE, channels: wire::CHANNELS },
         buffer_ms,
+        wire::PACKET_BYTES as u32,
     )?;
     eprintln!(
         "[audio] playing (f32le {} Hz, {}ch, {} ms buffer via the default sink)",
