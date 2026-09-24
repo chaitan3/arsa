@@ -458,14 +458,25 @@ impl GpuCodec {
             // Sampling an imported external texture from a compute shader is
             // the fast path (no blit). Not all drivers allow it; if the shader
             // does not compile we keep the blit + image path.
-            let enc_ext_prog = match build_program(&gl, ENC_EXT_SRC) {
-                Ok(p) => {
-                    eprintln!("[gpu] external-texture compute encode available (no blit)");
-                    p
-                }
-                Err(e) => {
-                    eprintln!("[gpu] external-texture compute encode unavailable ({e:#}); using blit path");
-                    0
+            // RDMA_LOSSLESS_SRC=blit forces the fragment-blit path (A/B probe:
+            // a tiled scanout may sample faster in a fragment shader than in
+            // compute).
+            let force_blit = std::env::var("RDMA_LOSSLESS_SRC")
+                .map(|v| v == "blit")
+                .unwrap_or(false);
+            let enc_ext_prog = if force_blit {
+                eprintln!("[gpu] RDMA_LOSSLESS_SRC=blit: forcing the blit + image encode path");
+                0
+            } else {
+                match build_program(&gl, ENC_EXT_SRC) {
+                    Ok(p) => {
+                        eprintln!("[gpu] external-texture compute encode available (no blit)");
+                        p
+                    }
+                    Err(e) => {
+                        eprintln!("[gpu] external-texture compute encode unavailable ({e:#}); using blit path");
+                        0
+                    }
                 }
             };
             let enc_fetch_prog = build_program(&gl, ENC_FETCH_SRC)?;
