@@ -31,7 +31,10 @@ use rdma_display_capture::{
     InputSink, QemuDbusInput, QemuDbusSource, ScreenSize,
 };
 
+mod gpu_power;
 mod lossy;
+
+use gpu_power::GpuPower;
 
 fn main() -> Result<()> {
     let mut mode = "testcard".to_string();
@@ -56,6 +59,7 @@ fn main() -> Result<()> {
     let mut lossy_budget: usize = 1_000_000;
     let mut lossy_chroma444 = false;
     let mut transport = rdma_display_rdma::TransportPref::Auto;
+    let mut gpu_power = GpuPower::Off;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -117,6 +121,10 @@ fn main() -> Result<()> {
             "--audio" => audio = true,
             "--audio-device" => audio_device = Some(args.next().expect("--audio-device needs a value")),
             "--audio-helper" => audio_helper = true,
+            "--gpu-power" => {
+                let v = args.next().expect("--gpu-power needs a value");
+                gpu_power = GpuPower::parse(&v)?;
+            }
             "--help" | "-h" => {
                 println!("usage: rdma-display-server [--mode testcard|capture] [--device mlx5_0] [--listen 0.0.0.0:4791] [--slots 3] [--fps 60]\n  \
 capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS capture, the host — requires sudo/CAP_SYS_ADMIN, kernel >= 5.8)\n  \
@@ -128,6 +136,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
   --codec raw|lossless|lossy  frame coding for the whole session (default raw = unchanged wire). lossless = tile-delta against the previous frame (desktop-friendly); lossy = PyroWave intra-only GPU codec (needs libpyrowave-shared.so). The client negotiates automatically.\n  \
   --lossy-budget BYTES  lossy: max bitstream bytes per frame (default 1000000; slot size sent to the client).\n  \
   --lossy-chroma 420|444  lossy: chroma subsampling (default 420).\n  \
+  --gpu-power off|p5|p0|max|<sm>[,<mem>]  pin the NVIDIA GPU clocks with nvidia-smi (needs root; warns and continues if unavailable). p5 = the measured fast state (sm 435 / mem 810 MHz), p0/max = the card's maximum, <sm>[,<mem>] = explicit MHz. Default off. GeForce cards reject the memory-clock lock.\n  \
   --transport auto|rdma|tcp  video transport (default auto: RDMA/RoCE when available, else TCP). Negotiated with the client; TCP sends length-prefixed coded frames on a TAG_VIDEO connection.\n  \
   --fps N (capture): pacing cap; 0 = uncapped, consumer-paced by client credits (default 30). For lower latency use 60 or 0.\n  \
   --audio [--audio-device my-sink.monitor]  audio side-channel: capture the named source's PCM through the pipewire-pulse\n  \
@@ -144,6 +153,13 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
         return rdma_display_audio::capture::run_helper(
             audio_device.as_deref().unwrap_or("@DEFAULT_MONITOR@"),
         );
+    }
+
+    // best-effort GPU clock pin (--gpu-power): never fatal, so a non-root or
+    // non-NVIDIA box still streams on the driver's own power management
+    if let Err(e) = gpu_power.apply() {
+        eprintln!("[gpu-power] {e:#}");
+        eprintln!("[gpu-power] continuing with the driver's default power management");
     }
 
     // video transport: auto prefers RDMA/RoCE and falls back to TCP when no
