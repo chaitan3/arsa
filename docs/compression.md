@@ -106,24 +106,35 @@ client sees is always full.
 
 ## Where the cost sits
 
-`lossless` encodes on the **GPU** (`rdma-display-codec-gpu`, GLES 3.1 compute)
-in the server's send path: the materializer reads the scanout back into the
-pinned staging slot, the GPU tile-diffs it against a reference and compacts
-the changed tiles, and only the coded bytes are posted. The CPU reference
-encoder is kept as a fallback if the GPU codec can't be created.
+`lossless` encodes on the **GPU** (`rdma-display-codec-gpu`, GLES 3.1 compute).
+There are two input paths:
 
-Per 4K frame the encode is roughly `cpu 6.6 ms / gpu 0.2 ms` for a delta and
-`cpu 9.3 ms / gpu 8.1 ms` for a full frame — the full-frame cost is dominated
-by moving the payload either way, so on high-motion content that compresses
-poorly `raw` is still the cheaper choice.
+- **Texture-direct (default when the scanout is a dmabuf):** the encoder imports
+  the KMS scanout dma-buf into its own GLES context (`eglCreateImageKHR` →
+  `GL_TEXTURE_EXTERNAL_OES`), blits it once to an RGBA8 image (GPU→GPU — the
+  channel normalize the readback used to do), and the compute shader reads that
+  image directly. The frame never leaves the GPU: no full-frame `glReadPixels`
+  to host and no re-upload. Only the coded delta is copied into the pinned
+  staging slot, so a static frame costs about the changed tiles.
+- **Readback fallback** (no dmabuf, import unsupported, or no GPU encoder): the
+  materializer reads the scanout back into the pinned staging slot, the encoder
+  uploads it and tile-diffs as before. The CPU reference encoder is the last
+  fallback if the GPU codec can't be created at all.
+
+The dmabuf blit swizzles `.bgra`, so the source image's `R,G,B,A` equals the
+wire bytes `B,G,R,A` — exactly what `glReadPixels(GL_BGRA)` of the materializer's
+linear target yields. The coded byte format is therefore identical on both
+paths and the client cannot tell them apart.
+
+The per-frame *compute* is roughly `cpu 6.6 ms / gpu 0.2 ms` for a delta and
+`cpu 9.3 ms / gpu 8.1 ms` for a full frame, but those numbers exclude the
+input: on the readback path a delta also pays ~5.5 ms `glReadPixels` plus the
+re-upload, which the texture-direct path removes. On high-motion content that
+compresses poorly `raw` is still the cheaper choice (a texture-direct delta then
+costs about the same as the coded payload's readback).
 
 On the client, `--output egl` decodes the tiles on the GPU straight into the
 texture the presenter draws (`GpuVideoDecoder`, attached to the presenter's
 GLES context), so a delta patches only the changed region: no full-frame CPU
 decode and no full-frame `glTexImage2D` upload. Headless (`--output none`)
 keeps the CPU decoder.
-
-The next step for lossless is to feed the server encoder the linear RGBA8
-target directly (share the materializer's context, sample the texture in the
-compute shader) instead of going through the readback, so a static frame costs
-only the coded bytes' readback. The byte format is unchanged.
