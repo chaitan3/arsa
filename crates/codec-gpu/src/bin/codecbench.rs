@@ -235,6 +235,47 @@ fn decoder_roundtrip(geom: Geometry, frames: &[Vec<u32>]) -> Result<()> {
     Ok(())
 }
 
+/// Texture-input encode: the same frames uploaded into the RGBA8 source image
+/// and encoded through the image-input compute (the production texture-direct
+/// path). Must be bit-identical to the SSBO encode and CPU-decodable.
+fn texture_encode(geom: Geometry, frames: &[Vec<u32>]) -> Result<()> {
+    let mut gpu = GpuCodec::new(geom)?;
+    let mut ssbo = GpuCodec::new(geom)?;
+    let mut dec = Decoder::new(geom)?;
+    let mut tex_us = Vec::new();
+    for (i, frame) in frames.iter().enumerate() {
+        let fb = words_bytes(frame);
+        // each GpuCodec owns its own EGL context: make it current before use
+        ssbo.activate()?;
+        ssbo.upload(fb)?;
+        ssbo.sync();
+        let n_ssbo = ssbo.encode(i == 0)?;
+        let count_ssbo = Header::parse(ssbo.coded(n_ssbo))?.count as usize;
+
+        gpu.activate()?;
+        gpu.upload_source_image(fb)?;
+        let t0 = Instant::now();
+        let n = gpu.encode_tex(i == 0)?;
+        tex_us.push(t0.elapsed().as_secs_f64() * 1e3);
+        let count = Header::parse(gpu.coded(n))?.count as usize;
+        if count != count_ssbo || n != n_ssbo {
+            bail!("texture encode differs at frame {i}: {count}/{n} vs {count_ssbo}/{n_ssbo}");
+        }
+        if dec.decode(gpu.coded(n))? != fb {
+            bail!("CPU decode of texture-encoded frame {i} mismatch");
+        }
+        gpu.update_reference()?;
+        ssbo.activate()?;
+        ssbo.update_reference()?;
+    }
+    eprintln!(
+        "[texture] {} frames: image-input encode bit-identical to SSBO encode; steady delta {:.2} ms",
+        frames.len(),
+        tex_us[1..].iter().sum::<f64>() / (tex_us.len() - 1) as f64
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let geom = Geometry::new(W, H, W * 4);
     let raw = geom.frame_bytes();
@@ -252,6 +293,7 @@ fn main() -> Result<()> {
     let frames = scenario();
     let _ = correctness(geom, &frames)?;
     decoder_roundtrip(geom, &frames)?;
+    texture_encode(geom, &frames)?;
 
     let cpu = cpu_timing(geom, &frames)?;
     let gpu = gpu_timing(geom, &frames)?;

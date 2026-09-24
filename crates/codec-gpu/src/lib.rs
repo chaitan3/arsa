@@ -38,6 +38,29 @@ const GL_ALL_BARRIER_BITS: u32 = 0xFFFF_FFFF;
 const GL_RENDERER: u32 = 0x1F01;
 const GL_VERSION: u32 = 0x1F02;
 
+// --- texture-direct input: dmabuf -> external texture -> RGBA8 image --------
+// EGL_EXT_image_dma_buf_import(_modifiers) attribute list
+const EGL_WIDTH: i32 = 0x3057;
+const EGL_HEIGHT: i32 = 0x3056;
+const EGL_LINUX_DMA_BUF_EXT: u32 = 0x3270;
+const EGL_LINUX_DRM_FOURCC_EXT: i32 = 0x3271;
+const EGL_DMA_BUF_PLANE0_FD_EXT: i32 = 0x3272;
+const EGL_DMA_BUF_PLANE0_OFFSET_EXT: i32 = 0x3273;
+const EGL_DMA_BUF_PLANE0_PITCH_EXT: i32 = 0x3274;
+const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: i32 = 0x3443;
+const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: i32 = 0x3444;
+
+const GL_TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
+const GL_TEXTURE0: u32 = 0x84C0;
+const GL_TEXTURE_WRAP_S: u32 = 0x2802;
+const GL_TEXTURE_WRAP_T: u32 = 0x2803;
+const GL_CLAMP_TO_EDGE: u32 = 0x812F;
+const GL_TRIANGLES: u32 = 0x0004;
+const GL_READ_ONLY: u32 = 0x88B8;
+const GL_FRAGMENT_SHADER: u32 = 0x8B30;
+const GL_VERTEX_SHADER: u32 = 0x8B31;
+const GL_FRAMEBUFFER_BARRIER_BIT: u32 = 0x0000_0400;
+
 type Handle = *mut c_void;
 type FnGetProc = unsafe extern "system" fn(*const u8) -> *const c_void;
 
@@ -49,6 +72,11 @@ type FnBindApi = unsafe extern "system" fn(u32) -> u32;
 type FnChooseConfig = unsafe extern "system" fn(Handle, *const i32, *mut Handle, i32, *mut i32) -> u32;
 type FnCreateContext = unsafe extern "system" fn(Handle, Handle, Handle, *const i32) -> Handle;
 type FnMakeCurrent = unsafe extern "system" fn(Handle, Handle, Handle, Handle) -> u32;
+type FnCreateImageKhr =
+    unsafe extern "system" fn(Handle, Handle, u32, Handle, *const i32) -> Handle;
+type FnDestroyImageKhr = unsafe extern "system" fn(Handle, Handle) -> u32;
+type FnEglGetError = unsafe extern "system" fn() -> u32;
+type FnImageTargetTexture = unsafe extern "system" fn(u32, *const c_void);
 
 type FnGetString = unsafe extern "system" fn(u32) -> *const u8;
 type FnGetError = unsafe extern "system" fn() -> u32;
@@ -138,6 +166,17 @@ struct Gl {
     check_framebuffer_status: unsafe extern "system" fn(u32) -> u32,
     delete_framebuffers: unsafe extern "system" fn(i32, *const u32),
     read_pixels: unsafe extern "system" fn(i32, i32, i32, i32, u32, u32, *mut c_void),
+    // texture-direct input + blit
+    draw_arrays: unsafe extern "system" fn(u32, i32, i32),
+    viewport: unsafe extern "system" fn(i32, i32, i32, i32),
+    uniform1i: unsafe extern "system" fn(i32, i32),
+    active_texture: unsafe extern "system" fn(u32),
+    delete_textures: unsafe extern "system" fn(i32, *const u32),
+    tex_sub_image_2d:
+        unsafe extern "system" fn(u32, i32, i32, i32, i32, i32, u32, u32, *const c_void),
+    /// `glEGLImageTargetTexture2DOES` (optional: absent without external-image
+    /// support; the texture-direct path is then unavailable)
+    image_target_texture: Option<FnImageTargetTexture>,
 }
 
 type FnBindImageTexture = unsafe extern "system" fn(u32, u32, i32, u8, i32, u32, u32);
@@ -199,8 +238,33 @@ impl Gl {
             check_framebuffer_status: s!("glCheckFramebufferStatus"),
             delete_framebuffers: s!("glDeleteFramebuffers"),
             read_pixels: s!("glReadPixels"),
+            draw_arrays: s!("glDrawArrays"),
+            viewport: s!("glViewport"),
+            uniform1i: s!("glUniform1i"),
+            active_texture: s!("glActiveTexture"),
+            delete_textures: s!("glDeleteTextures"),
+            tex_sub_image_2d: s!("glTexSubImage2D"),
+            image_target_texture: load_sym::<FnImageTargetTexture>(
+                get,
+                lib,
+                &["glEGLImageTargetTexture2DOES"],
+            )
+            .ok(),
         })
     }
+}
+
+/// One scanout dmabuf to encode directly (no readback, no re-upload). The fd
+/// is only borrowed for the duration of [`GpuCodec::set_scanout`].
+#[derive(Clone, Copy, Debug)]
+pub struct DmabufImage {
+    pub fd: i32,
+    pub offset: u32,
+    pub stride: u32,
+    pub fourcc: u32,
+    pub modifier: u64,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// GPU codec instance: owns the EGL context and the SSBOs.
@@ -212,12 +276,25 @@ pub struct GpuCodec {
     dpy: Handle,
     ctx: Handle,
     make_current: FnMakeCurrent,
+    create_image: Option<FnCreateImageKhr>,
+    destroy_image: Option<FnDestroyImageKhr>,
+    egl_get_error: Option<FnEglGetError>,
     enc_prog: u32,
     dec_prog: u32,
+    /// blit program + program that encodes from the source image
+    blit_prog: u32,
+    enc_tex_prog: u32,
     cur: u32,
     reference: u32,
     coded: u32,
     counter: u32,
+    /// texture-direct source: external texture (dmabuf) + RGBA8 image the blit
+    /// normalizes into; `has_scanout` gates that path
+    src_tex: u32,
+    src_img: u32,
+    src_fbo: u32,
+    src_egl_image: Handle,
+    has_scanout: bool,
     coded_map: *mut u8,
     coded_len: usize,
     counter_map: *mut u32,
@@ -254,6 +331,22 @@ impl GpuCodec {
                 load_sym(get_proc, Some(&egl), &["eglQueryDevicesEXT"])?;
             let query_device_string: FnQueryDeviceString =
                 load_sym(get_proc, Some(&egl), &["eglQueryDeviceStringEXT"])?;
+            // dmabuf image import is optional: if absent, the texture-direct
+            // path is disabled and the caller falls back to upload+encode.
+            let create_image = load_sym::<FnCreateImageKhr>(
+                get_proc,
+                Some(&egl),
+                &["eglCreateImageKHR", "eglCreateImage"],
+            )
+            .ok();
+            let destroy_image = load_sym::<FnDestroyImageKhr>(
+                get_proc,
+                Some(&egl),
+                &["eglDestroyImageKHR", "eglDestroyImage"],
+            )
+            .ok();
+            let egl_get_error =
+                load_sym::<FnEglGetError>(get_proc, Some(&egl), &["eglGetError"]).ok();
 
             let mut devs: [Handle; 16] = [std::ptr::null_mut(); 16];
             let mut n = 0i32;
@@ -330,6 +423,8 @@ impl GpuCodec {
 
             let enc_prog = build_program(&gl, &enc_src())?;
             let dec_prog = build_program(&gl, &dec_src())?;
+            let blit_prog = build_graphics_program(&gl, BLIT_VS, BLIT_FS)?;
+            let enc_tex_prog = build_program(&gl, ENC_TEX_SRC)?;
 
             let frame_bytes = geom.frame_bytes();
             let index_cap = geom.tile_count();
@@ -389,6 +484,42 @@ impl GpuCodec {
             (gl.bind_buffer_base)(GL_SHADER_STORAGE_BUFFER, 2, coded);
             (gl.bind_buffer_base)(GL_SHADER_STORAGE_BUFFER, 3, counter);
 
+            // texture-direct source image: immutable RGBA8 storage so it can
+            // be both an FBO color attachment (the blit) and a bound image
+            // (the encode compute reads it)
+            let mut texs = [0u32; 1];
+            (gl.gen_textures)(1, texs.as_mut_ptr());
+            let src_img = texs[0];
+            (gl.bind_texture)(GL_TEXTURE_2D, src_img);
+            (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST as i32);
+            (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST as i32);
+            (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE as i32);
+            (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE as i32);
+            (gl.tex_storage_2d)(
+                GL_TEXTURE_2D,
+                1,
+                GL_RGBA8,
+                geom.width as i32,
+                geom.height as i32,
+            );
+            let mut fbos = [0u32; 1];
+            (gl.gen_framebuffers)(1, fbos.as_mut_ptr());
+            let src_fbo = fbos[0];
+            (gl.bind_framebuffer)(GL_FRAMEBUFFER, src_fbo);
+            (gl.framebuffer_texture_2d)(
+                GL_FRAMEBUFFER,
+                GL_COLOR_ATTACHMENT0,
+                GL_TEXTURE_2D,
+                src_img,
+                0,
+            );
+            let st = (gl.check_framebuffer_status)(GL_FRAMEBUFFER);
+            if st != GL_FRAMEBUFFER_COMPLETE {
+                bail!("gpu codec source FBO incomplete: 0x{st:04x}");
+            }
+            (gl.bind_framebuffer)(GL_FRAMEBUFFER, 0);
+            (gl.bind_texture)(GL_TEXTURE_2D, 0);
+
             Ok(Self {
                 geom,
                 gl,
@@ -397,12 +528,22 @@ impl GpuCodec {
                 dpy,
                 ctx,
                 make_current,
+                create_image,
+                destroy_image,
+                egl_get_error,
                 enc_prog,
                 dec_prog,
+                blit_prog,
+                enc_tex_prog,
                 cur,
                 reference,
                 coded,
                 counter,
+                src_tex: 0,
+                src_img,
+                src_fbo,
+                src_egl_image: std::ptr::null_mut(),
+                has_scanout: false,
                 coded_map: coded_map as *mut u8,
                 coded_len,
                 counter_map: counter_map as *mut u32,
@@ -452,9 +593,212 @@ impl GpuCodec {
         Ok(())
     }
 
+    /// Whether a scanout is imported for texture-direct encoding.
+    pub fn has_scanout(&self) -> bool {
+        self.has_scanout
+    }
+
+    /// Tiles changed by the most recent `encode`/`encode_tex` (0 = idle delta).
+    pub fn last_count(&self) -> usize {
+        self.last_count
+    }
+
+    /// Import (or re-import) a scanout dmabuf as an external texture and blit
+    /// it into the RGBA8 source image, so [`encode_tex`](Self::encode_tex)
+    /// encodes straight from GPU memory — no full-frame readback to host and no
+    /// re-upload. Makes the codec's EGL context current itself. Errors (missing
+    /// `EGL_EXT_image_dma_buf_import`, unsupported modifier, ...) are returned
+    /// so the caller can fall back to the readback+upload path.
+    pub fn set_scanout(&mut self, d: &DmabufImage) -> Result<()> {
+        self.activate()?;
+        let create = self
+            .create_image
+            .context("no eglCreateImageKHR (EGL_EXT_image_dma_buf_import absent)")?;
+        let destroy = self.destroy_image.context("no eglDestroyImageKHR")?;
+        let itt = self
+            .gl
+            .image_target_texture
+            .context("no glEGLImageTargetTexture2DOES")?;
+
+        // release the previous import (unbind before deleting either object)
+        if !self.src_egl_image.is_null() {
+            unsafe {
+                (self.gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, 0);
+                if self.src_tex != 0 {
+                    let t = [self.src_tex];
+                    (self.gl.delete_textures)(1, t.as_ptr());
+                }
+                (destroy)(self.dpy, self.src_egl_image);
+            }
+            self.src_egl_image = std::ptr::null_mut();
+            self.src_tex = 0;
+            self.has_scanout = false;
+        }
+
+        let attrs: [i32; 17] = [
+            EGL_WIDTH,
+            d.width as i32,
+            EGL_HEIGHT,
+            d.height as i32,
+            EGL_LINUX_DRM_FOURCC_EXT,
+            d.fourcc as i32,
+            EGL_DMA_BUF_PLANE0_FD_EXT,
+            d.fd,
+            EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+            d.offset as i32,
+            EGL_DMA_BUF_PLANE0_PITCH_EXT,
+            d.stride as i32,
+            EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+            (d.modifier & 0xffff_ffff) as i32,
+            EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
+            (d.modifier >> 32) as i32,
+            EGL_NONE,
+        ];
+        let img = unsafe {
+            (create)(
+                self.dpy,
+                std::ptr::null_mut(),
+                EGL_LINUX_DMA_BUF_EXT,
+                std::ptr::null_mut(),
+                attrs.as_ptr(),
+            )
+        };
+        if img.is_null() {
+            let e = self.egl_get_error.map(|f| unsafe { f() }).unwrap_or(0);
+            bail!("eglCreateImageKHR(dmabuf) failed (err {e:#06x})");
+        }
+
+        unsafe {
+            let mut t = [0u32; 1];
+            (self.gl.gen_textures)(1, t.as_mut_ptr());
+            (self.gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, t[0]);
+            (itt)(GL_TEXTURE_EXTERNAL_OES, img);
+            (self.gl.tex_parameteri)(
+                GL_TEXTURE_EXTERNAL_OES,
+                GL_TEXTURE_MIN_FILTER,
+                GL_NEAREST as i32,
+            );
+            (self.gl.tex_parameteri)(
+                GL_TEXTURE_EXTERNAL_OES,
+                GL_TEXTURE_MAG_FILTER,
+                GL_NEAREST as i32,
+            );
+            (self.gl.tex_parameteri)(
+                GL_TEXTURE_EXTERNAL_OES,
+                GL_TEXTURE_WRAP_S,
+                GL_CLAMP_TO_EDGE as i32,
+            );
+            (self.gl.tex_parameteri)(
+                GL_TEXTURE_EXTERNAL_OES,
+                GL_TEXTURE_WRAP_T,
+                GL_CLAMP_TO_EDGE as i32,
+            );
+            let err = (self.gl.get_error)();
+            if err != 0 {
+                (destroy)(self.dpy, img);
+                bail!("EGLImage -> external texture glError 0x{err:04x}");
+            }
+            self.src_tex = t[0];
+        }
+        self.src_egl_image = img;
+        self.has_scanout = true;
+        Ok(())
+    }
+
+    /// Blit the imported external texture into the source image, swizzled so
+    /// the image's `(R,G,B,A)` equals the wire bytes `(B,G,R,A)` — exactly what
+    /// the materializer's `glReadPixels(GL_BGRA)` of its linear target yields.
+    /// The encode compute then reconstructs the same 32-bit words via
+    /// `packUnorm4x8(imageLoad(...))`. GPU→GPU only.
+    pub fn blit_source(&self) -> Result<()> {
+        if !self.has_scanout {
+            bail!("blit_source: no scanout imported");
+        }
+        unsafe {
+            (self.gl.use_program)(self.blit_prog);
+            (self.gl.viewport)(0, 0, self.geom.width as i32, self.geom.height as i32);
+            (self.gl.bind_framebuffer)(GL_FRAMEBUFFER, self.src_fbo);
+            (self.gl.active_texture)(GL_TEXTURE0);
+            (self.gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, self.src_tex);
+            let c = CString::new("tex").unwrap();
+            let loc = (self.gl.get_uniform_location)(self.blit_prog, c.as_ptr() as *const u8);
+            if loc >= 0 {
+                (self.gl.uniform1i)(loc, 0);
+            }
+            (self.gl.draw_arrays)(GL_TRIANGLES, 0, 3);
+            (self.gl.bind_framebuffer)(GL_FRAMEBUFFER, 0);
+            (self.gl.memory_barrier)(
+                GL_FRAMEBUFFER_BARRIER_BIT
+                    | GL_TEXTURE_FETCH_BARRIER_BIT
+                    | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT,
+            );
+            (self.gl.finish)();
+            let err = (self.gl.get_error)();
+            if err != 0 {
+                bail!("source blit glError 0x{err:04x}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode directly from the source image (after `blit_source`, or after
+    /// `upload_source_image` in tests); no `cur` upload. Binds the image at
+    /// unit 0 and runs the texture-input compute.
+    pub fn encode_tex(&mut self, full: bool) -> Result<usize> {
+        if !self.has_scanout && self.src_img == 0 {
+            bail!("encode_tex: no source image");
+        }
+        unsafe {
+            (self.gl.bind_image_texture)(0, self.src_img, 0, 0, 0, GL_READ_ONLY, GL_RGBA8);
+            let e = (self.gl.get_error)();
+            if e != 0 {
+                bail!("encode_tex: bind_image_texture glError 0x{e:04x}");
+            }
+        }
+        let prog = self.enc_tex_prog;
+        let n = self.encode_with(prog, full)?;
+        unsafe {
+            let e = (self.gl.get_error)();
+            if e != 0 {
+                bail!("encode_tex: glError 0x{e:04x} after dispatch");
+            }
+        }
+        Ok(n)
+    }
+
+    /// Test hook: fill the source image from tightly-packed wire bytes
+    /// (`(R,G,B,A) == (wire0,wire1,wire2,wire3)`), mirroring the blit output.
+    pub fn upload_source_image(&self, frame: &[u8]) -> Result<()> {
+        assert_eq!(frame.len(), self.frame_bytes);
+        unsafe {
+            (self.gl.bind_texture)(GL_TEXTURE_2D, self.src_img);
+            (self.gl.tex_sub_image_2d)(
+                GL_TEXTURE_2D,
+                0,
+                0,
+                0,
+                self.geom.width as i32,
+                self.geom.height as i32,
+                GL_RGBA,
+                GL_UNSIGNED_BYTE,
+                frame.as_ptr() as *const c_void,
+            );
+            (self.gl.memory_barrier)(GL_TEXTURE_FETCH_BARRIER_BIT);
+            (self.gl.finish)();
+        }
+        Ok(())
+    }
+
     /// Encode the uploaded frame; `full` forces a full frame. Returns the
     /// coded length.
     pub fn encode(&mut self, full: bool) -> Result<usize> {
+        let prog = self.enc_prog;
+        self.encode_with(prog, full)
+    }
+
+    /// Shared encode body. `prog` is either the SSBO-input (`cur`) encoder or
+    /// the image-input (`src_img`) encoder.
+    fn encode_with(&mut self, prog: u32, full: bool) -> Result<usize> {
         let g = self.geom;
         let h = Header {
             codec: rdma_display_codec::CODEC_LOSSLESS,
@@ -473,10 +817,10 @@ impl GpuCodec {
             h.write(std::slice::from_raw_parts_mut(self.coded_map, HEADER_LEN));
             *self.counter_map = 0;
             (self.gl.memory_barrier)(GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT);
-            (self.gl.use_program)(self.enc_prog);
+            (self.gl.use_program)(prog);
             let u = |name: &str| {
                 let c = CString::new(name).unwrap();
-                (self.gl.get_uniform_location)(self.enc_prog, c.as_ptr() as *const u8)
+                (self.gl.get_uniform_location)(prog, c.as_ptr() as *const u8)
             };
             (self.gl.uniform1ui)(u("u_width"), g.width);
             (self.gl.uniform1ui)(u("u_height"), g.height);
@@ -840,6 +1184,130 @@ fn build_program(gl: &Gl, src: &str) -> Result<u32> {
         Ok(prog)
     }
 }
+
+/// Compile+link a vertex+fragment program (the dmabuf blit).
+fn build_graphics_program(gl: &Gl, vs_src: &str, fs_src: &str) -> Result<u32> {
+    unsafe {
+        let compile = |ty: u32, src: &str, what: &str| -> Result<u32> {
+            let sh = (gl.create_shader)(ty);
+            let c = CString::new(src.as_bytes()).unwrap();
+            (gl.shader_source)(
+                sh,
+                1,
+                (&[c.as_ptr() as *const u8] as *const [*const u8]) as *const *const u8,
+                std::ptr::null(),
+            );
+            (gl.compile_shader)(sh);
+            let mut ok = 0;
+            (gl.get_shaderiv)(sh, GL_COMPILE_STATUS, &mut ok);
+            if ok == 0 {
+                let mut log = [0u8; 4096];
+                let mut n = 0;
+                (gl.get_shader_info_log)(sh, 4096, &mut n, log.as_mut_ptr());
+                bail!(
+                    "{what} shader compile failed: {}",
+                    String::from_utf8_lossy(&log[..n as usize])
+                );
+            }
+            Ok(sh)
+        };
+        let vs = compile(GL_VERTEX_SHADER, vs_src, "vertex")?;
+        let fs = compile(GL_FRAGMENT_SHADER, fs_src, "fragment")?;
+        let prog = (gl.create_program)();
+        (gl.attach_shader)(prog, vs);
+        (gl.attach_shader)(prog, fs);
+        (gl.link_program)(prog);
+        let mut ok = 0;
+        (gl.get_programiv)(prog, GL_LINK_STATUS, &mut ok);
+        if ok == 0 {
+            let mut log = [0u8; 4096];
+            let mut n = 0;
+            (gl.get_program_info_log)(prog, 4096, &mut n, log.as_mut_ptr());
+            bail!(
+                "blit program link failed: {}",
+                String::from_utf8_lossy(&log[..n as usize])
+            );
+        }
+        Ok(prog)
+    }
+}
+
+/// Full-screen triangle for the scanout blit; the `.bgra` in the fragment
+/// shader makes the source image's R,G,B,A equal the wire bytes B,G,R,A
+/// (matching the materializer's `glReadPixels(GL_BGRA)` readback), so the
+/// encoder reconstructs identical 32-bit words.
+const BLIT_VS: &str = r#"#version 310 es
+out vec2 v_uv;
+void main() {
+    float x = float((gl_VertexID == 1) ? 3 : -1);
+    float y = float((gl_VertexID == 2) ? 3 : -1);
+    v_uv = vec2(x, y) * 0.5 + 0.5;
+    gl_Position = vec4(vec2(x, y), 0.0, 1.0);
+}
+"#;
+
+const BLIT_FS: &str = r#"#version 310 es
+#extension GL_OES_EGL_image_external_essl3 : require
+precision highp float;
+uniform samplerExternalOES tex;
+in vec2 v_uv;
+out vec4 frag;
+void main() { frag = texture(tex, v_uv).bgra; }
+"#;
+
+/// Encode directly from the RGBA8 source image (the blit output). Same
+/// tile-delta format as the SSBO encoder; only the word source differs.
+const ENC_TEX_SRC: &str = r#"#version 310 es
+precision highp int;
+layout(local_size_x = 256) in;
+uniform uint u_width, u_height, u_stride_px, u_tiles_x, u_full, u_pbase_words;
+layout(rgba8, binding = 0) readonly uniform highp image2D u_src;
+layout(std430, binding = 1) readonly buffer Ref { uint ref[]; };
+layout(std430, binding = 2) writeonly buffer Out { uint outb[]; };
+layout(std430, binding = 3) buffer Cnt { uint count; };
+const uint TILE = 64u;
+const uint TW = TILE * TILE;
+shared uint s_changed;
+shared uint s_k;
+uint word(uint x, uint y) {
+    return packUnorm4x8(imageLoad(u_src, ivec2(int(x), int(y))));
+}
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint tile_id = gl_WorkGroupID.x;
+    uint tx = tile_id % u_tiles_x;
+    uint ty = tile_id / u_tiles_x;
+    uint x0 = tx * TILE, y0 = ty * TILE;
+    uint vw = min(TILE, u_width - x0);
+    uint vh = min(TILE, u_height - y0);
+    bool changed = (u_full != 0u);
+    if (!changed) {
+        for (uint i = tid; i < TW; i += 256u) {
+            uint lx = i % TILE, ly = i / TILE;
+            if (lx >= vw || ly >= vh) continue;
+            uint gi = (y0 + ly) * u_stride_px + (x0 + lx);
+            if (word(x0 + lx, y0 + ly) != ref[gi]) { changed = true; break; }
+        }
+    }
+    if (tid == 0u) s_changed = 0u;
+    barrier();
+    if (changed) atomicOr(s_changed, 1u);
+    barrier();
+    if (s_changed == 0u) return;
+    if (tid == 0u) { uint k = atomicAdd(count, 1u); s_k = k; outb[8u + k] = tile_id; }
+    barrier();
+    uint base = u_pbase_words + s_k * TW;
+    for (uint i = tid; i < TW; i += 256u) {
+        uint lx = i % TILE, ly = i / TILE;
+        uint o = base + i;
+        if (lx < vw && ly < vh) {
+            outb[o] = word(x0 + lx, y0 + ly);
+        } else {
+            outb[o] = 0u;
+        }
+    }
+}
+"#;
 
 const ENC_SRC: &str = r#"#version 310 es
 precision highp int;
