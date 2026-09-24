@@ -71,6 +71,10 @@ const EGL_DMA_BUF_PLANE0_OFFSET_EXT: i32 = 0x3273;
 const EGL_DMA_BUF_PLANE0_PITCH_EXT: i32 = 0x3274;
 /// DRM_FORMAT_R8 ('R','8',' ',' ')
 const DRM_FORMAT_R8: i32 = 0x2020_3852;
+const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: i32 = 0x3443;
+const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: i32 = 0x3444;
+const EGL_EXTENSIONS: i32 = 0x3055;
+const GL_EXTENSIONS: u32 = 0x1F03;
 
 fn sym<T: Copy>(lib: &libloading::Library, name: &str) -> Result<T> {
     unsafe {
@@ -99,6 +103,7 @@ struct EglLib {
     swap_interval: unsafe extern "system" fn(*mut c_void, i32) -> u32,
     get_error: unsafe extern "system" fn() -> i32,
     get_proc_address: unsafe extern "system" fn(*const i8) -> *const c_void,
+    query_string: unsafe extern "system" fn(*mut c_void, i32) -> *const i8,
 }
 
 struct Gl {
@@ -131,6 +136,7 @@ struct Gl {
     draw_arrays: unsafe extern "system" fn(u32, i32, i32),
     clear: unsafe extern "system" fn(u32),
     get_error: unsafe extern "system" fn() -> u32,
+    get_string: unsafe extern "system" fn(u32) -> *const u8,
     enable: unsafe extern "system" fn(u32),
     disable: unsafe extern "system" fn(u32),
     blend_func: unsafe extern "system" fn(u32, u32),
@@ -420,6 +426,7 @@ impl EglWindow {
             swap_interval: sym(&lib, "eglSwapInterval")?,
             get_error: sym(&lib, "eglGetError")?,
             get_proc_address: sym(&lib, "eglGetProcAddress")?,
+            query_string: sym(&lib, "eglQueryString")?,
             lib,
         };
         let err = || unsafe { (egl.get_error)() };
@@ -526,6 +533,7 @@ impl EglWindow {
             draw_arrays: glsym!("glDrawArrays", unsafe extern "system" fn(u32, i32, i32)),
             clear: glsym!("glClear", unsafe extern "system" fn(u32)),
             get_error: glsym!("glGetError", unsafe extern "system" fn() -> u32),
+            get_string: glsym!("glGetString", unsafe extern "system" fn(u32) -> *const u8),
             enable: glsym!("glEnable", unsafe extern "system" fn(u32)),
             disable: glsym!("glDisable", unsafe extern "system" fn(u32)),
             blend_func: glsym!("glBlendFunc", unsafe extern "system" fn(u32, u32)),
@@ -964,12 +972,42 @@ impl EglWindow {
         let bind_image: unsafe extern "system" fn(u32, *mut c_void) =
             unsafe { std::mem::transmute(egl_func(&self.egl, "glEGLImageTargetTexture2DOES")?) };
 
+        // Diagnostic: what the driver actually offers for dma-buf -> GL.
+        unsafe {
+            let e = (self.egl.query_string)(self.dpy, EGL_EXTENSIONS);
+            if !e.is_null() {
+                eprintln!(
+                    "[eglwin] EGL extensions: {}",
+                    std::ffi::CStr::from_ptr(e).to_string_lossy()
+                );
+            }
+            let g = (self.gl.get_string)(GL_EXTENSIONS);
+            if !g.is_null() {
+                let s = std::ffi::CStr::from_ptr(g as *const i8).to_string_lossy();
+                let of: Vec<&str> = s
+                    .split_whitespace()
+                    .filter(|x| x.contains("EGL_image") || x.contains("dma_buf"))
+                    .collect();
+                eprintln!("[eglwin] GL EGL-image extensions: {}", of.join(" "));
+            }
+        }
+
         let mut last_err: Option<anyhow::Error> = None;
-        for (target, external) in [(GL_TEXTURE_2D, false), (GL_TEXTURE_EXTERNAL_OES, true)] {
+        // (target, external, use_modifier): drivers differ on which of these
+        // they accept. NVIDIA's GL rejects the legacy non-modifier import on
+        // GL_TEXTURE_2D, so also try the EGL_EXT_image_dma_buf_import_modifiers
+        // form (modifier = DRM_FORMAT_MOD_LINEAR = 0).
+        for (target, external, use_modifier) in [
+            (GL_TEXTURE_2D, false, false),
+            (GL_TEXTURE_2D, false, true),
+            (GL_TEXTURE_EXTERNAL_OES, true, false),
+            (GL_TEXTURE_EXTERNAL_OES, true, true),
+        ] {
             match unsafe {
                 self.try_import_target(
                     &planes,
                     target,
+                    use_modifier,
                     &create_image,
                     &destroy_image,
                     &bind_image,
@@ -980,12 +1018,13 @@ impl EglWindow {
                     match self.build_yuv_program() {
                         Ok(()) => {
                             eprintln!(
-                                "[eglwin] lossy: YUV planes imported as dma-bufs ({}, GPU YUV->RGB)",
+                                "[eglwin] lossy: YUV planes imported as dma-bufs ({}, {}, GPU YUV->RGB)",
                                 if external {
                                     "GL_TEXTURE_EXTERNAL_OES"
                                 } else {
                                     "GL_TEXTURE_2D"
-                                }
+                                },
+                                if use_modifier { "modifier" } else { "legacy" }
                             );
                             return Ok(());
                         }
@@ -998,7 +1037,10 @@ impl EglWindow {
                 }
                 Err(e) => {
                     unsafe { self.release_yuv_images(&destroy_image) };
-                    eprintln!("[eglwin] lossy: dma-buf import as {target:#06x} failed: {e:#}");
+                    eprintln!(
+                        "[eglwin] lossy: dma-buf import as {target:#06x} ({} ) failed: {e:#}",
+                        if use_modifier { "modifier" } else { "legacy" }
+                    );
                     last_err = Some(e);
                 }
             }
@@ -1013,6 +1055,7 @@ impl EglWindow {
         &mut self,
         planes: &[(i32, u32, u32, u32); 3],
         target: u32,
+        use_modifier: bool,
         create_image: &unsafe extern "system" fn(
             *mut c_void,
             *mut c_void,
@@ -1030,9 +1073,10 @@ impl EglWindow {
         (self.gl.gen_textures)(3, self.yuv_tex.as_mut_ptr());
         for (i, (fd, w, h, pitch)) in planes.iter().enumerate() {
             eprintln!(
-                "[eglwin] lossy plane {i}: fd {fd} {w}x{h} pitch {pitch} target {target:#06x}"
+                "[eglwin] lossy plane {i}: fd {fd} {w}x{h} pitch {pitch} target {target:#06x} {}",
+                if use_modifier { "modifier" } else { "legacy" }
             );
-            let attribs = [
+            let mut attribs = vec![
                 EGL_WIDTH,
                 *w as i32,
                 EGL_HEIGHT,
@@ -1045,8 +1089,17 @@ impl EglWindow {
                 0,
                 EGL_DMA_BUF_PLANE0_PITCH_EXT,
                 *pitch as i32,
-                EGL_NONE,
             ];
+            if use_modifier {
+                // DRM_FORMAT_MOD_LINEAR == 0 (the planes are pitch-linear)
+                attribs.extend_from_slice(&[
+                    EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+                    0,
+                    EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
+                    0,
+                ]);
+            }
+            attribs.push(EGL_NONE);
             let img = create_image(
                 self.dpy,
                 std::ptr::null_mut(),
