@@ -1,0 +1,62 @@
+#!/usr/bin/env bpftrace
+/*
+ * Phase 1 discriminator - generic DRM only.
+ *
+ * NVIDIA marks its flip entry points `notrace`, so nv_drm_handle_flip_event (and
+ * likely its siblings) cannot be attached by bpftrace or ftrace - that is why
+ * the first activity probe aborted. We therefore observe the generic DRM
+ * entry points that flip completion must funnel through *if* a page-flip event
+ * is delivered:
+ *
+ *   atomic / setfb     commits reach KMS, and which fb is handed over
+ *   arm                a flip event was armed at commit time
+ *   send_vblank        the generic vblank event function (== delivered tracepoint)
+ *   send_event*        an event was delivered to a userspace DRM client
+ *   delivered/queued   the drm_vblank_event tracepoints (generic path)
+ *
+ * Run with UNAMBIGUOUS primary-plane motion. In a visible terminal:
+ *     while :; do date +%s.%N; sleep 0.02; done
+ * or drag a window continuously. Ctrl-C to stop; maps print on exit.
+ *
+ * Reading it:
+ *   atomic/setfb = 0                        -> no motion (or no KMS commits); re-run.
+ *   setfb > 0, delivered > 0                -> generic path works: Phase 1 PASS.
+ *   setfb > 0, send_event > 0, delivered = 0 -> completion is delivered without
+ *                                              the generic vblank function; key an
+ *                                              event-driven capture off drm_send_event*.
+ *   setfb > 0, send_event = 0, delivered = 0 -> no page-flip event at all; the
+ *                                              compositor learns completion another
+ *                                              way (syncobj/out-fence) -> Phase 2.
+ *
+ * If bpftrace refuses to start on ONE symbol, delete that line and re-run; the
+ * remaining counters still separate the cases above.
+ */
+
+BEGIN {
+  printf("phase1/activity: commit + flip probe (generic DRM). Generate VISIBLE MOTION now.\n");
+}
+
+/* --- commit activity ----------------------------------------------------- */
+kprobe:drm_mode_atomic_ioctl       { @atomic++; }
+kprobe:drm_atomic_set_fb_for_plane { @setfb++; }
+
+/* --- flip-event delivery ------------------------------------------------- */
+kprobe:drm_crtc_arm_vblank_event   { @arm++; }
+kprobe:drm_crtc_send_vblank_event  { @send_vblank++; }
+kprobe:drm_send_event_locked       { @send_event_locked++; }
+kprobe:drm_send_event              { @send_event++; }
+
+tracepoint:drm:drm_vblank_event            { @event++; }
+tracepoint:drm:drm_vblank_event_queued     { @queued++; }
+tracepoint:drm:drm_vblank_event_delivered  { @delivered++; }
+
+/* --- bonus: explicit-sync usage (Phase 2 preview) ------------------------ */
+kprobe:drm_syncobj_timeline_wait_ioctl { @so_tl_wait++; }
+kprobe:drm_syncobj_wait_ioctl          { @so_wait++; }
+kprobe:drm_atomic_helper_wait_for_fences { @infence_wait++; }
+
+interval:s:2 {
+  printf("t=%llu atomic=%llu setfb=%llu delivered=%llu queued=%llu event=%llu arm=%llu send_vblank=%llu send_event=%llu so_tl_wait=%llu so_wait=%llu infence_wait=%llu\n",
+         nsecs, @atomic, @setfb, @delivered, @queued, @event, @arm, @send_vblank,
+         @send_event, @so_tl_wait, @so_wait, @infence_wait);
+}

@@ -1,0 +1,30 @@
+#!/usr/bin/env bpftrace
+/*
+ * DEAD END - kept for the record.
+ *
+ * NVIDIA marks its flip entry points `notrace`, so bpftrace/ftrace reject these
+ * kprobes ("not traceable ... attaching to it will likely fail",
+ * `cannot attach kprobe, Invalid argument`). Use phase1-activity.bt instead,
+ * which probes the generic DRM functions flip completion funnels through.
+ */
+ *
+ *   sudo bpftrace scripts/capture-handover/phase1-nvidia-paths.bt
+ *
+ * Generate visible motion. If the counters grow at the frame rate, flip
+ * completion goes through NVIDIA's callback into the generic DRM event path
+ * (which is what the drm_vblank_event_delivered tracepoint observes). Attach
+ * failures here are harmless - run phase1-flip-event.bt instead.
+ */
+
+BEGIN {
+  printf("phase1/nvidia: flip-path probe. Generate VISIBLE MOTION now.\n");
+}
+
+kprobe:nv_drm_handle_flip_event       { @nv_handle++; }
+kprobe:nv_drm_crtc_send_vblank_event  { @nv_send++; }
+kprobe:drm_crtc_send_vblank_event     { @drm_send++; }
+
+interval:s:2 {
+  printf("t=%llu nv_handle=%llu nv_send=%llu drm_send=%llu\n",
+         nsecs, @nv_handle, @nv_send, @drm_send);
+}

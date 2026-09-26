@@ -1,0 +1,59 @@
+#!/usr/bin/env bpftrace
+/*
+ * Phase 3 - identify the per-frame completion fence (context 6 in the Phase 2
+ * run) and measure when it is emitted and signalled relative to handover.
+ *
+ *   sudo bpftrace scripts/capture-handover/phase3-fence-id.bt
+ *
+ * The context number is allocated at boot; 6 is what this box used. If a run
+ * shows ctx != 6, change CTX in the three probe filters below (and the BEGIN
+ * message). The other numbers (321..325, 433) are secondary.
+ *
+ * Answers:
+ *   1. driver + timeline of the fence (dma_fence_init) -> is it NVIDIA's
+ *      present/commit fence, or a drm_crtc_commit-style fence?
+ *   2. emitted before handover (= compositor render fence, armed at submit) or
+ *      at handover (= KMS commit fence)?
+ *   3. signal offset from handover -> the safe-read delay, i.e. the settle a
+ *      short-settle capture mode should use (take a high percentile).
+ */
+
+BEGIN {
+  printf("phase3: fence identification (ctx=6). Generate VISIBLE MOTION now.\n");
+}
+
+/* timestamp of the most recent handover */
+kprobe:drm_atomic_set_fb_for_plane { @handover++; @h_at = nsecs; }
+
+/* who is context 6? */
+tracepoint:dma_fence:dma_fence_init /args->context == 6/ {
+  if (@init_show < 4) {
+    @init_show++;
+    printf("init   seq=%u drv=%s tl=%s\n", args->seqno, str(args->driver), str(args->timeline));
+  }
+}
+
+/* when is it armed relative to handover? */
+tracepoint:dma_fence:dma_fence_emit /args->context == 6/ {
+  @emit6++;
+  if (@h_at > 0) { @emit6_vs_handover_us = hist((nsecs - @h_at) / 1000); }
+}
+
+/* when does it signal relative to handover? (the safe-read delay) */
+tracepoint:dma_fence:dma_fence_signaled /args->context == 6/ {
+  @signal6++;
+  if (@h_at > 0) { @signal6_vs_handover_us = hist((nsecs - @h_at) / 1000); }
+}
+
+/* secondary: what is the ~4/frame context? (optional; ignore if it fails) */
+tracepoint:dma_fence:dma_fence_init /args->context == 433/ {
+  if (@init433_show < 2) {
+    @init433_show++;
+    printf("init433 seq=%u drv=%s tl=%s\n", args->seqno, str(args->driver), str(args->timeline));
+  }
+}
+
+interval:s:2 {
+  printf("t=%llu handover=%llu emit6=%llu signal6=%llu\n",
+         nsecs, @handover, @emit6, @signal6);
+}

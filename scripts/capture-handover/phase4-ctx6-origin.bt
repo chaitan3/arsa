@@ -1,0 +1,51 @@
+#!/usr/bin/env bpftrace
+/*
+ * Phase 4 - where do the per-frame fences come from, and is there a later GPU
+ * fence the capture must actually wait for?
+ *
+ *   sudo bpftrace scripts/capture-handover/phase4-ctx6-origin.bt
+ *
+ * Context 6 (the 1:1-per-handover fence) never goes through dma_fence_emit and
+ * signals a near-constant ~1 ms after handover, which points at the KMS commit
+ * fence (drm_crtc_commit / hw_done) rather than a GPU render fence. The kernel
+ * stacks below settle that. Context 433 (~4/frame) does go through the GPU, so
+ * its emit and signal offsets tell us whether the real render completion lands
+ * *after* context 6 - in which case a settle keyed on context 6 would be unsafe.
+ *
+ * Generate visible motion. Stacks print every 5 s; Ctrl-C to stop.
+ */
+
+BEGIN {
+  printf("phase4: fence origins (kstack). Generate VISIBLE MOTION now.\n");
+}
+
+/* 1. who creates and who signals the 1:1 fence (context 6)? */
+tracepoint:dma_fence:dma_fence_init /args->context == 6/ {
+  @creator6[kstack(8)] = count();
+}
+tracepoint:dma_fence:dma_fence_signaled /args->context == 6/ {
+  @signaler6[kstack(8)] = count();
+}
+
+/* 2. the GPU fences (context 433): armed? when do they signal vs handover? */
+kprobe:drm_atomic_set_fb_for_plane { @handover++; @h_at = nsecs; }
+
+tracepoint:dma_fence:dma_fence_emit /args->context == 433/ { @emit433++; }
+tracepoint:dma_fence:dma_fence_signaled /args->context == 433/ {
+  @signal433++;
+  if (@h_at > 0) { @signal433_vs_handover_us = hist((nsecs - @h_at) / 1000); }
+}
+
+/* 3. optional: same for a second GPU context, uncomment after seeing 433 */
+/*
+tracepoint:dma_fence:dma_fence_emit /args->context == 6/ { @emit6++; }
+*/
+
+interval:s:5 {
+  print(@creator6);
+  print(@signaler6);
+  clear(@creator6);
+  clear(@signaler6);
+  printf("t=%llu handover=%llu emit433=%llu signal433=%llu\n",
+         nsecs, @handover, @emit433, @signal433);
+}

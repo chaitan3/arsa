@@ -1,0 +1,51 @@
+#!/usr/bin/env bpftrace
+/*
+ * Phase 1 (bpftrace form of phase1-flip-event.sh) - do flip-completion events
+ * fire on this nvidia-drm stack?
+ *
+ *   sudo bpftrace scripts/capture-handover/phase1-flip-event.bt
+ *
+ * Generate visible motion (drag a window / play a video). Ctrl-C to stop; the
+ * maps (counts and the inter-flip histogram) print on exit. Tracepoints only,
+ * so this always attaches; see phase1-nvidia-paths.bt for the kprobes.
+ *
+ * Reading it:
+ *   - @delivered grows at ~the displayed frame rate  -> flip events fire.
+ *   - @interval_us peaking near ~16666 us             -> 60 Hz presentation.
+ *     (VRR shows a wider/left-shifted spread.)
+ *   - @delivered_crtc tells you which pipe. The capture target is one CRTC.
+ */
+
+BEGIN {
+  printf("phase1: flip-completion probe. Generate VISIBLE MOTION now.\n");
+}
+
+tracepoint:drm:drm_vblank_event_delivered {
+  @delivered++;
+  @delivered_crtc[args->crtc]++;
+  if (@prev[args->crtc] > 0) {
+    @interval_us[args->crtc] = hist((nsecs - @prev[args->crtc]) / 1000);
+  }
+  @prev[args->crtc] = nsecs;
+  if (@sample[args->crtc] < 5) {
+    @sample[args->crtc]++;
+    printf("delivered crtc=%d seq=%u t=%llu\n", args->crtc, args->seq, nsecs);
+  }
+}
+
+tracepoint:drm:drm_vblank_event_queued {
+  @queued++;
+  @queued_crtc[args->crtc]++;
+}
+
+tracepoint:drm:drm_vblank_event { @event++; }
+
+interval:s:2 {
+  printf("t=%llu delivered=%llu queued=%llu event=%llu\n",
+         nsecs, @delivered, @queued, @event);
+}
+
+END {
+  clear(@prev);
+  clear(@sample);
+}
