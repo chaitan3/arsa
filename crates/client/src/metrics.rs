@@ -115,7 +115,9 @@ pub struct Metrics {
     stamps: HashMap<u64, FrameStamp>,
     /// presentation timestamps whose frame was already matched: fb_id -> us
     presented: HashMap<u64, u64>,
-    frame_bytes: usize,
+    /// bytes actually received since the last refresh (the real wire transfer,
+    /// summed over every received frame — superseded ones included)
+    rx_bytes_since_refresh: u64,
     last_seq: Option<u64>,
     skipped: u64,
     frames_since_refresh: u64,
@@ -172,7 +174,7 @@ impl Metrics {
             local: VecDeque::with_capacity(4),
             stamps: HashMap::new(),
             presented: HashMap::new(),
-            frame_bytes: 0,
+            rx_bytes_since_refresh: 0,
             last_seq: None,
             skipped: 0,
             frames_since_refresh: 0,
@@ -184,8 +186,11 @@ impl Metrics {
         }
     }
 
-    pub fn set_frame_bytes(&mut self, bytes: usize) {
-        self.frame_bytes = bytes;
+    /// Count one received frame's bytes — the actual bytes the NIC/TCP moved
+    /// for it (the coded length, not the uncompressed frame size). Superseded
+    /// frames count too: they crossed the wire even though they weren't shown.
+    pub fn add_rx_bytes(&mut self, bytes: usize) {
+        self.rx_bytes_since_refresh = self.rx_bytes_since_refresh.saturating_add(bytes as u64);
     }
 
     /// Tell the overlay whether wp_presentation is bound, so the `display`
@@ -353,11 +358,16 @@ impl Metrics {
             Some(t) => {
                 let dt = now.duration_since(t).as_secs_f64().max(1e-6);
                 let fps = self.frames_since_refresh as f64 / dt;
-                (fps, self.frame_bytes as f64 * fps * 8.0 / 1e6)
+                // actual transferred bytes over the interval, not
+                // frame_size × fps: for lossless/lossy the coded frame is much
+                // smaller than the raw one.
+                let mbps = self.rx_bytes_since_refresh as f64 * 8.0 / dt / 1e6;
+                (fps, mbps)
             }
         };
         self.last_refresh = Some(now);
         self.frames_since_refresh = 0;
+        self.rx_bytes_since_refresh = 0;
 
         let stat = |pick: fn(&Sample) -> u64| -> (f64, f64) {
             let mut v: Vec<u64> = self.samples.iter().map(pick).collect();

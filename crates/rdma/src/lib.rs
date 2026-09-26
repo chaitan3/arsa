@@ -1133,6 +1133,9 @@ pub struct ClientLink {
     /// server→client control events (Stamps, Pongs) from the reader thread
     ctrl_rx: mpsc::Receiver<ControlEvent>,
     transport: Transport,
+    /// bytes moved by the most recently returned frame (the RDMA WRITE / TCP
+    /// payload length) — the actual wire transfer, for the bandwidth display
+    last_rx_bytes: usize,
 }
 
 /// Read length-prefixed `[u32 len][u64 seq][payload]` video frames off the
@@ -1352,6 +1355,7 @@ impl ClientLink {
                     rx,
                     ctrl_rx: spawn_control_reader(reader_stream),
                     transport,
+                    last_rx_bytes: 0,
                 };
                 link.rearm_all()?;
                 return Ok(link);
@@ -1387,6 +1391,7 @@ impl ClientLink {
             rx,
             ctrl_rx: spawn_control_reader(reader_stream),
             transport,
+            last_rx_bytes: 0,
         })
     }
 
@@ -1418,16 +1423,17 @@ impl ClientLink {
     /// Non-blocking variant: `Ok(None)` if no completion is ready. The
     /// presenter loop uses this to interleave RDMA with Wayland events.
     pub fn try_next_frame(&mut self) -> Result<Option<(u64, usize)>> {
-        match &mut self.rx {
+        let (frame_seq, slot, nbytes) = match &mut self.rx {
             Rx::Rdma { recv_cq, .. } => {
                 let mut completions = recv_cq.poll().context("poll recv CQ")?;
-                if let Some(wc) = completions.next() {
-                    wc.ok().context("recv work request failed")?;
-                    let imm = wc.imm_data().context("expected WRITE immediate")?;
-                    let (frame_seq, slot) = imm_decode(imm);
-                    return Ok(Some((frame_seq, slot)));
-                }
-                Ok(None)
+                let Some(wc) = completions.next() else {
+                    return Ok(None);
+                };
+                wc.ok().context("recv work request failed")?;
+                let imm = wc.imm_data().context("expected WRITE immediate")?;
+                let (frame_seq, slot) = imm_decode(imm);
+                // the RDMA WRITE length: the actual bytes that crossed the wire
+                (frame_seq, slot, wc.len())
             }
             Rx::Tcp {
                 frame_rx,
@@ -1443,16 +1449,27 @@ impl ClientLink {
                 let Some((seq, buf)) = item else {
                     return Ok(None);
                 };
+                let nbytes = buf.len();
                 if let Some(slot) = slot_free.iter().position(|f| *f) {
                     slot_free[slot] = false;
                     slots[slot] = buf;
-                    Ok(Some((seq, slot)))
+                    (seq, slot, nbytes)
                 } else {
                     *pending = Some((seq, buf)); // no free slot: retry next call
-                    Ok(None)
+                    return Ok(None);
                 }
             }
-        }
+        };
+        self.last_rx_bytes = nbytes;
+        Ok(Some((frame_seq, slot)))
+    }
+
+    /// Bytes moved by the frame most recently returned by
+    /// [`try_next_frame`](Self::try_next_frame): the RDMA WRITE length (TCP:
+    /// payload length). This is the real wire transfer, i.e. the coded frame
+    /// size, not the uncompressed frame size — use it for bandwidth.
+    pub fn last_rx_bytes(&self) -> usize {
+        self.last_rx_bytes
     }
 
     /// The negotiated video transport.

@@ -241,11 +241,7 @@ fn main() -> Result<()> {
 
     // --metrics collector: consumes server Stamps + Pongs via the control
     // reader, samples t3/t4/t5 around the GL calls, pings every PING_SECS
-    let mut metrics = metrics_on.then(|| {
-        let mut m = metrics::Metrics::new();
-        m.set_frame_bytes(link.meta.frame_bytes as usize);
-        m
-    });
+    let mut metrics = metrics_on.then(|| metrics::Metrics::new());
     // tell the overlay whether the compositor can report the true on-screen
     // time (wp_presentation), so `display` reads a number instead of n/a
     if let (Some((p, _)), Some(m)) = (presenter.as_ref(), metrics.as_mut()) {
@@ -306,6 +302,11 @@ fn main() -> Result<()> {
                 // the re-arm/credit below (those are TCP sends and would
                 // otherwise be billed to the client's receive side).
                 let t3 = rdma_display_proto::unix_now_us();
+                // bandwidth: count every received frame's real wire bytes
+                // (superseded frames included), not the uncompressed size
+                if let Some(m) = metrics.as_mut() {
+                    m.add_rx_bytes(wire_bytes(&link, slot));
+                }
                 link.rearm_slot(slot)?;
                 // Lossless deltas reference the previous frame, so every
                 // received frame must be decoded in order (skipping one
@@ -631,6 +632,36 @@ fn route_control(
             }
             None
         }
+    }
+}
+
+/// Bytes that crossed the wire for the frame currently in `slot`. Prefer the
+/// transport's reported length (the RDMA WRITE length / TCP payload length);
+/// fall back to the coded length the frame implies for transports/HCAs that
+/// report 0 for a write-with-immediate receive.
+fn wire_bytes(link: &rdma_display_rdma::ClientLink, slot: usize) -> usize {
+    let n = link.last_rx_bytes();
+    if n != 0 {
+        return n;
+    }
+    match link.codec {
+        rdma_display_codec::Codec::Raw => link.meta.frame_bytes as usize,
+        rdma_display_codec::Codec::Lossless => {
+            let g = rdma_display_codec::Geometry::new(
+                link.meta.width,
+                link.meta.height,
+                link.meta.stride,
+            );
+            rdma_display_codec::Header::parse(link.slot_bytes(slot))
+                .map(|h| {
+                    rdma_display_codec::HEADER_LEN
+                        + g.tile_count() * rdma_display_codec::INDEX_WORDS * 4
+                        + h.payload_words as usize * 4
+                })
+                .unwrap_or(0)
+        }
+        // the lossy bitstream length isn't recoverable from the slot alone
+        rdma_display_codec::Codec::Lossy => 0,
     }
 }
 
