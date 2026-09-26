@@ -55,7 +55,7 @@ The `.so` is `dlopen`ed from beside the binaries (see
 newer host bakes in symbol versions the lab lacks (e.g. `GLIBC_2.43` from
 `sqrtf`/`acosf`) and the `dlopen` fails.
 
-## Lossless format (v1)
+## Lossless format (v2)
 
 Full specification and the CPU reference implementation live in
 `crates/codec/src/lib.rs`. Summary:
@@ -66,6 +66,15 @@ Full specification and the CPU reference implementation live in
   decoded frame (only changed tiles).
 - Because the codec is lossless, the server's reference and the client's
   reference are the same pixels, so they cannot drift.
+- A changed tile is **not raw** any more. It picks the cheapest of three modes:
+  - `RAW` — the tile's valid pixels, row-major (`vw·vh` words);
+  - `REF` — runs of `cur ^ ref` (never used on a full frame: no reference yet);
+  - `DPCM` — runs of the horizontal predictor `cur[x] - cur[x-1]` (predictor 0
+    at the row start).
+  Runs are maximal within a row, so `DPCM` decode stays a per-row prefix sum.
+  Modes are chosen by coded length (strictly smaller wins; ties prefer `RAW`,
+  then `REF`, then `DPCM`), so the coded total is deterministic even though the
+  GPU packs payloads in atomic order.
 - The payload carries a CRC32 so a desync or a transport fault is caught by
   the decoder instead of silently showing wrong pixels.
 
@@ -73,7 +82,7 @@ Full specification and the CPU reference implementation live in
 offset  size            field
   0     1               magic 0xC0
   1     1               codec (1 = lossless)
-  2     1               version
+  2     1               version = 2
   3     1               flags: bit0 = delta / full
   4     1               tile_log2
   5     3               reserved
@@ -83,20 +92,35 @@ offset  size            field
  20     4  LE           changed tile count
  24     4  LE           index capacity (tiles_x * tiles_y)
  28     4  LE           crc32 of the payload
- 32     cap*4 LE        changed-tile ids, in payload order
- 32+cap*4  count*tile   tile payloads (fixed tile²·4 bytes each)
+ 32     4  LE           total payload words
+ 36    12               reserved
+ 48     cap*12 LE        tile entries {tile_id, off_words, (mode<<16)|len_words}
+ 48+cap*12  payload      packed tile payloads, in write order
 ```
 
-The index array is fixed capacity so the future GPU encoder can write payloads
-at static offsets; the decoder reads the first `count` entries. Row padding
-(`stride − width·4`) is never coded and never displayed.
+A `REF`/`DPCM` tile payload starts with `vh` per-row run counts, followed by
+`(run_len, residual)` tokens in row order. The index array is fixed capacity so
+a GPU encoder can write entries at static offsets; the payload itself is
+variable length and packed densely by an atomic bump allocator (each entry
+carries its own offset). Row padding (`stride − width·4`) is never coded and
+never displayed.
+
+### Measured (4K, RTX 2080 Ti, `codecbench` synthetic desktop)
+
+| | v1 (raw tiles) | v2 (ref/dpcm runs) |
+|---|---|---|
+| 10-frame coded total | 34.7 MiB (9.1x) | **7.9 MiB (40.3x)** |
+| steady delta | 325 KB/frame (102x) | **46 KB/frame (719x)** |
+| full first frame | 31.9 MiB (1.0x) | **7.8 MiB (4.2x)** |
+| GPU encode (steady) | 0.18 ms | 0.20 ms |
+| GPU decode (steady) | 0.07 ms | 0.04 ms |
 
 ## Slots and the wire
 
 The staging/receive slot must hold the codec's worst case:
 
 - raw: `stride × height`
-- lossless: `32 + tiles·4 + tiles·tile²·4`
+- lossless: `48 + tiles·12 + tiles·tile²·4`
 - lossy: `budget + 1 MiB` (the PyroWave bit budget plus packet framing)
 
 The server sends the codec id right after `Meta`, before the client allocates

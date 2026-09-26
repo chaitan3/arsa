@@ -14,7 +14,7 @@
 //! encoder is required to produce exactly this byte layout; the CPU encoder
 //! here is the reference implementation and the arbiter of correctness.
 //!
-//! ## Lossless format (`CODEC_LOSSLESS`, version 1)
+//! ## Lossless format (`CODEC_LOSSLESS`, version 2)
 //!
 //! The frame is cut into `tile × tile` tiles (`tile = 1 << tile_log2`). Each
 //! frame is either **full** (every tile carried) or **delta** against the
@@ -22,11 +22,24 @@
 //! is lossless, the encoder's reference and the decoder's reference are the
 //! same pixels, so they never drift.
 //!
+//! Changed tiles are no longer raw: each tile picks the cheapest of
+//!
+//! - `RAW` — the tile's valid pixels, row-major, `vw·vh` words;
+//! - `REF` — runs of `cur ^ ref` (rows independent), `(run_len, residual)`;
+//! - `DPCM` — runs of the horizontal predictor `cur[x] - cur[x-1]`
+//!   (predictor 0 at the row start), rows independent.
+//!
+//! Runs are maximal within a row. `REF` is never used on a full frame (the
+//! decoder has no reference yet). Modes are chosen by coded length (strictly
+//! smaller wins, ties prefer `RAW`, then `REF`, then `DPCM`), so the coded
+//! total is deterministic even though the GPU packs payloads in an arbitrary
+//! (atomic) order.
+//!
 //! ```text
 //! offset  size                field
 //!   0     1                   magic = 0xC0
 //!   1     1                   codec = 1
-//!   2     1                   version = 1
+//!   2     1                   version = 2
 //!   3     1                   flags: bit0 = delta (1) / full (0)
 //!   4     1                   tile_log2
 //!   5     3                   reserved (0)
@@ -36,14 +49,18 @@
 //!  20     4  LE               changed tile count
 //!  24     4  LE               index capacity (tiles_x * tiles_y)
 //!  28     4  LE               crc32 of the payload (see `finish_crc`)
-//!  32     cap*4 LE            changed-tile ids, in payload order
-//!  32+cap*4  count*tile_bytes tile payloads (fixed tile_bytes = tile²*4)
+//!  32     4  LE               total payload words
+//!  36    12                   reserved (0)
+//!  48     cap*12 LE           changed-tile entries {tile_id, off_words,
+//!                             (mode << 16) | len_words}
+//!  48+cap*12  payload_words*4  tile payloads, packed in write order
 //! ```
 //!
-//! The index array is **fixed capacity** so the GPU encoder can write payloads
-//! at static offsets; the decoder reads the first `count` entries. Payload
-//! tiles carry the valid `valid_w × valid_h` region of their tile; the rest of
-//! the fixed `tile²` slot is padding and is never read.
+//! The index array is **fixed capacity** so a GPU encoder can write entries at
+//! static offsets; the payload is variable length and packed densely by an
+//! atomic bump allocator, with each entry carrying its own offset. A tile's
+//! `REF`/`DPCM` payload starts with `vh` per-row run counts, followed by the
+//! `(run_len, residual)` tokens in row order.
 //!
 //! `crc32` is filled by [`finish_crc`] after the coded bytes are complete. The
 //! CPU encoder calls it; the GPU path calls it on the host after the readback
@@ -59,8 +76,20 @@
 use anyhow::{ensure, Result};
 
 pub const MAGIC: u8 = 0xC0;
-pub const VERSION: u8 = 1;
-pub const HEADER_LEN: usize = 32;
+pub const VERSION: u8 = 2;
+pub const HEADER_LEN: usize = 48;
+
+/// Words per changed-tile index entry (v2): `{tile_id, payload_off, mode|len}`.
+pub const INDEX_WORDS: usize = 3;
+/// Payload word offset (relative to the payload base) of the first tile.
+pub const PAYLOAD_BASE_WORDS: usize = HEADER_LEN / 4;
+
+/// Per-tile payload modes (v2).
+pub const MODE_RAW: u32 = 0;
+/// `(run_len, residual)` runs of `cur ^ ref`, rows independent.
+pub const MODE_REF: u32 = 1;
+/// `(run_len, residual)` runs of horizontal DPCM, rows independent.
+pub const MODE_DPCM: u32 = 2;
 
 pub const CODEC_RAW: u8 = 0;
 pub const CODEC_LOSSLESS: u8 = 1;
@@ -192,9 +221,14 @@ impl Geometry {
         self.stride as usize * self.height as usize
     }
 
-    /// Worst-case coded length: full frame with every tile carried.
+    /// Worst-case coded length: full frame with every tile carried raw.
     pub fn max_coded_len(&self) -> usize {
-        HEADER_LEN + self.tile_count() * 4 + self.tile_count() * self.tile_bytes()
+        HEADER_LEN + self.tile_count() * INDEX_WORDS * 4 + self.tile_count() * self.tile_bytes()
+    }
+
+    /// Byte offset of the payload region (after the fixed index array).
+    pub fn payload_off(&self) -> usize {
+        HEADER_LEN + self.tile_count() * INDEX_WORDS * 4
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -258,6 +292,9 @@ pub struct Header {
     pub count: u32,
     pub index_capacity: u32,
     pub crc32: u32,
+    /// Total coded payload words (v2). The coded length is
+    /// `payload_off() + payload_words·4`.
+    pub payload_words: u32,
 }
 
 impl Header {
@@ -290,6 +327,7 @@ impl Header {
             count: rd_u32(bytes, 20),
             index_capacity: rd_u32(bytes, 24),
             crc32: rd_u32(bytes, 28),
+            payload_words: rd_u32(bytes, 32),
         })
     }
 
@@ -307,6 +345,7 @@ impl Header {
         wr_u32(out, 20, self.count);
         wr_u32(out, 24, self.index_capacity);
         wr_u32(out, 28, self.crc32);
+        wr_u32(out, 32, self.payload_words);
     }
 }
 
@@ -317,9 +356,8 @@ pub fn finish_crc(coded: &mut [u8]) -> Result<u32> {
     let h = Header::parse(coded)?;
     let cap = h.index_capacity as usize;
     ensure!(h.count as usize <= cap, "tile count {} > capacity {}", h.count, cap);
-    let tile_bytes = (1usize << h.tile_log2) * (1usize << h.tile_log2) * BPP as usize;
-    let payload_off = HEADER_LEN + cap * 4;
-    let payload_len = h.count as usize * tile_bytes;
+    let payload_off = HEADER_LEN + cap * INDEX_WORDS * 4;
+    let payload_len = h.payload_words as usize * 4;
     ensure!(
         coded.len() >= payload_off + payload_len,
         "coded frame truncated ({} < {})",
@@ -347,28 +385,133 @@ fn tile_row_off(g: &Geometry, tx: usize, ty: usize, row: usize) -> usize {
     (ty * tile + row) * g.stride as usize + tx * tile * BPP as usize
 }
 
-/// Copy one tile's valid region from `src` into a fixed `tile²·4` payload
-/// slot (`dst`), zero-padding the remainder so the output is deterministic.
-fn pack_tile(g: &Geometry, src: &[u8], tx: usize, ty: usize, dst: &mut [u8]) {
-    let (w, h) = valid_dims(g, tx, ty);
-    let row_bytes = w * BPP as usize;
-    let tile_row = (g.tile() * BPP) as usize;
-    dst.fill(0);
-    for row in 0..h {
-        let s = tile_row_off(g, tx, ty, row);
-        dst[row * tile_row..row * tile_row + row_bytes].copy_from_slice(&src[s..s + row_bytes]);
-    }
+/// Byte offset of pixel `(x, y)` within tile `(tx, ty)` in a frame with the
+/// geometry's stride. `x`/`y` are tile-local.
+#[inline]
+fn gw(g: &Geometry, tx: usize, ty: usize, x: usize, y: usize) -> usize {
+    (ty * g.tile() as usize + y) * g.stride as usize + (tx * g.tile() as usize + x) * BPP as usize
 }
 
-/// Copy one tile's valid region out of a fixed payload slot into `dst`.
-fn unpack_tile(g: &Geometry, dst: &mut [u8], tx: usize, ty: usize, src: &[u8]) {
-    let (w, h) = valid_dims(g, tx, ty);
-    let row_bytes = w * BPP as usize;
-    let tile_row = (g.tile() * BPP) as usize;
-    for row in 0..h {
-        let d = tile_row_off(g, tx, ty, row);
-        dst[d..d + row_bytes].copy_from_slice(&src[row * tile_row..row * tile_row + row_bytes]);
+#[inline]
+fn rd_word(b: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
+}
+
+#[inline]
+fn wr_word(b: &mut [u8], o: usize, v: u32) {
+    b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Choose the cheapest mode for one tile and build its payload words into
+/// `out_words`; returns `(mode, len_words)`. This is the arbiter of the wire
+/// format: the GPU encode shaders must choose the same mode and emit the same
+/// tokens so the coded total matches.
+fn tile_plan(
+    g: &Geometry,
+    cur: &[u8],
+    reference: &[u8],
+    tx: usize,
+    ty: usize,
+    allow_ref: bool,
+    counts: &mut Vec<u32>,
+    out_words: &mut Vec<u32>,
+) -> (u32, usize) {
+    let (vw, vh) = valid_dims(g, tx, ty);
+    let n = vw * vh;
+
+    // Count maximal runs per row for both residuals in one pass. Rows are
+    // independent (a run never crosses a row boundary), which is what keeps
+    // DPCM decode a per-row prefix sum.
+    let (mut runs_ref, mut runs_dpcm) = (0usize, 0usize);
+    let (mut prev_ref, mut prev_dpcm) = (0u32, 0u32);
+    let mut prev_cur = 0u32;
+    for y in 0..vh {
+        for x in 0..vw {
+            let o = gw(g, tx, ty, x, y);
+            let w = rd_word(cur, o);
+            let r = w ^ rd_word(reference, o);
+            let d = w.wrapping_sub(if x == 0 { 0 } else { prev_cur });
+            if x == 0 || r != prev_ref {
+                runs_ref += 1;
+                prev_ref = r;
+            }
+            if x == 0 || d != prev_dpcm {
+                runs_dpcm += 1;
+                prev_dpcm = d;
+            }
+            prev_cur = w;
+        }
     }
+
+    let mut mode = MODE_RAW;
+    let mut best = n;
+    if allow_ref && (vh + 2 * runs_ref) < best {
+        best = vh + 2 * runs_ref;
+        mode = MODE_REF;
+    }
+    if (vh + 2 * runs_dpcm) < best {
+        mode = MODE_DPCM;
+    }
+
+    out_words.clear();
+    if mode == MODE_RAW {
+        for y in 0..vh {
+            for x in 0..vw {
+                out_words.push(rd_word(cur, gw(g, tx, ty, x, y)));
+            }
+        }
+        return (mode, n);
+    }
+
+    // per-row run counts, then the tokens in row order
+    counts.clear();
+    counts.resize(vh, 0);
+    for y in 0..vh {
+        let (mut runs, mut prev, mut pcur) = (0u32, 0u32, 0u32);
+        for x in 0..vw {
+            let o = gw(g, tx, ty, x, y);
+            let w = rd_word(cur, o);
+            let res = if mode == MODE_REF {
+                w ^ rd_word(reference, o)
+            } else {
+                w.wrapping_sub(if x == 0 { 0 } else { pcur })
+            };
+            if x == 0 || res != prev {
+                runs += 1;
+                prev = res;
+            }
+            pcur = w;
+        }
+        counts[y] = runs;
+    }
+    out_words.extend_from_slice(counts);
+    for y in 0..vh {
+        let (mut prev, mut runlen, mut pcur) = (0u32, 0u32, 0u32);
+        for x in 0..vw {
+            let o = gw(g, tx, ty, x, y);
+            let w = rd_word(cur, o);
+            let res = if mode == MODE_REF {
+                w ^ rd_word(reference, o)
+            } else {
+                w.wrapping_sub(if x == 0 { 0 } else { pcur })
+            };
+            if x == 0 {
+                prev = res;
+                runlen = 1;
+            } else if res == prev {
+                runlen += 1;
+            } else {
+                out_words.push(runlen);
+                out_words.push(prev);
+                prev = res;
+                runlen = 1;
+            }
+            pcur = w;
+        }
+        out_words.push(runlen);
+        out_words.push(prev);
+    }
+    (mode, out_words.len())
 }
 
 fn tile_equal(g: &Geometry, a: &[u8], b: &[u8], tx: usize, ty: usize) -> bool {
@@ -438,22 +581,43 @@ impl Encoder {
         ensure!(cur.len() >= g.frame_bytes(), "input shorter than a frame");
         ensure!(out.len() >= g.max_coded_len(), "output buffer too small");
         let cap = g.tile_count();
-        let tile_bytes = g.tile_bytes();
         let delta = self.have_reference;
-        let payload_off = HEADER_LEN + cap * 4;
+        let payload_off = g.payload_off();
 
+        let mut counts: Vec<u32> = Vec::new();
+        let mut words: Vec<u32> = Vec::new();
         let mut count = 0usize;
+        let mut cursor = 0usize; // payload words written so far
+
         for ty in 0..g.tiles_y() {
             for tx in 0..g.tiles_x() {
-                let changed = !delta || !tile_equal(&g, cur, &self.reference, tx, ty);
-                if !changed {
+                if delta && tile_equal(&g, cur, &self.reference, tx, ty) {
                     continue;
                 }
                 let id = (ty * g.tiles_x() + tx) as u32;
-                wr_u32(out, HEADER_LEN + count * 4, id);
-                let po = payload_off + count * tile_bytes;
-                pack_tile(&g, cur, tx, ty, &mut out[po..po + tile_bytes]);
+                let (mode, len) = tile_plan(
+                    &g, cur, &self.reference, tx, ty, delta, &mut counts, &mut words,
+                );
+                let e = HEADER_LEN + count * INDEX_WORDS * 4;
+                wr_u32(out, e, id);
+                wr_u32(out, e + 4, cursor as u32);
+                wr_u32(out, e + 8, (mode << 16) | (len as u32));
+                let po = payload_off + cursor * 4;
+                for (i, &w) in words.iter().enumerate() {
+                    wr_word(out, po + i * 4, w);
+                }
+                cursor += len;
                 count += 1;
+
+                // advance the reference so the next delta can compare
+                let (vw, vh) = valid_dims(&g, tx, ty);
+                for y in 0..vh {
+                    for x in 0..vw {
+                        let o = gw(&g, tx, ty, x, y);
+                        let v = rd_word(cur, o);
+                        wr_word(&mut self.reference, o, v);
+                    }
+                }
             }
         }
 
@@ -469,14 +633,14 @@ impl Encoder {
             count: count as u32,
             index_capacity: cap as u32,
             crc32: 0,
+            payload_words: cursor as u32,
         };
         h.write(out);
-        let len = payload_off + count * tile_bytes;
+        let len = payload_off + cursor * 4;
         if self.with_crc {
             finish_crc(&mut out[..len])?;
         }
 
-        self.reference[..g.frame_bytes()].copy_from_slice(&cur[..g.frame_bytes()]);
         self.have_reference = true;
         Ok(len)
     }
@@ -526,9 +690,8 @@ impl Decoder {
         }
 
         let cap = h.index_capacity as usize;
-        let tile_bytes = g.tile_bytes();
-        let payload_off = HEADER_LEN + cap * 4;
-        let payload_len = h.count as usize * tile_bytes;
+        let payload_off = HEADER_LEN + cap * INDEX_WORDS * 4;
+        let payload_len = h.payload_words as usize * 4;
         ensure!(
             coded.len() >= payload_off + payload_len,
             "coded frame truncated"
@@ -542,12 +705,56 @@ impl Decoder {
 
         let frame_bytes = g.frame_bytes();
         for k in 0..h.count as usize {
-            let id = rd_u32(coded, HEADER_LEN + k * 4) as usize;
+            let e = HEADER_LEN + k * INDEX_WORDS * 4;
+            let id = rd_u32(coded, e) as usize;
+            let off = rd_u32(coded, e + 4) as usize;
+            let w2 = rd_u32(coded, e + 8);
+            let mode = w2 >> 16;
+            let len = (w2 & 0xffff) as usize;
             ensure!(id < cap, "tile id {id} out of range");
             let tx = id % g.tiles_x();
             let ty = id / g.tiles_x();
-            let src = &coded[payload_off + k * tile_bytes..payload_off + (k + 1) * tile_bytes];
-            unpack_tile(&g, &mut self.frame[..frame_bytes], tx, ty, src);
+            let (vw, vh) = valid_dims(&g, tx, ty);
+            let base = payload_off + off * 4;
+            ensure!(base + len * 4 <= coded.len(), "tile payload out of range");
+            match mode {
+                MODE_RAW => {
+                    ensure!(len >= vw * vh, "raw tile too short");
+                    for i in 0..vw * vh {
+                        let (x, y) = (i % vw, i / vw);
+                        let o = gw(&g, tx, ty, x, y);
+                        wr_word(&mut self.frame, o, rd_word(coded, base + i * 4));
+                    }
+                }
+                MODE_REF | MODE_DPCM => {
+                    ensure!(len >= vh, "rle tile too short");
+                    let mut tok = base + vh * 4;
+                    for y in 0..vh {
+                        let runs = rd_u32(coded, base + y * 4) as usize;
+                        let (mut x, mut acc) = (0usize, 0u32);
+                        for _ in 0..runs {
+                            ensure!(tok + 8 <= coded.len(), "rle token out of range");
+                            let rl = rd_u32(coded, tok) as usize;
+                            let val = rd_u32(coded, tok + 4);
+                            tok += 8;
+                            ensure!(x + rl <= vw, "rle run overflows row");
+                            for _ in 0..rl {
+                                let o = gw(&g, tx, ty, x, y);
+                                let out = if mode == MODE_REF {
+                                    rd_word(&self.frame, o) ^ val
+                                } else {
+                                    acc = acc.wrapping_add(val);
+                                    acc
+                                };
+                                wr_word(&mut self.frame, o, out);
+                                x += 1;
+                            }
+                        }
+                        ensure!(x == vw, "rle row underfull");
+                    }
+                }
+                _ => anyhow::bail!("unknown lossless tile mode {mode}"),
+            }
         }
         self.have_frame = true;
         Ok(&self.frame[..frame_bytes])
@@ -651,7 +858,9 @@ mod tests {
         // full first frame
         let n0 = enc.encode(&frame, &mut buf).unwrap();
         dec.decode(&buf[..n0]).unwrap();
-        assert!(n0 >= g.frame_bytes(), "first frame carries all tiles");
+        let h0 = Header::parse(&buf[..n0]).unwrap();
+        assert!(!h0.delta);
+        assert_eq!(h0.count as usize, g.tile_count(), "first frame carries all tiles");
 
         let mut last_delta = 0usize;
         for step in 0..30u32 {
@@ -712,9 +921,10 @@ mod tests {
         assert_eq!(h2.count, 0, "identical frame must carry no tiles");
         assert_eq!(
             second.len(),
-            HEADER_LEN + g.tile_count() * 4,
+            HEADER_LEN + g.tile_count() * INDEX_WORDS * 4,
             "empty delta is header + fixed index array"
         );
+        assert_eq!(h2.payload_words, 0);
     }
 
     #[test]
@@ -817,7 +1027,7 @@ mod tests {
         let mut buf = vec![0u8; g.max_coded_len()];
         let n = enc.encode(&f, &mut buf).unwrap();
         let h = Header::parse(&buf[..n]).unwrap();
-        let payload_off = HEADER_LEN + h.index_capacity as usize * 4;
+        let payload_off = HEADER_LEN + h.index_capacity as usize * INDEX_WORDS * 4;
         buf[payload_off + 1] ^= 0x80;
         assert!(dec.decode(&buf[..n]).is_err(), "crc must reject corruption");
     }
@@ -842,8 +1052,8 @@ mod tests {
 
     fn crc32_payload(coded: &[u8]) -> u32 {
         let h = Header::parse(coded).unwrap();
-        let payload_off = HEADER_LEN + h.index_capacity as usize * 4;
-        let len = h.count as usize * (1usize << h.tile_log2) * (1usize << h.tile_log2) * BPP as usize;
+        let payload_off = HEADER_LEN + h.index_capacity as usize * INDEX_WORDS * 4;
+        let len = h.payload_words as usize * 4;
         crc32(&coded[payload_off..payload_off + len])
     }
 }

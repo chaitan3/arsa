@@ -321,8 +321,8 @@ fn main() -> Result<()> {
                         match rdma_display_codec::Header::parse(coded) {
                             Ok(h) => {
                                 let n = rdma_display_codec::HEADER_LEN
-                                    + g.tile_count() * 4
-                                    + h.count as usize * g.tile_bytes();
+                                    + g.tile_count() * rdma_display_codec::INDEX_WORDS * 4
+                                    + h.payload_words as usize * 4;
                                 if n <= coded.len() {
                                     dec.upload(&coded[..n])?;
                                     dec.decode_to_image(*tex, h.count as usize)?;

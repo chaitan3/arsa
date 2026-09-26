@@ -12,7 +12,7 @@
 use std::ffi::{c_void, CStr, CString};
 
 use anyhow::{bail, Context, Result};
-use rdma_display_codec::{Header, Geometry, BPP, HEADER_LEN};
+use rdma_display_codec::{Geometry, Header, BPP, HEADER_LEN, INDEX_WORDS};
 
 const EGL_PLATFORM_DEVICE_EXT: u32 = 0x313F;
 const EGL_DRM_DEVICE_FILE_EXT: i32 = 0x3233;
@@ -198,7 +198,7 @@ const GL_FRAMEBUFFER: u32 = 0x8D40;
 const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
 const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
 const GL_RGBA8: u32 = 0x8058;
-const GL_WRITE_ONLY: u32 = 0x88B9;
+const GL_READ_WRITE: u32 = 0x88BA;
 const GL_SHADER_IMAGE_ACCESS_BARRIER_BIT: u32 = 0x0000_0020;
 const GL_TEXTURE_FETCH_BARRIER_BIT: u32 = 0x0000_0008;
 
@@ -466,7 +466,7 @@ impl GpuCodec {
             let enc_prog = build_program(&gl, &enc_src())?;
             let dec_prog = build_program(&gl, &dec_src())?;
             let blit_prog = build_graphics_program(&gl, BLIT_VS, BLIT_FS)?;
-            let enc_tex_prog = build_program(&gl, ENC_TEX_SRC)?;
+            let enc_tex_prog = build_program(&gl, &enc_tex_src())?;
             // Sampling an imported external texture from a compute shader is
             // the fast path (no blit). Not all drivers allow it; if the shader
             // does not compile we keep the blit + image path.
@@ -483,7 +483,7 @@ impl GpuCodec {
                 eprintln!("[gpu] RDMA_LOSSLESS_SRC=blit: forcing the blit + image encode path");
                 0
             } else {
-                match build_program(&gl, ENC_EXT_SRC) {
+                match build_program(&gl, &enc_ext_src()) {
                     Ok(p) => {
                         eprintln!("[gpu] external-texture compute encode available (no blit)");
                         p
@@ -494,7 +494,7 @@ impl GpuCodec {
                     }
                 }
             };
-            let enc_fetch_prog = build_program(&gl, ENC_FETCH_SRC)?;
+            let enc_fetch_prog = build_program(&gl, &enc_fetch_src())?;
             let probe_buf_prog = build_program(&gl, PROBE_BUF_SRC)?;
             let probe_2d_prog = build_program(&gl, PROBE_2D_SRC)?;
             let probe_ext_prog = build_program(&gl, PROBE_EXT_SRC).unwrap_or(0);
@@ -502,7 +502,7 @@ impl GpuCodec {
             let frame_bytes = geom.frame_bytes();
             let index_cap = geom.tile_count();
             let coded_len = geom.max_coded_len();
-            let payload_base_words = ((HEADER_LEN + index_cap * 4) / 4) as u32;
+            let payload_base_words = ((HEADER_LEN + index_cap * INDEX_WORDS * 4) / 4) as u32;
 
             let mut buf = [0u32; 4];
             (gl.gen_buffers)(4, buf.as_mut_ptr());
@@ -516,7 +516,7 @@ impl GpuCodec {
             (gl.bind_buffer)(GL_SHADER_STORAGE_BUFFER, counter);
             (gl.buffer_storage)(
                 GL_SHADER_STORAGE_BUFFER,
-                4,
+                8,
                 std::ptr::null(),
                 GL_MAP_READ_BIT | GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT,
             );
@@ -545,7 +545,7 @@ impl GpuCodec {
             let counter_map = (gl.map_buffer_range)(
                 GL_SHADER_STORAGE_BUFFER,
                 0,
-                4,
+                8,
                 GL_MAP_READ_BIT | GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT,
             );
             if counter_map.is_null() {
@@ -1030,7 +1030,7 @@ impl GpuCodec {
             }
         }
         let prog = self.enc_tex_prog;
-        let n = self.encode_with(prog, full)?;
+        let n = self.encode_with(prog, full, true)?;
         unsafe {
             let e = (self.gl.get_error)();
             if e != 0 {
@@ -1071,7 +1071,7 @@ impl GpuCodec {
             }
         }
         let prog = self.enc_ext_prog;
-        let n = self.encode_with(prog, full)?;
+        let n = self.encode_with(prog, full, true)?;
         unsafe {
             let e = (self.gl.get_error)();
             if e != 0 {
@@ -1108,7 +1108,7 @@ impl GpuCodec {
             }
         }
         let prog = self.enc_fetch_prog;
-        let n = self.encode_with(prog, full)?;
+        let n = self.encode_with(prog, full, true)?;
         unsafe {
             let e = (self.gl.get_error)();
             if e != 0 {
@@ -1186,12 +1186,14 @@ impl GpuCodec {
     /// coded length.
     pub fn encode(&mut self, full: bool) -> Result<usize> {
         let prog = self.enc_prog;
-        self.encode_with(prog, full)
+        self.encode_with(prog, full, false)
     }
 
     /// Shared encode body. `prog` is either the SSBO-input (`cur`) encoder or
-    /// the image-input (`src_img`) encoder.
-    fn encode_with(&mut self, prog: u32, full: bool) -> Result<usize> {
+    /// the image-input (`src_img`) encoder. `update_ref` makes the shader
+    /// advance the reference in-pass (the scanout paths); the SSBO path leaves
+    /// that to `decode`, which also validates the decode.
+    fn encode_with(&mut self, prog: u32, full: bool, update_ref: bool) -> Result<usize> {
         let g = self.geom;
         let h = Header {
             codec: rdma_display_codec::CODEC_LOSSLESS,
@@ -1205,10 +1207,12 @@ impl GpuCodec {
             count: 0,
             index_capacity: self.index_cap as u32,
             crc32: 0,
+            payload_words: 0,
         };
         unsafe {
             h.write(std::slice::from_raw_parts_mut(self.coded_map, HEADER_LEN));
             *self.counter_map = 0;
+            *self.counter_map.add(1) = 0;
             (self.gl.memory_barrier)(GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT);
             (self.gl.use_program)(prog);
             let u = |name: &str| {
@@ -1221,21 +1225,24 @@ impl GpuCodec {
             (self.gl.uniform1ui)(u("u_tiles_x"), g.tiles_x() as u32);
             (self.gl.uniform1ui)(u("u_full"), full as u32);
             (self.gl.uniform1ui)(u("u_pbase_words"), self.payload_base_words);
+            (self.gl.uniform1ui)(u("u_update_ref"), update_ref as u32);
             (self.gl.dispatch_compute)(g.tile_count() as u32, 1, 1);
             (self.gl.memory_barrier)(GL_SHADER_STORAGE_BARRIER_BIT);
             (self.gl.finish)();
         }
         let count = unsafe { *self.counter_map } as usize;
+        let payload_words = unsafe { *self.counter_map.add(1) } as usize;
         if count > self.index_cap {
             bail!("shader produced {count} tiles > capacity {}", self.index_cap);
         }
         self.last_count = count;
         let mut patched = h;
         patched.count = count as u32;
+        patched.payload_words = payload_words as u32;
         unsafe {
             patched.write(std::slice::from_raw_parts_mut(self.coded_map, HEADER_LEN));
         }
-        let end = HEADER_LEN + self.index_cap * 4 + count * g.tile_bytes();
+        let end = HEADER_LEN + self.index_cap * INDEX_WORDS * 4 + payload_words * 4;
         Ok(end)
     }
 
@@ -1474,7 +1481,7 @@ impl GpuVideoDecoder {
         let dec_prog = build_program(&gl, &dec_tex_src())?;
         let coded_len = geom.max_coded_len();
         let index_cap = geom.tile_count();
-        let payload_base_words = ((HEADER_LEN + index_cap * 4) / 4) as u32;
+        let payload_base_words = ((HEADER_LEN + index_cap * INDEX_WORDS * 4) / 4) as u32;
         unsafe {
             let mut buf = [0u32; 1];
             (gl.gen_buffers)(1, buf.as_mut_ptr());
@@ -1626,7 +1633,7 @@ impl GpuVideoDecoder {
         }
         let g = self.geom;
         unsafe {
-            (self.gl.bind_image_texture)(0, tex, 0, 0, 0, GL_WRITE_ONLY, GL_RGBA8);
+            (self.gl.bind_image_texture)(0, tex, 0, 0, 0, GL_READ_WRITE, GL_RGBA8);
             (self.gl.use_program)(self.dec_prog);
             let u = |name: &str| {
                 let c = CString::new(name).unwrap();
@@ -1669,6 +1676,11 @@ fn build_program(gl: &Gl, src: &str) -> Result<u32> {
             let mut log = [0u8; 4096];
             let mut n = 0;
             (gl.get_shader_info_log)(sh, 4096, &mut n, log.as_mut_ptr());
+            if std::env::var("RDMA_SHADER_DUMP").is_ok() {
+                for (i, l) in src.lines().enumerate() {
+                    eprintln!("{:>4}: {l}", i + 1);
+                }
+            }
             bail!(
                 "compute shader compile failed: {}",
                 String::from_utf8_lossy(&log[..n as usize])
@@ -1762,94 +1774,30 @@ out vec4 frag;
 void main() { frag = texture(tex, v_uv).bgra; }
 "#;
 
-/// Encode directly from the RGBA8 source image (the blit output). Same
-/// tile-delta format as the SSBO encoder; only the word source differs.
-const ENC_TEX_SRC: &str = r#"#version 310 es
-precision highp int;
-layout(local_size_x = 256) in;
-uniform uint u_width, u_height, u_stride_px, u_tiles_x, u_full, u_pbase_words;
-layout(rgba8, binding = 0) readonly uniform highp image2D u_src;
+/// Shared lossless-encode compute body (v2). The four encoders differ only in
+/// how they produce the current source word via `word(x, y)` (SSBO buffer,
+/// RGBA8 image, external sampler, or `sampler2D`). A tile picks the cheapest
+/// of `RAW` (packed valid pixels), `REF` (runs of `cur ^ ref`) and `DPCM`
+/// (runs of the horizontal predictor); `REF` is never used on a full frame.
+/// Payloads are packed densely by an atomic bump allocator, so each tile
+/// records its own offset in the index entry. The mode choice and token layout
+/// must match `rdma_display_codec::tile_plan` exactly, or the coded total and
+/// the CPU/GPU cross-decode tests disagree.
+const ENC_PRELUDE: &str = r#"
 layout(std430, binding = 1) buffer Ref { uint ref[]; };
 layout(std430, binding = 2) writeonly buffer Out { uint outb[]; };
-layout(std430, binding = 3) buffer Cnt { uint count; };
+layout(std430, binding = 3) buffer Cnt { uint count; uint alloc; };
 const uint TILE = 64u;
 const uint TW = TILE * TILE;
+shared uint s_runs_r[256];
+shared uint s_runs_d[256];
+shared uint s_roff[256];
+shared uint s_mode;
+shared uint s_off;
 shared uint s_changed;
-shared uint s_k;
-uint word(uint x, uint y) {
-    return packUnorm4x8(imageLoad(u_src, ivec2(int(x), int(y))));
-}
-void main() {
-    uint tid = gl_LocalInvocationID.x;
-    uint tile_id = gl_WorkGroupID.x;
-    uint tx = tile_id % u_tiles_x;
-    uint ty = tile_id / u_tiles_x;
-    uint x0 = tx * TILE, y0 = ty * TILE;
-    uint vw = min(TILE, u_width - x0);
-    uint vh = min(TILE, u_height - y0);
-    bool changed = (u_full != 0u);
-    if (!changed) {
-        // accumulate XOR deltas: every lane stays independent (no data-dependent
-        // break), so the loads pipeline instead of serializing on the compare
-        uint acc = 0u;
-        for (uint i = tid; i < TW; i += 256u) {
-            uint lx = i % TILE, ly = i / TILE;
-            if (lx >= vw || ly >= vh) continue;
-            uint gi = (y0 + ly) * u_stride_px + (x0 + lx);
-            acc |= (word(x0 + lx, y0 + ly) ^ ref[gi]);
-        }
-        changed = (acc != 0u);
-    }
-    if (tid == 0u) s_changed = 0u;
-    barrier();
-    if (changed) atomicOr(s_changed, 1u);
-    barrier();
-    if (s_changed == 0u) return;
-    if (tid == 0u) { uint k = atomicAdd(count, 1u); s_k = k; outb[8u + k] = tile_id; }
-    barrier();
-    uint base = u_pbase_words + s_k * TW;
-    for (uint i = tid; i < TW; i += 256u) {
-        uint lx = i % TILE, ly = i / TILE;
-        uint o = base + i;
-        if (lx < vw && ly < vh) {
-            uint w = word(x0 + lx, y0 + ly);
-            outb[o] = w;
-            // advance the reference in the same pass: lossless, so the decoded
-            // tile equals the source word. This replaces a separate
-            // decode-to-reference pass over the coded payload.
-            ref[(y0 + ly) * u_stride_px + (x0 + lx)] = w;
-        } else {
-            outb[o] = 0u;
-        }
-    }
-}
 "#;
 
-/// Encode straight from the imported external texture: no blit and no
-/// intermediate RGBA8 image, so the source is read exactly once. Requires the
-/// driver to allow `samplerExternalOES` in a compute shader (checked at build
-/// time; otherwise the blit path is used).
-const ENC_EXT_SRC: &str = r#"#version 310 es
-#extension GL_OES_EGL_image_external_essl3 : require
-precision highp int;
-precision highp float;
-layout(local_size_x = 256) in;
-uniform uint u_width, u_height, u_stride_px, u_tiles_x, u_full, u_pbase_words;
-uniform highp samplerExternalOES u_src;
-layout(std430, binding = 1) buffer Ref { uint ref[]; };
-layout(std430, binding = 2) writeonly buffer Out { uint outb[]; };
-layout(std430, binding = 3) buffer Cnt { uint count; };
-const uint TILE = 64u;
-const uint TW = TILE * TILE;
-shared uint s_changed;
-shared uint s_k;
-uint word(uint x, uint y) {
-    vec2 uv = (vec2(float(x), float(y)) + 0.5) / vec2(float(u_width), float(u_height));
-    // The external sampler returns real colour (R,G,B) for a dma-buf fourcc,
-    // while the wire word is B,G,R,A. Swizzle exactly like BLIT_FS does, or the
-    // coded word comes out R,G,B and the client shows red/blue swapped.
-    return packUnorm4x8(texture(u_src, uv).bgra);
-}
+const ENC_BODY: &str = r#"
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint tile_id = gl_WorkGroupID.x;
@@ -1858,6 +1806,7 @@ void main() {
     uint x0 = tx * TILE, y0 = ty * TILE;
     uint vw = min(TILE, u_width - x0);
     uint vh = min(TILE, u_height - y0);
+
     bool changed = (u_full != 0u);
     if (!changed) {
         uint acc = 0u;
@@ -1874,138 +1823,135 @@ void main() {
     if (changed) atomicOr(s_changed, 1u);
     barrier();
     if (s_changed == 0u) return;
-    if (tid == 0u) { uint k = atomicAdd(count, 1u); s_k = k; outb[8u + k] = tile_id; }
+
+    if (tid < vh) {
+        uint y = tid;
+        uint runs_r = 0u, runs_d = 0u;
+        uint prev_r = 0u, prev_d = 0u, pcur = 0u;
+        for (uint px = 0u; px < vw; ++px) {
+            uint w = word(x0 + px, y0 + y);
+            uint rf = ref[(y0 + y) * u_stride_px + (x0 + px)];
+            uint r = w ^ rf;
+            uint d = w - ((px == 0u) ? 0u : pcur);
+            if (px == 0u || r != prev_r) { runs_r++; prev_r = r; }
+            if (px == 0u || d != prev_d) { runs_d++; prev_d = d; }
+            pcur = w;
+        }
+        s_runs_r[y] = runs_r;
+        s_runs_d[y] = runs_d;
+    }
     barrier();
-    uint base = u_pbase_words + s_k * TW;
-    for (uint i = tid; i < TW; i += 256u) {
-        uint lx = i % TILE, ly = i / TILE;
-        uint o = base + i;
-        if (lx < vw && ly < vh) {
-            uint w = word(x0 + lx, y0 + ly);
-            outb[o] = w;
-            // advance the reference in the same pass (lossless: the decoded
-            // tile equals the source word), replacing a separate
-            // decode-to-reference pass over the coded payload
-            ref[(y0 + ly) * u_stride_px + (x0 + lx)] = w;
-        } else {
-            outb[o] = 0u;
+
+    if (tid == 0u) {
+        uint tr = 0u, td = 0u;
+        for (uint y = 0u; y < vh; ++y) { tr += s_runs_r[y]; td += s_runs_d[y]; }
+        uint mode = 0u;
+        uint best = vw * vh;
+        if (u_full == 0u && (vh + 2u * tr) < best) { best = vh + 2u * tr; mode = 1u; }
+        if ((vh + 2u * td) < best) { best = vh + 2u * td; mode = 2u; }
+        s_mode = mode;
+        uint off = atomicAdd(alloc, (mode == 0u) ? (vw * vh) : best);
+        s_off = off;
+        if (mode != 0u) {
+            uint acc = 0u;
+            for (uint y = 0u; y < vh; ++y) {
+                s_roff[y] = acc;
+                acc += (mode == 1u) ? s_runs_r[y] : s_runs_d[y];
+            }
+        }
+        uint k = atomicAdd(count, 1u);
+        uint e = 12u + k * 3u;
+        outb[e] = tile_id;
+        outb[e + 1u] = off;
+        outb[e + 2u] = (best & 0xffffu) | (mode << 16u);
+    }
+    barrier();
+
+    uint mode = s_mode;
+    uint base = u_pbase_words + s_off;
+    if (mode == 0u) {
+        for (uint i = tid; i < vw * vh; i += 256u) {
+            uint lx = i % vw, ly = i / vw;
+            outb[base + i] = word(x0 + lx, y0 + ly);
+        }
+    } else if (tid < vh) {
+        uint y = tid;
+        outb[base + y] = (mode == 1u) ? s_runs_r[y] : s_runs_d[y];
+        uint tok = base + vh + 2u * s_roff[y];
+        uint lr = 0u, lv = 0u, pcur = 0u;
+        for (uint i = 0u; i < vw; ++i) {
+            uint w = word(x0 + i, y0 + y);
+            uint rf = ref[(y0 + y) * u_stride_px + (x0 + i)];
+            uint res = (mode == 1u) ? (w ^ rf) : (w - ((i == 0u) ? 0u : pcur));
+            if (i == 0u) { lv = res; lr = 1u; }
+            else if (res == lv) { lr++; }
+            else { outb[tok] = lr; outb[tok + 1u] = lv; tok += 2u; lv = res; lr = 1u; }
+            pcur = w;
+        }
+        outb[tok] = lr;
+        outb[tok + 1u] = lv;
+    }
+    barrier();
+
+    // advance the reference in-pass for the next delta (the texture/external/
+    // fetch paths); the SSBO path leaves this to `decode`, which validates the
+    // decode at the same time
+    if (u_update_ref != 0u) {
+        for (uint i = tid; i < TW; i += 256u) {
+            uint lx = i % TILE, ly = i / TILE;
+            if (lx < vw && ly < vh) {
+                uint gi = (y0 + ly) * u_stride_px + (x0 + lx);
+                ref[gi] = word(x0 + lx, y0 + ly);
+            }
         }
     }
 }
 "#;
 
-/// Encode reading the source as a normal `sampler2D` via `texelFetch`. Used
-/// when the scanout is linear and its EGLImage binds to `GL_TEXTURE_2D`: the
-/// normal texture path is ~15x faster than the external sampler on this driver.
-const ENC_FETCH_SRC: &str = r#"#version 310 es
-precision highp int;
-precision highp float;
-layout(local_size_x = 256) in;
-uniform uint u_width, u_height, u_stride_px, u_tiles_x, u_full, u_pbase_words;
-uniform highp sampler2D u_src;
-layout(std430, binding = 1) buffer Ref { uint ref[]; };
-layout(std430, binding = 2) writeonly buffer Out { uint outb[]; };
-layout(std430, binding = 3) buffer Cnt { uint count; };
-const uint TILE = 64u;
-const uint TW = TILE * TILE;
-shared uint s_changed;
-shared uint s_k;
-uint word(uint x, uint y) {
-    return packUnorm4x8(texelFetch(u_src, ivec2(int(x), int(y)), 0));
+fn enc_shader(extension: &str, source_decl: &str, word_fn: &str) -> String {
+    format!(
+        "#version 310 es\n{extension}precision highp int;\nprecision highp float;\n\
+layout(local_size_x = 256) in;\n\
+uniform uint u_width, u_height, u_stride_px, u_tiles_x, u_full, u_pbase_words, u_update_ref;\n\
+{source_decl}\n{ENC_PRELUDE}\n{word_fn}\n{ENC_BODY}\n"
+    )
 }
-void main() {
-    uint tid = gl_LocalInvocationID.x;
-    uint tile_id = gl_WorkGroupID.x;
-    uint tx = tile_id % u_tiles_x;
-    uint ty = tile_id / u_tiles_x;
-    uint x0 = tx * TILE, y0 = ty * TILE;
-    uint vw = min(TILE, u_width - x0);
-    uint vh = min(TILE, u_height - y0);
-    bool changed = (u_full != 0u);
-    if (!changed) {
-        uint acc = 0u;
-        for (uint i = tid; i < TW; i += 256u) {
-            uint lx = i % TILE, ly = i / TILE;
-            if (lx >= vw || ly >= vh) continue;
-            uint gi = (y0 + ly) * u_stride_px + (x0 + lx);
-            acc |= (word(x0 + lx, y0 + ly) ^ ref[gi]);
-        }
-        changed = (acc != 0u);
-    }
-    if (tid == 0u) s_changed = 0u;
-    barrier();
-    if (changed) atomicOr(s_changed, 1u);
-    barrier();
-    if (s_changed == 0u) return;
-    if (tid == 0u) { uint k = atomicAdd(count, 1u); s_k = k; outb[8u + k] = tile_id; }
-    barrier();
-    uint base = u_pbase_words + s_k * TW;
-    for (uint i = tid; i < TW; i += 256u) {
-        uint lx = i % TILE, ly = i / TILE;
-        uint o = base + i;
-        if (lx < vw && ly < vh) {
-            uint w = word(x0 + lx, y0 + ly);
-            outb[o] = w;
-            // advance the reference in the same pass (lossless: the decoded
-            // tile equals the source word), replacing a separate
-            // decode-to-reference pass over the coded payload
-            ref[(y0 + ly) * u_stride_px + (x0 + lx)] = w;
-        } else {
-            outb[o] = 0u;
-        }
-    }
-}
-"#;
 
-const ENC_SRC: &str = r#"#version 310 es
-precision highp int;
-layout(local_size_x = 256) in;
-uniform uint u_width, u_height, u_stride_px, u_tiles_x, u_full, u_pbase_words;
-layout(std430, binding = 0) readonly buffer Cur { uint cur[]; };
-layout(std430, binding = 1) readonly buffer Ref { uint ref[]; };
-layout(std430, binding = 2) writeonly buffer Out { uint outb[]; };
-layout(std430, binding = 3) buffer Cnt { uint count; };
-const uint TILE = 64u;
-const uint TW = TILE * TILE;
-shared uint s_changed;
-shared uint s_k;
-void main() {
-    uint tid = gl_LocalInvocationID.x;
-    uint tile_id = gl_WorkGroupID.x;
-    uint tx = tile_id % u_tiles_x;
-    uint ty = tile_id / u_tiles_x;
-    uint x0 = tx * TILE, y0 = ty * TILE;
-    uint vw = min(TILE, u_width - x0);
-    uint vh = min(TILE, u_height - y0);
-    bool changed = (u_full != 0u);
-    if (!changed) {
-        for (uint i = tid; i < TW; i += 256u) {
-            uint lx = i % TILE, ly = i / TILE;
-            if (lx >= vw || ly >= vh) continue;
-            uint gi = (y0 + ly) * u_stride_px + (x0 + lx);
-            if (cur[gi] != ref[gi]) { changed = true; break; }
-        }
-    }
-    if (tid == 0u) s_changed = 0u;
-    barrier();
-    if (changed) atomicOr(s_changed, 1u);
-    barrier();
-    if (s_changed == 0u) return;
-    if (tid == 0u) { uint k = atomicAdd(count, 1u); s_k = k; outb[8u + k] = tile_id; }
-    barrier();
-    uint base = u_pbase_words + s_k * TW;
-    for (uint i = tid; i < TW; i += 256u) {
-        uint lx = i % TILE, ly = i / TILE;
-        uint o = base + i;
-        if (lx < vw && ly < vh) {
-            uint gi = (y0 + ly) * u_stride_px + (x0 + lx);
-            outb[o] = cur[gi];
-        } else {
-            outb[o] = 0u;
-        }
-    }
+/// SSBO-input encode (the CPU-equivalent reference path; also `encode`).
+fn enc_src() -> String {
+    enc_shader(
+        "",
+        "layout(std430, binding = 0) readonly buffer Cur { uint cur[]; };",
+        "uint word(uint x, uint y) { return cur[y * u_stride_px + x]; }",
+    )
 }
-"#;
+
+/// Encode directly from the RGBA8 source image (after the blit).
+fn enc_tex_src() -> String {
+    enc_shader(
+        "",
+        "layout(rgba8, binding = 0) readonly uniform highp image2D u_src;",
+        "uint word(uint x, uint y) { return packUnorm4x8(imageLoad(u_src, ivec2(int(x), int(y)))); }",
+    )
+}
+
+/// Encode straight from the imported external texture (no blit).
+fn enc_ext_src() -> String {
+    enc_shader(
+        "#extension GL_OES_EGL_image_external_essl3 : require\n",
+        "uniform highp samplerExternalOES u_src;",
+        "uint word(uint x, uint y) {\n    vec2 uv = (vec2(float(x), float(y)) + 0.5) / vec2(float(u_width), float(u_height));\n    return packUnorm4x8(texture(u_src, uv).bgra);\n}",
+    )
+}
+
+/// Encode from a linear scanout bound to `GL_TEXTURE_2D` (`texelFetch`).
+fn enc_fetch_src() -> String {
+    enc_shader(
+        "",
+        "uniform highp sampler2D u_src;",
+        "uint word(uint x, uint y) { return packUnorm4x8(texelFetch(u_src, ivec2(int(x), int(y)), 0)); }",
+    )
+}
 
 /// Read-bandwidth probe: stream `u_words` uints from the buffer at binding 4.
 /// The load is kept live by a data-dependent store, so the compiler cannot
@@ -2062,70 +2008,89 @@ void main() {
 }
 "#;
 
-const DEC_SRC: &str = r#"#version 310 es
-precision highp int;
-layout(local_size_x = 256) in;
-uniform uint u_width, u_height, u_stride_px, u_tiles_x, u_count, u_pbase_words;
-layout(std430, binding = 2) readonly buffer In { uint inb[]; };
-layout(std430, binding = 1) buffer Frame { uint frame[]; };
-const uint TILE = 64u;
-const uint TW = TILE * TILE;
+/// Shared lossless-decode compute body (v2). `read_coded`, `load_px` and
+/// `store_px` come from each decoder (SSBO frame or `GL_RGBA8` image). One
+/// workgroup per changed tile; a `REF`/`DPCM` tile expands one row per thread,
+/// so it needs no cross-invocation scan.
+const DEC_BODY: &str = r#"
 void main() {
     uint k = gl_WorkGroupID.x;
     if (k >= u_count) return;
-    uint tile_id = inb[8u + k];
+    uint tid = gl_LocalInvocationID.x;
+    uint i0 = 12u + k * 3u;
+    uint tile_id = read_coded(i0);
+    uint off = read_coded(i0 + 1u);
+    uint mode = read_coded(i0 + 2u) >> 16u;
     uint tx = tile_id % u_tiles_x;
     uint ty = tile_id / u_tiles_x;
     uint x0 = tx * TILE, y0 = ty * TILE;
     uint vw = min(TILE, u_width - x0);
     uint vh = min(TILE, u_height - y0);
-    uint base = u_pbase_words + k * TW;
-    for (uint i = gl_LocalInvocationID.x; i < TW; i += 256u) {
-        uint lx = i % TILE, ly = i / TILE;
-        if (lx >= vw || ly >= vh) continue;
-        uint gi = (y0 + ly) * u_stride_px + (x0 + lx);
-        frame[gi] = inb[base + i];
+    uint base = u_pbase_words + off;
+    if (mode == 0u) {
+        for (uint i = tid; i < vw * vh; i += 256u) {
+            uint lx = i % vw, ly = i / vw;
+            store_px(x0 + lx, y0 + ly, read_coded(base + i));
+        }
+        return;
+    }
+    if (tid < vh) s_cnt[tid] = read_coded(base + tid);
+    barrier();
+    if (tid < vh) {
+        uint y = tid;
+        uint roff = 0u;
+        for (uint yy = 0u; yy < y; ++yy) roff += s_cnt[yy];
+        uint tok = base + vh + 2u * roff;
+        uint runs = s_cnt[y];
+        uint x = 0u;
+        uint acc = 0u;
+        for (uint r = 0u; r < runs; ++r) {
+            uint len = read_coded(tok);
+            uint val = read_coded(tok + 1u);
+            tok += 2u;
+            for (uint j = 0u; j < len; ++j) {
+                uint nv;
+                if (mode == 1u) { nv = load_px(x0 + x, y0 + y) ^ val; }
+                else { acc += val; nv = acc; }
+                store_px(x0 + x, y0 + y, nv);
+                x++;
+            }
+        }
     }
 }
 "#;
 
-fn enc_src() -> String {
-    ENC_SRC.to_string()
-}
+const DEC_PRELUDE: &str = r#"
+const uint TILE = 64u;
+shared uint s_cnt[256];
+"#;
+
+/// Decode into the reference/frame SSBO (the server's reference update and the
+/// benchmark's GPU decode).
 fn dec_src() -> String {
-    DEC_SRC.to_string()
+    format!(
+        "#version 310 es\nprecision highp int;\nlayout(local_size_x = 256) in;\n\
+uniform uint u_width, u_height, u_stride_px, u_tiles_x, u_count, u_pbase_words;\n\
+layout(std430, binding = 2) readonly buffer In {{ uint inb[]; }};\n\
+layout(std430, binding = 1) buffer Frame {{ uint frame[]; }};\n\
+uint read_coded(uint i) {{ return inb[i]; }}\n\
+uint load_px(uint x, uint y) {{ return frame[y * u_stride_px + x]; }}\n\
+void store_px(uint x, uint y, uint v) {{ frame[y * u_stride_px + x] = v; }}\n\
+{DEC_PRELUDE}\n{DEC_BODY}\n"
+    )
 }
 
-const DEC_TEX_SRC: &str = r#"#version 310 es
-precision highp int;
-layout(local_size_x = 256) in;
-uniform uint u_width, u_height, u_stride_px, u_tiles_x, u_count, u_pbase_words;
-layout(std430, binding = 4) readonly buffer In { uint inb[]; };
-layout(rgba8, binding = 0) uniform highp writeonly image2D u_img;
-const uint TILE = 64u;
-const uint TW = TILE * TILE;
-void main() {
-    uint k = gl_WorkGroupID.x;
-    if (k >= u_count) return;
-    uint tile_id = inb[8u + k];
-    uint tx = tile_id % u_tiles_x;
-    uint ty = tile_id / u_tiles_x;
-    uint x0 = tx * TILE, y0 = ty * TILE;
-    uint vw = min(TILE, u_width - x0);
-    uint vh = min(TILE, u_height - y0);
-    uint base = u_pbase_words + k * TW;
-    for (uint i = gl_LocalInvocationID.x; i < TW; i += 256u) {
-        uint lx = i % TILE, ly = i / TILE;
-        if (lx >= vw || ly >= vh) continue;
-        uint v = inb[base + i];
-        // wire word is B,G,R,A little-endian; store those four bytes in the
-        // texture's R,G,B,A so the presenter's sampler sees the same texel as
-        // glTexImage2D(GL_RGBA) of the wire bytes would.
-        imageStore(u_img, ivec2(int(x0 + lx), int(y0 + ly)), unpackUnorm4x8(v));
-    }
-}
-"#;
-
+/// Decode into a `GL_RGBA8` texture (the client presenter's target). The image
+/// is read as well as written because `REF` reads the previous frame's texel.
 fn dec_tex_src() -> String {
-    DEC_TEX_SRC.to_string()
+    format!(
+        "#version 310 es\nprecision highp int;\nlayout(local_size_x = 256) in;\n\
+uniform uint u_width, u_height, u_stride_px, u_tiles_x, u_count, u_pbase_words;\n\
+layout(std430, binding = 4) readonly buffer In {{ uint inb[]; }};\n\
+layout(rgba8, binding = 0) uniform highp image2D u_img;\n\
+uint read_coded(uint i) {{ return inb[i]; }}\n\
+uint load_px(uint x, uint y) {{ return packUnorm4x8(imageLoad(u_img, ivec2(int(x), int(y)))); }}\n\
+void store_px(uint x, uint y, uint v) {{ imageStore(u_img, ivec2(int(x), int(y)), unpackUnorm4x8(v)); }}\n\
+{DEC_PRELUDE}\n{DEC_BODY}\n"
+    )
 }

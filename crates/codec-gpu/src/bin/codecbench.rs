@@ -106,6 +106,7 @@ struct PassStats {
     counts: Vec<usize>,
     enc_us: Vec<f64>,
     dec_us: Vec<f64>,
+    modes: [usize; 3],
 }
 
 fn correctness(geom: Geometry, frames: &[Vec<u32>]) -> Result<PassStats> {
@@ -114,7 +115,7 @@ fn correctness(geom: Geometry, frames: &[Vec<u32>]) -> Result<PassStats> {
     enc.set_crc(false); // streaming path omits the CRC
     let mut dec = Decoder::new(geom)?;
     let mut buf = vec![0u8; geom.max_coded_len()];
-    let mut cpu = PassStats { sizes: vec![], counts: vec![], enc_us: vec![], dec_us: vec![] };
+    let mut cpu = PassStats { sizes: vec![], counts: vec![], enc_us: vec![], dec_us: vec![], modes: [0usize; 3] };
     for (i, frame) in frames.iter().enumerate() {
         let fb = words_bytes(frame);
         let n = enc.encode(fb, &mut buf)?;
@@ -130,7 +131,7 @@ fn correctness(geom: Geometry, frames: &[Vec<u32>]) -> Result<PassStats> {
     // GPU: output must match the source and be CPU-decodable
     let mut gpu = GpuCodec::new(geom)?;
     let mut dec_cross = Decoder::new(geom)?;
-    let mut g = PassStats { sizes: vec![], counts: vec![], enc_us: vec![], dec_us: vec![] };
+    let mut g = PassStats { sizes: vec![], counts: vec![], enc_us: vec![], dec_us: vec![], modes: [0usize; 3] };
     for (i, frame) in frames.iter().enumerate() {
         let fb = words_bytes(frame);
         gpu.upload(fb)?;
@@ -165,7 +166,7 @@ fn cpu_timing(geom: Geometry, frames: &[Vec<u32>]) -> Result<PassStats> {
     enc.set_crc(false); // streaming path omits the CRC
     let mut dec = Decoder::new(geom)?;
     let mut buf = vec![0u8; geom.max_coded_len()];
-    let mut s = PassStats { sizes: vec![], counts: vec![], enc_us: vec![], dec_us: vec![] };
+    let mut s = PassStats { sizes: vec![], counts: vec![], enc_us: vec![], dec_us: vec![], modes: [0usize; 3] };
     for (i, frame) in frames.iter().enumerate() {
         let fb = words_bytes(frame);
         let t = Instant::now();
@@ -184,7 +185,7 @@ fn cpu_timing(geom: Geometry, frames: &[Vec<u32>]) -> Result<PassStats> {
 
 fn gpu_timing(geom: Geometry, frames: &[Vec<u32>]) -> Result<PassStats> {
     let mut gpu = GpuCodec::new(geom)?;
-    let mut s = PassStats { sizes: vec![], counts: vec![], enc_us: vec![], dec_us: vec![] };
+    let mut s = PassStats { sizes: vec![], counts: vec![], enc_us: vec![], dec_us: vec![], modes: [0usize; 3] };
     for (i, frame) in frames.iter().enumerate() {
         let fb = words_bytes(frame);
         gpu.upload(fb)?;
@@ -193,6 +194,16 @@ fn gpu_timing(geom: Geometry, frames: &[Vec<u32>]) -> Result<PassStats> {
         let n = gpu.encode(i == 0)?;
         s.enc_us.push(t.elapsed().as_secs_f64() * 1e3);
         let count = Header::parse(gpu.coded(n))?.count as usize;
+        {
+            let coded = gpu.coded(n);
+            let word = |i: usize| u32::from_le_bytes(coded[i * 4..i * 4 + 4].try_into().unwrap());
+            for k in 0..count {
+                let mode = (word(12 + k * 3 + 2) >> 16) as usize;
+                if mode < s.modes.len() {
+                    s.modes[mode] += 1;
+                }
+            }
+        }
         let t = Instant::now();
         gpu.decode(count)?;
         s.dec_us.push(t.elapsed().as_secs_f64() * 1e3);
@@ -675,6 +686,10 @@ fn main() -> Result<()> {
         (sum[1] - gpu.enc_us[0]) / (n - 1.0),
         (sum[2] - cpu.dec_us[0]) / (n - 1.0),
         (sum[3] - gpu.dec_us[0]) / (n - 1.0),
+    );
+    println!(
+        "tile modes (all frames): raw {}  ref {}  dpcm {}",
+        gpu.modes[0], gpu.modes[1], gpu.modes[2]
     );
     Ok(())
 }
