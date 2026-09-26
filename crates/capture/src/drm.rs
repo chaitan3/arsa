@@ -896,6 +896,10 @@ const SETTLE_MS: u64 = 20;
 /// long enough to see tens of commits and pick the per-frame completion context.
 const FENCE_CALIB: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// If the completion-fence signal stream goes quiet this long while the fb is
+/// still changing, capture defensively instead of freezing the stream.
+const FENCE_STALL_MS: u64 = 200;
+
 /// One poll's decision.
 #[derive(Debug, PartialEq, Eq)]
 enum FbAction {
@@ -1343,6 +1347,11 @@ fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> 
     // completion-fence watch (`fence` mode); started once, falls back on error
     let mut fence: Option<crate::fence::FenceWatch> = None;
     let mut fence_tried = false;
+    // fence-mode runtime state: calibration becomes `ready` in the background
+    // (an idle screen at boot has nothing to calibrate against), so we capture
+    // with one-behind until then and switch over when signals start flowing
+    let mut fence_ready = false;
+    let mut fence_last_ms = 0u64;
     let mut active = ActiveSync::OneBehind;
     let mut crtc_id: Option<u32> = None;
     let started = std::time::Instant::now();
@@ -1570,36 +1579,69 @@ fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> 
                 }
             }
             ActiveSync::Fence => {
-                // drain the completion-fence signals, keeping only the latest
-                let mut sig: Option<u64> = None;
-                let mut disconnected = false;
-                if let Some(w) = fence.as_ref() {
-                    loop {
-                        match w.rx.try_recv() {
-                            Ok(t) => sig = Some(t),
-                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                disconnected = true;
-                                break;
-                            }
-                        }
+                let ready_now = fence.as_ref().is_some_and(|w| w.ready());
+                if ready_now != fence_ready {
+                    fence_ready = ready_now;
+                    fence_last_ms = now_ms;
+                    if ready_now {
+                        // signals take over: start fresh so the next one captures
+                        ftracker = FenceTracker::default();
                     }
                 }
-                if disconnected {
-                    eprintln!("[capture-drm] fence watch ended; switching to one-behind");
-                    fence = None;
-                    active = ActiveSync::OneBehind;
-                    tracker = FbTracker::default();
-                }
-                if active == ActiveSync::Fence {
-                    match ftracker.update(fb, sig) {
+                if !ready_now {
+                    // calibrating (an idle screen at boot has no commits to
+                    // calibrate against): one-behind until activity appears
+                    match tracker.update(now_ms, now_us, fb) {
                         FbAction::None => {}
                         FbAction::Disabled => disabled(&mut disabled_reported),
                         FbAction::Capture(id, t0) => {
                             if emit_scanout(&card.as_ref().unwrap().0, id, t0, &tx) {
                                 disabled_reported = false;
                             } else {
-                                ftracker.capture_failed();
+                                tracker.capture_failed();
+                            }
+                        }
+                    }
+                } else {
+                    // drain the completion-fence signals, keeping only the latest
+                    let mut sig: Option<u64> = None;
+                    let mut disconnected = false;
+                    if let Some(w) = fence.as_ref() {
+                        loop {
+                            match w.rx.try_recv() {
+                                Ok(t) => {
+                                    sig = Some(t);
+                                    fence_last_ms = now_ms;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if disconnected {
+                        eprintln!("[capture-drm] fence watch ended; switching to one-behind");
+                        fence = None;
+                        active = ActiveSync::OneBehind;
+                        tracker = FbTracker::default();
+                    } else {
+                        // signal-driven capture, with a defensive capture if the
+                        // stream stalls while the fb is still changing
+                        let trigger = sig.or_else(|| {
+                            (now_ms.saturating_sub(fence_last_ms) > FENCE_STALL_MS)
+                                .then_some(now_us)
+                        });
+                        match ftracker.update(fb, trigger) {
+                            FbAction::None => {}
+                            FbAction::Disabled => disabled(&mut disabled_reported),
+                            FbAction::Capture(id, t0) => {
+                                if emit_scanout(&card.as_ref().unwrap().0, id, t0, &tx) {
+                                    disabled_reported = false;
+                                } else {
+                                    ftracker.capture_failed();
+                                }
                             }
                         }
                     }

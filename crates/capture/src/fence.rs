@@ -15,18 +15,24 @@
 //! (and consistent with the hand-rolled style of the DRM capture). It:
 //!
 //!   1. mounts tracefs if needed;
-//!   2. calibrates: watches `dma_fence_init` plus an atomic-commit kprobe for a
-//!      short window and picks the fence context whose init count tracks the
-//!      commit count (the per-frame completion fence);
+//!   2. **calibrates in the background**: watches `dma_fence_init` plus an
+//!      atomic-commit kprobe for a short window and picks the fence context
+//!      whose init count tracks the commit count (the per-frame completion
+//!      fence). An idle screen has no commits to calibrate against, so this
+//!      retries until activity appears instead of failing the mode;
 //!   3. filters `dma_fence_signaled` to that context and reports each signal's
-//!      timestamp over a channel.
+//!      timestamp over a channel, setting [`FenceWatch::ready`].
 //!
-//! Requires root and an actively flipping compositor during calibration. On any
-//! failure [`start`] returns an error and the caller falls back to one-behind.
+//! Until `ready`, the caller falls back to one-behind; calibration needs an
+//! actively flipping compositor (something moving on screen), but that can
+//! happen at any time after startup. If tracefs cannot be mounted at all,
+//! [`start`] returns an error and the caller falls back permanently.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -36,9 +42,19 @@ use anyhow::{bail, Context, Result};
 pub struct FenceWatch {
     /// one timestamp (unix us) per observed completion-fence signal
     pub rx: Receiver<u64>,
+    /// true once calibration succeeded and signals are being forwarded
+    ready: Arc<AtomicBool>,
     tracefs: String,
-    /// the trace_pipe reader thread; detached (killed at process exit)
-    _reader: JoinHandle<()>,
+    /// the background calibration/reader thread; detached at process exit
+    _worker: JoinHandle<()>,
+}
+
+impl FenceWatch {
+    /// Whether calibration has finished and the completion fence is being
+    /// watched. While false the caller should use its own fallback (one-behind).
+    pub fn ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
+    }
 }
 
 const TRACEFS_CANDIDATES: [&str; 2] = ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"];
@@ -91,7 +107,7 @@ fn field_u64(line: &str, key: &str) -> Option<u64> {
 }
 
 /// Watch `dma_fence_init` + the atomic-commit kprobe for `calib`, pick the
-/// per-frame completion context, and configure the signal tracepoint.
+/// per-frame completion context, and leave tracefs idle for the caller.
 fn calibrate(tracefs: &str, calib: Duration) -> Result<u32> {
     // reset
     let _ = write_str(&format!("{tracefs}/tracing_on"), "0\n");
@@ -137,11 +153,7 @@ fn calibrate(tracefs: &str, calib: Duration) -> Result<u32> {
         }
     }
     if handovers < 8 {
-        bail!(
-            "calibration saw only {handovers} commits in {:?} - compositor idle? \
-             keep something moving on screen",
-            calib
-        );
+        bail!("only {handovers} commits in {:?}", calib);
     }
     // the per-frame completion fence is created ~once per commit; pick the
     // context whose creation count is closest to the commit count
@@ -158,7 +170,7 @@ fn calibrate(tracefs: &str, calib: Duration) -> Result<u32> {
             best = Some((ctx, n));
         }
     }
-    let (ctx, n) = best.context("calibration: no fence context tracked the commits")?;
+    let (ctx, n) = best.context("no fence context tracked the commits")?;
     eprintln!(
         "[capture-drm] fence watch: completion context {ctx} \
          ({n} fence inits vs {handovers} commits in {:?})",
@@ -167,11 +179,8 @@ fn calibrate(tracefs: &str, calib: Duration) -> Result<u32> {
     Ok(ctx)
 }
 
-/// Mount tracefs, calibrate, and start reporting completion-fence signals.
-pub fn start(calib: Duration) -> Result<FenceWatch> {
-    let tracefs = ensure_tracefs()?;
-    let ctx = calibrate(&tracefs, calib)?;
-
+/// Point the signal tracepoint at `ctx` and turn tracing on.
+fn configure_signal(tracefs: &str, ctx: u32) -> Result<()> {
     let _ = write_str(
         &format!("{tracefs}/events/dma_fence/dma_fence_signaled/filter"),
         &format!("context == {ctx}\n"),
@@ -182,36 +191,97 @@ pub fn start(calib: Duration) -> Result<FenceWatch> {
     )
     .context("enable dma_fence_signaled")?;
     write_str(&format!("{tracefs}/tracing_on"), "1\n")?;
+    Ok(())
+}
 
-    let pipe = std::fs::OpenOptions::new()
+/// Read `trace_pipe` until it errors/EOF, forwarding one timestamp per
+/// completion-fence signal. Returns when the stream ends (caller recalibrates).
+fn read_signals(tracefs: &str, tx: &Sender<u64>) {
+    let Ok(pipe) = std::fs::OpenOptions::new()
         .read(true)
         .open(format!("{tracefs}/trace_pipe"))
-        .context("open trace_pipe")?;
-    let (tx, rx) = mpsc::channel::<u64>();
-    let reader = std::thread::Builder::new()
-        .name("fence-watch".into())
-        .spawn(move || {
-            let mut br = BufReader::new(pipe);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match br.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        if line.contains("dma_fence_signaled:") {
-                            let _ = tx.send(rdma_display_proto::unix_now_us());
-                        }
-                    }
-                    Err(_) => break,
+    else {
+        return;
+    };
+    let mut br = BufReader::new(pipe);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match br.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                if line.contains("dma_fence_signaled:")
+                    && tx.send(rdma_display_proto::unix_now_us()).is_err()
+                {
+                    break;
                 }
             }
-        })
-        .context("spawn fence-watch thread")?;
+            Err(_) => break,
+        }
+    }
+}
 
+/// Background loop: calibrate (retrying until the screen is active), then
+/// forward completion-fence signals.
+fn worker_loop(tracefs: &str, calib: Duration, tx: Sender<u64>, ready: Arc<AtomicBool>) {
+    let mut attempts: u32 = 0;
+    loop {
+        match calibrate(tracefs, calib) {
+            Ok(ctx) => {
+                if let Err(e) = configure_signal(tracefs, ctx) {
+                    attempts += 1;
+                    if attempts <= 3 {
+                        eprintln!(
+                            "[capture-drm] fence watch: configure signalled failed: {e:#}; \
+                             retrying"
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(1000));
+                    continue;
+                }
+                eprintln!(
+                    "[capture-drm] fence watch: switching to fence-triggered capture \
+                     (context {ctx})"
+                );
+                ready.store(true, Ordering::Relaxed);
+                read_signals(tracefs, &tx);
+                ready.store(false, Ordering::Relaxed);
+                eprintln!("[capture-drm] fence watch: signal stream ended; recalibrating");
+            }
+            Err(e) => {
+                attempts += 1;
+                // the usual cause is an idle screen at boot: no commits to
+                // calibrate against. One-behind is used until activity appears.
+                if attempts <= 2 || attempts % 20 == 0 {
+                    eprintln!(
+                        "[capture-drm] fence watch: no activity to calibrate yet ({e:#}); \
+                         using one-behind until the screen changes"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(750));
+            }
+        }
+    }
+}
+
+/// Mount tracefs and start the background calibration/reader thread. Returns an
+/// error only if tracefs itself is unavailable; an idle screen is fine (the
+/// caller uses one-behind until [`FenceWatch::ready`]).
+pub fn start(calib: Duration) -> Result<FenceWatch> {
+    let tracefs = ensure_tracefs()?;
+    let (tx, rx) = mpsc::channel::<u64>();
+    let ready = Arc::new(AtomicBool::new(false));
+    let ready_worker = ready.clone();
+    let tracefs_worker = tracefs.clone();
+    let worker = std::thread::Builder::new()
+        .name("fence-watch".into())
+        .spawn(move || worker_loop(&tracefs_worker, calib, tx, ready_worker))
+        .context("spawn fence-watch thread")?;
     Ok(FenceWatch {
         rx,
+        ready,
         tracefs,
-        _reader: reader,
+        _worker: worker,
     })
 }
 

@@ -241,10 +241,12 @@ Two modes were added to the KMS capture (`crates/capture/src/drm.rs`,
   kernel `dma_fence:dma_fence_signaled` tracepoint through tracefs (no libbpf,
   same tracepoint an eBPF probe would use): it calibrates the completion context
   by matching `dma_fence_init` counts against the atomic-commit count, then
-  filters `dma_fence_signaled` to it and reports each signal. Requires root
-  (the server already runs under sudo) and an actively flipping compositor for
-  the first ~400 ms calibration; on any failure it logs and falls back to
-  one-behind.
+  filters `dma_fence_signaled` to it and reports each signal. Calibration runs
+  **in a background thread and retries until the screen is active** (an idle
+  desktop at boot has no commits to calibrate against), capturing with
+  one-behind in the meantime and switching to fence-triggered once ready. Root
+  is required (the server already runs under sudo); only a tracefs mount failure
+  is a hard fallback to one-behind.
 
 Benchmark with the client overlay (`queue prep slot mat`) over `onbehind`,
 `settle:2`, `settle:4`, and `fence`; the `fence` mode should show a queue near
