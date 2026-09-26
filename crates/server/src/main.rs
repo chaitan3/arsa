@@ -83,7 +83,9 @@ fn main() -> Result<()> {
             "--capture-sync" => {
                 let v = args.next().expect("--capture-sync needs a value");
                 capture_sync = CaptureSync::parse(&v).with_context(|| {
-                    format!("--capture-sync must be onbehind|vblank|zero|auto, got {v:?}")
+                    format!(
+                        "--capture-sync must be onbehind|vblank|zero|auto|settle[:ms]|fence, got {v:?}"
+                    )
                 })?;
             }
             "--input-test" => input_test = true,
@@ -132,7 +134,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
   qemu: [--dbus-socket /path/dbus.sock] [--console 0]   drm: [--drm-card /dev/dri/card0]\n  \
   [--materialize egl|plain] [--rendernode /dev/dri/renderD128] [--readback pbo|direct] [--input-test]\n  \
   --materialize egl (default) imports the dmabuf and reads the frame back for raw/lossy and for the CPU/readback lossless fallback; GPU lossless bypasses the readback entirely and encodes straight from the imported dmabuf (no full-frame readback, no re-upload). --readback pbo|direct only affects that readback path.\n  \
-  --capture-sync onbehind|vblank|zero|auto  (drm) which fb to capture: onbehind = safe, one frame old; vblank = current frame as its vblank retires it (lower latency); zero = current frame immediately, no sync (testing only, may tear); auto = try vblank, fall back (default)\n  \
+  --capture-sync onbehind|vblank|zero|auto|settle[:ms]|fence  (drm) which fb to capture: onbehind = safe, one frame old; vblank = current frame as its vblank retires it (lowest latency; dead on this nvidia-drm stack, falls back); zero = current frame immediately, no sync (testing only, may tear); settle[:ms] = current frame ms after its commit (default 2 ms; usually complete, but frames whose render outlasts the window tear); fence = read the current frame when the compositor's per-frame completion fence signals (tracefs; ~1 ms, tear-free, needs root, falls back); auto = try vblank, fall back (default)\n  \
   --codec raw|lossless|lossy  frame coding for the whole session (default raw = unchanged wire). lossless = tile-delta against the previous frame (desktop-friendly); lossy = PyroWave intra-only GPU codec (needs libpyrowave-shared.so). The client negotiates automatically.\n  \
   --lossy-budget BYTES  lossy: max bitstream bytes per frame (default 1000000; slot size sent to the client).\n  \
   --lossy-chroma 420|444  lossy: chroma subsampling (default 420).\n  \

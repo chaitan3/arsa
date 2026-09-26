@@ -38,6 +38,7 @@
 //! readback is unfenced (scanout buffers are stable while scanned out; the
 //! compositor's next render into the same buffer is ~1-2 flips away).
 
+use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::mpsc::Sender;
 
@@ -891,6 +892,10 @@ pub fn sync_probe(
 /// stopped and it is certainly fully rendered, so it is safe to capture it.
 const SETTLE_MS: u64 = 20;
 
+/// Calibration window for [`crate::fence::FenceWatch`] (the `fence` sync mode):
+/// long enough to see tens of commits and pick the per-frame completion context.
+const FENCE_CALIB: std::time::Duration = std::time::Duration::from_millis(400);
+
 /// One poll's decision.
 #[derive(Debug, PartialEq, Eq)]
 enum FbAction {
@@ -1019,6 +1024,126 @@ impl ZeroTracker {
     }
 
     /// The import failed: forget the claim so a later poll can retry.
+    fn capture_failed(&mut self) {
+        self.last_captured = 0;
+    }
+}
+
+/// Short-settle capture: hand the current fb to the importer `settle_ms` after
+/// its commit was observed.
+///
+/// The compositor commits with a non-blocking atomic commit and finishes the
+/// frame's GPU work afterwards; on this stack the per-frame completion fence
+/// (NVIDIA semsurf) signals ~0.75 ms (p50), ~8-16 ms (p99) after handover, so a
+/// small settle captures a complete frame most of the time without paying the
+/// full one-refresh one-behind wait. Frames whose render outlasts the settle are
+/// read mid-render and can tear — an explicit latency/tearing tradeoff, not a
+/// guarantee. A small backlog keeps a settle larger than the frame interval
+/// progressing in order (bounded so we cannot fall arbitrarily behind).
+#[derive(Default)]
+struct SettleTracker {
+    /// latest fb seen on the crtc/plane
+    seen: u32,
+    /// last fb handed to the importer
+    last_captured: u32,
+    /// t0 of the last fb handed to the importer
+    last_t0: u64,
+    /// when `seen` last changed (ms since capture start)
+    changed_ms: u64,
+    /// unix us when `seen` first appeared
+    seen_since_us: u64,
+    /// settle window (ms)
+    settle_ms: u64,
+    /// commits awaiting their settle deadline: (fb, due_ms, t0_us)
+    due: VecDeque<(u32, u64, u64)>,
+    /// last frame whose import failed; re-offered immediately on the next poll
+    retry: Option<(u32, u64)>,
+}
+
+impl SettleTracker {
+    fn new(settle_ms: u64) -> Self {
+        Self {
+            settle_ms,
+            ..Default::default()
+        }
+    }
+
+    fn update(&mut self, now_ms: u64, now_us: u64, fb: u32) -> FbAction {
+        if fb == 0 {
+            if self.seen == 0 {
+                return FbAction::None;
+            }
+            self.seen = 0;
+            self.last_captured = 0;
+            self.due.clear();
+            self.retry = None;
+            return FbAction::Disabled;
+        }
+        // a failed import is retried at once (the frame is already complete)
+        if let Some((id, t0)) = self.retry.take() {
+            self.last_captured = id;
+            self.last_t0 = t0;
+            return FbAction::Capture(id, t0);
+        }
+        if fb != self.seen {
+            self.seen = fb;
+            self.changed_ms = now_ms;
+            self.seen_since_us = now_us;
+            self.due
+                .push_back((fb, now_ms.saturating_add(self.settle_ms), now_us));
+            while self.due.len() > 4 {
+                self.due.pop_front();
+            }
+        }
+        while let Some(&(id, due_ms, t0)) = self.due.front() {
+            if now_ms < due_ms {
+                break;
+            }
+            self.due.pop_front();
+            if id != self.last_captured {
+                self.last_captured = id;
+                self.last_t0 = t0;
+                return FbAction::Capture(id, t0);
+            }
+        }
+        FbAction::None
+    }
+
+    /// The import failed: re-offer the frame on the next poll.
+    fn capture_failed(&mut self) {
+        if self.last_captured != 0 {
+            self.retry = Some((self.last_captured, self.last_t0));
+        }
+    }
+}
+
+/// Completion-fence-triggered capture (the `fence` sync mode). The caller drains
+/// the fence signals and passes the latest timestamp; we capture the current fb
+/// when it differs from the last one captured. See [`crate::fence`].
+#[derive(Default)]
+struct FenceTracker {
+    last_captured: u32,
+}
+
+impl FenceTracker {
+    fn update(&mut self, fb: u32, t0: Option<u64>) -> FbAction {
+        if fb == 0 {
+            if self.last_captured == 0 {
+                return FbAction::None;
+            }
+            self.last_captured = 0;
+            return FbAction::Disabled;
+        }
+        if let Some(t0) = t0 {
+            if fb != self.last_captured {
+                self.last_captured = fb;
+                return FbAction::Capture(fb, t0);
+            }
+        }
+        FbAction::None
+    }
+
+    /// The import failed: forget the claim so a later signal can retry.
     fn capture_failed(&mut self) {
         self.last_captured = 0;
     }
@@ -1169,8 +1294,10 @@ impl VblankTracker {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ActiveSync {
     OneBehind,
+    Settle,
     Zero,
     Vblank,
+    Fence,
 }
 
 /// Import `id` and emit a `Scanout`. False = import failed (the fb may already
@@ -1207,6 +1334,15 @@ fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> 
     let mut tracker = FbTracker::default();
     let mut vtracker = VblankTracker::default();
     let mut ztracker = ZeroTracker::default();
+    let settle_ms = match sync {
+        CaptureSync::Settle(ms) => ms,
+        _ => 0,
+    };
+    let mut stracker = SettleTracker::new(settle_ms);
+    let mut ftracker = FenceTracker::default();
+    // completion-fence watch (`fence` mode); started once, falls back on error
+    let mut fence: Option<crate::fence::FenceWatch> = None;
+    let mut fence_tried = false;
     let mut active = ActiveSync::OneBehind;
     let mut crtc_id: Option<u32> = None;
     let started = std::time::Instant::now();
@@ -1246,6 +1382,29 @@ fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> 
                     active = match sync {
                         CaptureSync::Zero => ActiveSync::Zero,
                         CaptureSync::OneBehind => ActiveSync::OneBehind,
+                        CaptureSync::Settle(_) => ActiveSync::Settle,
+                        CaptureSync::Fence => {
+                            if fence.is_none() && !fence_tried {
+                                fence_tried = true;
+                                match crate::fence::start(FENCE_CALIB) {
+                                    Ok(w) => {
+                                        fence = Some(w);
+                                        ActiveSync::Fence
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[capture-drm] fence watch unavailable: {e:#}; \
+                                             using one-behind"
+                                        );
+                                        ActiveSync::OneBehind
+                                    }
+                                }
+                            } else if fence.is_some() {
+                                ActiveSync::Fence
+                            } else {
+                                ActiveSync::OneBehind
+                            }
+                        }
                         CaptureSync::Vblank | CaptureSync::Auto => {
                             if vblank_ok {
                                 ActiveSync::Vblank
@@ -1260,6 +1419,8 @@ fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> 
                             ActiveSync::Vblank => "vblank-synced current frame",
                             ActiveSync::OneBehind => "one-behind",
                             ActiveSync::Zero => "zero-delay current frame (TESTING ONLY)",
+                            ActiveSync::Settle => "short-settle current frame",
+                            ActiveSync::Fence => "completion-fence-triggered current frame",
                         }
                     );
                     if matches!(sync, CaptureSync::Vblank | CaptureSync::Auto) && !vblank_ok {
@@ -1300,6 +1461,8 @@ fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> 
                     tracker = FbTracker::default();
                     vtracker = VblankTracker::default();
                     ztracker = ZeroTracker::default();
+                    stracker = SettleTracker::new(settle_ms);
+                    ftracker = FenceTracker::default();
                     disabled_reported = false;
                 }
                 Err(e) => {
@@ -1390,6 +1553,58 @@ fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> 
                     }
                 }
             }
+            ActiveSync::Settle => {
+                // capture the current fb `settle_ms` after its commit was seen:
+                // usually complete by then (the completion fence signals at
+                // ~1 ms), without the full one-refresh one-behind wait
+                match stracker.update(now_ms, now_us, fb) {
+                    FbAction::None => {}
+                    FbAction::Disabled => disabled(&mut disabled_reported),
+                    FbAction::Capture(id, t0) => {
+                        if emit_scanout(&card.as_ref().unwrap().0, id, t0, &tx) {
+                            disabled_reported = false;
+                        } else {
+                            stracker.capture_failed();
+                        }
+                    }
+                }
+            }
+            ActiveSync::Fence => {
+                // drain the completion-fence signals, keeping only the latest
+                let mut sig: Option<u64> = None;
+                let mut disconnected = false;
+                if let Some(w) = fence.as_ref() {
+                    loop {
+                        match w.rx.try_recv() {
+                            Ok(t) => sig = Some(t),
+                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                disconnected = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if disconnected {
+                    eprintln!("[capture-drm] fence watch ended; switching to one-behind");
+                    fence = None;
+                    active = ActiveSync::OneBehind;
+                    tracker = FbTracker::default();
+                }
+                if active == ActiveSync::Fence {
+                    match ftracker.update(fb, sig) {
+                        FbAction::None => {}
+                        FbAction::Disabled => disabled(&mut disabled_reported),
+                        FbAction::Capture(id, t0) => {
+                            if emit_scanout(&card.as_ref().unwrap().0, id, t0, &tx) {
+                                disabled_reported = false;
+                            } else {
+                                ftracker.capture_failed();
+                            }
+                        }
+                    }
+                }
+            }
             ActiveSync::Vblank => {
                 // capture the CURRENT fb as soon as its vblank retires it
                 let (seq, ns) = vblank.unwrap_or((0, 0));
@@ -1441,9 +1656,12 @@ fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> 
                 }
             }
         }
-        // polling cadence: vblank/zero modes need a tight poll (zero is trying
-        // to shave every millisecond); one-behind can afford 2 ms
-        let poll_ms = if matches!(active, ActiveSync::Vblank | ActiveSync::Zero) {
+        // polling cadence: vblank/zero/settle/fence modes need a tight poll
+        // (they are trying to shave every millisecond); one-behind can afford 2 ms
+        let poll_ms = if matches!(
+            active,
+            ActiveSync::Vblank | ActiveSync::Zero | ActiveSync::Settle | ActiveSync::Fence
+        ) {
             1
         } else {
             2
@@ -1599,5 +1817,66 @@ mod tests {
         assert_eq!(t.update(0, 0, 5), FbAction::Capture(5, 0));
         t.capture_failed();
         assert_eq!(t.update(SETTLE_MS + 1, 21_000, 5), FbAction::Capture(5, 0));
+    }
+
+    #[test]
+    fn settle_tracker_waits_then_captures_current() {
+        let mut t = SettleTracker::new(2);
+        // first observation: nothing until the settle elapses
+        assert_eq!(t.update(0, 0, 5), FbAction::None);
+        assert_eq!(t.update(1, 1_000, 5), FbAction::None);
+        // settle elapsed: capture the current fb with its observation time
+        assert_eq!(t.update(2, 2_000, 5), FbAction::Capture(5, 0));
+        // no repeat
+        assert_eq!(t.update(3, 3_000, 5), FbAction::None);
+        // a new commit is captured 2 ms later
+        assert_eq!(t.update(10, 10_000, 6), FbAction::None);
+        assert_eq!(t.update(12, 12_000, 6), FbAction::Capture(6, 10_000));
+        // DPMS off once, then a fresh first frame
+        assert_eq!(t.update(20, 20_000, 0), FbAction::Disabled);
+        assert_eq!(t.update(21, 21_000, 0), FbAction::None);
+        assert_eq!(t.update(30, 30_000, 7), FbAction::None);
+        assert_eq!(t.update(32, 32_000, 7), FbAction::Capture(7, 30_000));
+    }
+
+    #[test]
+    fn settle_tracker_keeps_order_when_settle_exceeds_interval() {
+        // settle (5 ms) longer than the commit interval (2 ms): a frame is
+        // still emitted in commit order, settle after *its own* commit
+        let mut t = SettleTracker::new(5);
+        assert_eq!(t.update(0, 0, 10), FbAction::None);
+        assert_eq!(t.update(2, 2_000, 11), FbAction::None);
+        assert_eq!(t.update(4, 4_000, 12), FbAction::None);
+        assert_eq!(t.update(5, 5_000, 12), FbAction::Capture(10, 0));
+        assert_eq!(t.update(7, 7_000, 12), FbAction::Capture(11, 2_000));
+        assert_eq!(t.update(9, 9_000, 12), FbAction::Capture(12, 4_000));
+        assert_eq!(t.update(11, 11_000, 12), FbAction::None);
+    }
+
+    #[test]
+    fn settle_tracker_failed_import_retries() {
+        let mut t = SettleTracker::new(1);
+        assert_eq!(t.update(0, 0, 5), FbAction::None);
+        assert_eq!(t.update(1, 1_000, 5), FbAction::Capture(5, 0));
+        // the import failed: the next poll re-offers the settled frame
+        t.capture_failed();
+        assert_eq!(t.update(2, 2_000, 5), FbAction::Capture(5, 0));
+    }
+
+    #[test]
+    fn fence_tracker_captures_on_signal() {
+        let mut t = FenceTracker::default();
+        // no signal: nothing, even on a new fb
+        assert_eq!(t.update(5, None), FbAction::None);
+        // a signal with a changed fb -> capture, t0 = the signal time
+        assert_eq!(t.update(5, Some(1_000)), FbAction::Capture(5, 1_000));
+        // another signal for the same fb -> nothing (already sent)
+        assert_eq!(t.update(5, Some(2_000)), FbAction::None);
+        // new fb + signal -> capture
+        assert_eq!(t.update(6, Some(3_000)), FbAction::Capture(6, 3_000));
+        // DPMS off once, then a fresh first frame
+        assert_eq!(t.update(0, Some(4_000)), FbAction::Disabled);
+        assert_eq!(t.update(0, Some(5_000)), FbAction::None);
+        assert_eq!(t.update(7, Some(6_000)), FbAction::Capture(7, 6_000));
     }
 }

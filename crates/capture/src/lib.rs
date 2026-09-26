@@ -14,6 +14,7 @@
 
 pub mod drm;
 pub mod egl;
+mod fence;
 pub mod input;
 pub mod materializer;
 pub mod qemu;
@@ -26,6 +27,12 @@ pub use qemu::QemuDbusSource;
 
 use anyhow::Result;
 
+/// Default settle window for [`CaptureSync::Settle`] (milliseconds).
+///
+/// Measured on this stack: the compositor's per-frame completion fence signals
+/// ~0.75 ms (p50), ~1-2 ms (p90), ~8-16 ms (p99) after the commit is observed.
+pub const DEFAULT_SETTLE_MS: u64 = 2;
+
 /// How the DRM/KMS source chooses which framebuffer to capture relative to
 /// the compositor's flips.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +41,14 @@ pub enum CaptureSync {
     /// scanned out for a full interval and is complete — but the mirrored
     /// image is one compositor frame old.
     OneBehind,
+    /// Capture the current fb `N` ms after its commit was observed, instead of
+    /// waiting for the next commit (one-behind). The compositor commits with a
+    /// non-blocking atomic commit and finishes its GPU work a little later; on
+    /// this stack the per-frame completion fence (NVIDIA semsurf) signals ~1 ms
+    /// after handover. Small N therefore removes most of the one-behind lag,
+    /// but frames whose render outlasts N are read mid-render and can tear.
+    /// This is a latency/tearing tradeoff, not a guarantee.
+    Settle(u64),
     /// Capture the current fb immediately when its commit is observed — no
     /// vblank wait and no one-behind. **Testing only:** the buffer may still
     /// be mid-render or not yet latched (this stack has no producer fence), so
@@ -49,6 +64,13 @@ pub enum CaptureSync {
     /// Try [`CaptureSync::Vblank`], degrade to [`CaptureSync::OneBehind`] if
     /// vblank turns out to be unusable on this driver/display.
     Auto,
+    /// Read the current fb when the compositor's per-frame completion fence
+    /// signals, observed through the kernel `dma_fence:dma_fence_signaled`
+    /// tracepoint (via tracefs; the same tracepoint an eBPF program would use).
+    /// Tear-free at ~1 ms latency on this stack, at the cost of requiring root
+    /// and an actively flipping compositor during a short calibration; falls
+    /// back to one-behind on any failure. See `capture::fence`.
+    Fence,
 }
 
 impl CaptureSync {
@@ -58,7 +80,17 @@ impl CaptureSync {
             "zero" | "now" => Some(Self::Zero),
             "vblank" => Some(Self::Vblank),
             "auto" => Some(Self::Auto),
-            _ => None,
+            // "bpf" is accepted as an alias: the mechanism is the dma_fence
+            // tracepoint, whether consumed via tracefs (here) or an eBPF probe.
+            "fence" | "bpf" => Some(Self::Fence),
+            _ => {
+                let rest = s.strip_prefix("settle")?;
+                let ms = match rest.strip_prefix(':').or_else(|| rest.strip_prefix('=')) {
+                    None | Some("") => DEFAULT_SETTLE_MS,
+                    Some(v) => v.parse().ok()?,
+                };
+                Some(Self::Settle(ms))
+            }
         }
     }
 }
@@ -98,7 +130,7 @@ pub fn fourcc_name(fourcc: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fourcc_name, CaptureSync};
+    use super::{fourcc_name, CaptureSync, DEFAULT_SETTLE_MS};
 
     #[test]
     fn fourcc_names() {
@@ -115,6 +147,13 @@ mod tests {
         assert_eq!(CaptureSync::parse("now"), Some(CaptureSync::Zero));
         assert_eq!(CaptureSync::parse("vblank"), Some(CaptureSync::Vblank));
         assert_eq!(CaptureSync::parse("auto"), Some(CaptureSync::Auto));
+        assert_eq!(CaptureSync::parse("fence"), Some(CaptureSync::Fence));
+        assert_eq!(CaptureSync::parse("bpf"), Some(CaptureSync::Fence));
+        assert_eq!(CaptureSync::parse("settle"), Some(CaptureSync::Settle(DEFAULT_SETTLE_MS)));
+        assert_eq!(CaptureSync::parse("settle:5"), Some(CaptureSync::Settle(5)));
+        assert_eq!(CaptureSync::parse("settle=12"), Some(CaptureSync::Settle(12)));
+        assert_eq!(CaptureSync::parse("settle:"), Some(CaptureSync::Settle(DEFAULT_SETTLE_MS)));
+        assert_eq!(CaptureSync::parse("settle:x"), None);
         assert_eq!(CaptureSync::parse("nope"), None);
     }
 }
