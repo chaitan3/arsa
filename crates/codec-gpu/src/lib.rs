@@ -201,6 +201,7 @@ const GL_RGBA8: u32 = 0x8058;
 const GL_READ_WRITE: u32 = 0x88BA;
 const GL_SHADER_IMAGE_ACCESS_BARRIER_BIT: u32 = 0x0000_0020;
 const GL_TEXTURE_FETCH_BARRIER_BIT: u32 = 0x0000_0008;
+const GL_TEXTURE_UPDATE_BARRIER_BIT: u32 = 0x0000_0100;
 
 impl Gl {
     unsafe fn load(get: FnGetProc, lib: Option<&libloading::Library>) -> Result<Self> {
@@ -1646,9 +1647,21 @@ impl GpuVideoDecoder {
             (self.gl.uniform1ui)(u("u_count"), count as u32);
             (self.gl.uniform1ui)(u("u_pbase_words"), self.payload_base_words);
             (self.gl.dispatch_compute)(count as u32, 1, 1);
+            // Make the image stores visible to the presenter's sampler. The
+            // spec bit for imageStore -> texture() is GL_TEXTURE_FETCH_BARRIER_BIT
+            // (and GL_SHADER_IMAGE_ACCESS_BARRIER_BIT for the next decode's
+            // imageLoad of the previous frame). Mesa/Intel additionally keeps
+            // the image-store result in a write cache until the image is
+            // unbound, so the presenter would sample stale texels (a persistent
+            // cursor trail on the in-place lossless texture). Cover all four
+            // consumers and unbind the image before the caller samples it.
             (self.gl.memory_barrier)(
-                GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT,
+                GL_SHADER_IMAGE_ACCESS_BARRIER_BIT
+                    | GL_TEXTURE_FETCH_BARRIER_BIT
+                    | GL_TEXTURE_UPDATE_BARRIER_BIT
+                    | GL_FRAMEBUFFER_BARRIER_BIT,
             );
+            (self.gl.bind_image_texture)(0, 0, 0, 0, 0, GL_READ_WRITE, GL_RGBA8);
             let err = (self.gl.get_error)();
             if err != 0 {
                 bail!("decode_to_image glError 0x{err:04x}");
