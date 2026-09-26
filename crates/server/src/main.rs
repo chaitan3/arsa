@@ -1,13 +1,13 @@
 //! rdma-display server: captures a display source and streams frames to a
 //! client over RDMA.
 //!
-//! Modes:
-//!   --mode testcard   synthetic frames (validates the transport end-to-end)
-//!   --mode capture    --source qemu|drm:
-//!     --codec raw|lossless|lossy  frame coding (default raw = unchanged wire;
-//!             lossless = tile-delta against the previous frame; see
-//!             docs/compression.md). The client negotiates the choice.
-//!     qemu  QEMU dbus display capture (the guest):
+//! Modes (defaults shown):
+//!   --mode capture   stream a display source:
+//!     --source drm (default)  KMS capture of the host screen (Sunshine-style):
+//!             grabs the CRTC's current fb via GETFB2 as a dmabuf each flip;
+//!             requires sudo (CAP_SYS_ADMIN) and kernel >= 5.8; egl
+//!             materialize only; --input uinput (default)
+//!     --source qemu           QEMU dbus display capture (the guest):
 //!             --materialize egl    GPU blit+readback (default, gl=on)
 //!             --materialize plain  D-Bus host-memory scanouts (gl=off)
 //!             --readback pbo       zero-copy staging: GL readback DMA fills
@@ -15,10 +15,12 @@
 //!                                  slots (default for egl); "direct" = legacy
 //!                                  readPixels path
 //!             --input qemu         inject into the guest console (default)
-//!     drm   KMS capture of the host screen (Sunshine-style): grabs the
-//!             CRTC's current fb via GETFB2 as a dmabuf each flip; requires
-//!             sudo (CAP_SYS_ADMIN) and kernel >= 5.8; egl materialize only
-//!             --input uinput        inject into the host compositor (default)
+//!     --codec lossless (default)|raw|lossy  frame coding (lossless =
+//!             tile-delta against the previous frame; raw = unchanged wire;
+//!             lossy = PyroWave; see docs/compression.md). Client negotiates.
+//!     --capture-sync auto (default) = fence -> vblank -> one-behind
+//!     --fps 0 (default) = uncapped, consumer-paced; --audio on by default
+//!   --mode testcard   synthetic frames (validates the transport end-to-end)
 
 use std::net::TcpListener;
 use std::sync::mpsc;
@@ -37,12 +39,12 @@ mod lossy;
 use gpu_power::GpuPower;
 
 fn main() -> Result<()> {
-    let mut mode = "testcard".to_string();
+    let mut mode = "capture".to_string();
     let mut device: Option<String> = None;
     let mut listen: String = "0.0.0.0:4791".to_string();
     let mut slots: usize = 3;
-    let mut fps: u64 = 30;
-    let mut source = "qemu".to_string();
+    let mut fps: u64 = 0;
+    let mut source = "drm".to_string();
     let mut input: Option<String> = None; // None = paired default for the source
     let mut dbus_socket: Option<String> = None;
     let mut console: u32 = 0;
@@ -51,11 +53,11 @@ fn main() -> Result<()> {
     let mut drm_card: Option<String> = None;
     let mut input_test = false;
     let mut readback: String = "pbo".to_string();
-    let mut audio = false;
+    let mut audio = true;
     let mut audio_device: Option<String> = None;
     let mut audio_helper = false;
     let mut capture_sync = CaptureSync::Auto;
-    let mut codec = rdma_display_codec::Codec::Raw;
+    let mut codec = rdma_display_codec::Codec::Lossless;
     let mut lossy_budget: usize = 1_000_000;
     let mut lossy_chroma444 = false;
     let mut transport = rdma_display_rdma::TransportPref::Auto;
@@ -121,6 +123,7 @@ fn main() -> Result<()> {
                     .with_context(|| format!("--transport must be auto|rdma|tcp, got {v:?}"))?;
             }
             "--audio" => audio = true,
+            "--no-audio" => audio = false,
             "--audio-device" => audio_device = Some(args.next().expect("--audio-device needs a value")),
             "--audio-helper" => audio_helper = true,
             "--gpu-power" => {
@@ -128,20 +131,21 @@ fn main() -> Result<()> {
                 gpu_power = GpuPower::parse(&v)?;
             }
             "--help" | "-h" => {
-                println!("usage: rdma-display-server [--mode testcard|capture] [--device mlx5_0] [--listen 0.0.0.0:4791] [--slots 3] [--fps 60]\n  \
+                println!("usage: rdma-display-server [--mode capture|testcard] [--device mlx5_0] [--listen 0.0.0.0:4791] [--slots 3] [--fps N]\n  \
+  defaults: --mode capture --source drm --fps 0 --codec lossless --audio on --capture-sync auto (a bare command is a root KMS capture of the host)\n  \
 capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS capture, the host — requires sudo/CAP_SYS_ADMIN, kernel >= 5.8)\n  \
   --input qemu|uinput (default auto: qemu↔qemu-dbus, drm↔uinput)\n  \
-  qemu: [--dbus-socket /path/dbus.sock] [--console 0]   drm: [--drm-card /dev/dri/card0]\n  \
+  qemu: [--dbus-socket /path/dbus.sock] [--console 0]   drm: [--drm-card /dev/dri/cardN] (default: first card0..card8 with an active scanout)\n  \
   [--materialize egl|plain] [--rendernode /dev/dri/renderD128] [--readback pbo|direct] [--input-test]\n  \
   --materialize egl (default) imports the dmabuf and reads the frame back for raw/lossy and for the CPU/readback lossless fallback; GPU lossless bypasses the readback entirely and encodes straight from the imported dmabuf (no full-frame readback, no re-upload). --readback pbo|direct only affects that readback path.\n  \
-  --capture-sync onbehind|vblank|zero|auto|settle[:ms]|fence  (drm) which fb to capture: onbehind = safe, one frame old; vblank = current frame as its vblank retires it (lowest latency; dead on this nvidia-drm stack, falls back); zero = current frame immediately, no sync (testing only, may tear); settle[:ms] = current frame ms after its commit (default 2 ms; usually complete, but frames whose render outlasts the window tear); fence = read the current frame when the compositor's per-frame completion fence signals (tracefs; ~1 ms, tear-free, needs root, falls back); auto = try vblank, fall back (default)\n  \
-  --codec raw|lossless|lossy  frame coding for the whole session (default raw = unchanged wire). lossless = tile-delta against the previous frame (desktop-friendly); lossy = PyroWave intra-only GPU codec (needs libpyrowave-shared.so). The client negotiates automatically.\n  \
+  --capture-sync onbehind|vblank|zero|auto|settle[:ms]|fence  (drm) which fb to capture: onbehind = safe, one frame old; vblank = current frame as its vblank retires it (lowest latency; dead on this nvidia-drm stack, falls back); zero = current frame immediately, no sync (testing only, may tear); settle[:ms] = current frame ms after its commit (default 2 ms; usually complete, but frames whose render outlasts the window tear); fence = read the current frame when the compositor's per-frame completion fence signals (tracefs; ~1 ms, tear-free, needs root, falls back); auto = try fence, then vblank, then one-behind (default)\n  \
+  --codec raw|lossless|lossy  frame coding for the whole session (default lossless = v2 tile-delta against the previous frame, desktop-friendly; raw = unchanged wire). lossy = PyroWave intra-only GPU codec (needs libpyrowave-shared.so). The client negotiates automatically; build server and client together (lossless v2 is a wire-format version).\n  \
   --lossy-budget BYTES  lossy: max bitstream bytes per frame (default 1000000; slot size sent to the client).\n  \
   --lossy-chroma 420|444  lossy: chroma subsampling (default 420).\n  \
   --gpu-power off|p5|p0|max|<sm>[,<mem>]  floor the NVIDIA GPU clocks with nvidia-smi, still allowing boost above the floor (needs root; warns and continues if unavailable). p5 = the measured fast floor (sm 435 / mem 810 MHz), p0/max = floor at the card's maximum (i.e. pinned), <sm>[,<mem>] = explicit MHz floors. Default off. GeForce cards reject the memory-clock floor.\n  \
   --transport auto|rdma|tcp  video transport (default auto: RDMA/RoCE when available, else TCP). Negotiated with the client; TCP sends length-prefixed coded frames on a TAG_VIDEO connection.\n  \
-  --fps N (capture): pacing cap; 0 = uncapped, consumer-paced by client credits (default 30). For lower latency use 60 or 0.\n  \
-  --audio [--audio-device my-sink.monitor]  audio side-channel: capture the named source's PCM through the pipewire-pulse\n  \
+  --fps N (capture): pacing cap; 0 = uncapped, consumer-paced by client credits (default 0).\n  \
+  --audio | --no-audio [--audio-device my-sink.monitor]  audio side-channel (default on; --no-audio disables): capture the named source's PCM through the pipewire-pulse\n  \
   compat socket (XDG_RUNTIME_DIR must point at the user's session when running under sudo; '@DEFAULT_MONITOR@' = default sink).");
                 return Ok(());
             }
@@ -370,9 +374,20 @@ fn run_capture(
     }
     // audio side-channel: capture starts with the server (video flows even
     // if no client ever connects the audio stream; the mailbox just
-    // overwrites — realtime drop-oldest, zero backpressure)
+    // overwrites — realtime drop-oldest, zero backpressure). Capture is
+    // best-effort: a missing pipewire/pulse (e.g. running as root without
+    // `sudo -E`) warns and leaves audio off rather than blocking video.
     let audio_mbox = if audio {
-        Some(rdma_display_audio::capture::start_capture(audio_device)?)
+        match rdma_display_audio::capture::start_capture(audio_device) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!(
+                    "[audio] capture unavailable ({e:#}); streaming video without audio \
+                     (pass --no-audio to silence this)"
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -639,7 +654,9 @@ fn run_capture(
                         }
                     }
                     None => {
-                        eprintln!("[server] audio connection but --audio is off: dropped ({addr})");
+                        eprintln!(
+                            "[server] audio connection but audio capture is unavailable: dropped ({addr})"
+                        );
                     }
                 }
             } else if tag[0] == rdma_display_proto::TAG_INPUT {

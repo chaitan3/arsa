@@ -1,8 +1,9 @@
 //! rdma-display client: connects to an rdma-display server over the control
 //! channel, receives frames via RDMA WRITE into registered slots, and either
-//! presents them on Wayland (`--output wayland`, C1: the slots themselves are
+//! presents them on Wayland (`--output egl`, default: the slots themselves are
 //! wl_buffers, credits pace on compositor release) or runs headless
-//! (stats/checksums + optional PPM dump).
+//! (`--output none`: stats/checksums + optional PPM dump). `--audio` is on by
+//! default; `--no-audio` disables it.
 
 mod eglwin;
 mod gamepad;
@@ -26,10 +27,10 @@ fn main() -> Result<()> {
     let mut seconds: Option<u64> = None;
     let mut slot_mem: String = "host".to_string();
     let mut cuda_device: u32 = 0;
-    let mut output: String = "none".to_string();
+    let mut output: String = "egl".to_string();
     let mut metrics_on = false;
     let mut fullscreen = false;
-    let mut audio_on = false;
+    let mut audio_on = true;
     let mut audio_buffer_ms: u32 = rdma_display_audio::wire::BUFFER_MS;
     let mut controller_on = true;
     let mut controller_grab = true;
@@ -54,6 +55,7 @@ fn main() -> Result<()> {
             "--metrics" => metrics_on = true,
             "--fullscreen" => fullscreen = true,
             "--audio" => audio_on = true,
+            "--no-audio" => audio_on = false,
             "--audio-buffer-ms" => {
                 audio_buffer_ms = args.next().expect("--audio-buffer-ms needs a value").parse()?
             }
@@ -83,9 +85,9 @@ fn main() -> Result<()> {
                 println!("usage: rdma-display-client --server HOST:PORT [--device mlx5_0] [--slots 3] [--dump frame.ppm] [--seconds N]");
                 println!("  --slot-mem host|cuda  receive slots: host = pinned RAM (default); cuda = dormant GPU path");
                 println!("  --cuda-device N       CUDA device ordinal for --slot-mem cuda (default 0)");
-                println!("  --output none|egl     egl = present in a Wayland window (needs --slot-mem host)");
+                println!("  --output egl|none     egl = present in a Wayland window (default; needs --slot-mem host); none = headless (e.g. with --dump)");
                 println!("  --fullscreen          fullscreen on the current output; frame letterboxed/scaled to the screen with aspect kept (compositor's own fullscreen toggle also works)");
-                println!("  --audio               play the server's audio side-channel (default sink; server captures its own monitor source)");
+                println!("  --audio | --no-audio  play the server's audio side-channel (default sink; server captures its own monitor source). Default on; --no-audio disables");
                 println!("  --audio-buffer-ms N   client playout buffer depth / pulse tlength (default {}; lower = less latency, less jitter headroom)", rdma_display_audio::wire::BUFFER_MS);
                 println!("  --metrics             per-stage latency overlay (capture, send, transfer, upload, present, on-screen) + clock-sync pings");
                 println!("  --no-controller       don't forward attached gamepads");

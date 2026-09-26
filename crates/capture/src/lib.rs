@@ -61,8 +61,9 @@ pub enum CaptureSync {
     /// (VRR idle, low refresh) and degrades permanently if vblank never
     /// advances.
     Vblank,
-    /// Try [`CaptureSync::Vblank`], degrade to [`CaptureSync::OneBehind`] if
-    /// vblank turns out to be unusable on this driver/display.
+    /// Try [`CaptureSync::Fence`], then [`CaptureSync::Vblank`], then degrade
+    /// to [`CaptureSync::OneBehind`]. Fence needs root and a flipping
+    /// compositor during calibration; each step falls through on failure.
     Auto,
     /// Read the current fb when the compositor's per-frame completion fence
     /// signals, observed through the kernel `dma_fence:dma_fence_signaled`

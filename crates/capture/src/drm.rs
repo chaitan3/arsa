@@ -1388,37 +1388,52 @@ fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> 
                     let vblank_probe = crtc_id.map(|c| probe_vblank(fdi, c));
                     let vblank_ok =
                         matches!(&vblank_probe, Some(Ok((s1, s2, _))) if s2 > s1);
-                    active = match sync {
-                        CaptureSync::Zero => ActiveSync::Zero,
-                        CaptureSync::OneBehind => ActiveSync::OneBehind,
-                        CaptureSync::Settle(_) => ActiveSync::Settle,
-                        CaptureSync::Fence => {
-                            if fence.is_none() && !fence_tried {
-                                fence_tried = true;
-                                match crate::fence::start(FENCE_CALIB) {
-                                    Ok(w) => {
-                                        fence = Some(w);
-                                        ActiveSync::Fence
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "[capture-drm] fence watch unavailable: {e:#}; \
-                                             using one-behind"
-                                        );
-                                        ActiveSync::OneBehind
-                                    }
+                    // Resolve the effective mode. `auto` tries the best
+                    // (lowest-latency, tear-free) mode first and degrades:
+                    // completion fence -> vblank -> one-behind. The fence
+                    // attempt runs once (it needs root + a flipping compositor
+                    // during FENCE_CALIB) and is cached for later card opens.
+                    let wants_fence = matches!(sync, CaptureSync::Fence | CaptureSync::Auto);
+                    let mut fence_active = false;
+                    if wants_fence && fence.is_none() && !fence_tried {
+                        fence_tried = true;
+                        match crate::fence::start(FENCE_CALIB) {
+                            Ok(w) => {
+                                fence = Some(w);
+                                fence_active = true;
+                            }
+                            Err(e) => {
+                                if matches!(sync, CaptureSync::Auto) {
+                                    eprintln!(
+                                        "[capture-drm] fence watch unavailable: {e:#}; \
+                                         trying vblank"
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "[capture-drm] fence watch unavailable: {e:#}; \
+                                         using one-behind"
+                                    );
                                 }
-                            } else if fence.is_some() {
-                                ActiveSync::Fence
-                            } else {
-                                ActiveSync::OneBehind
                             }
                         }
-                        CaptureSync::Vblank | CaptureSync::Auto => {
-                            if vblank_ok {
-                                ActiveSync::Vblank
-                            } else {
-                                ActiveSync::OneBehind
+                    } else if wants_fence && fence.is_some() {
+                        fence_active = true;
+                    }
+                    active = if fence_active {
+                        ActiveSync::Fence
+                    } else {
+                        match sync {
+                            CaptureSync::Zero => ActiveSync::Zero,
+                            CaptureSync::OneBehind => ActiveSync::OneBehind,
+                            CaptureSync::Settle(_) => ActiveSync::Settle,
+                            // the fence watch is unavailable (or died): degrade
+                            CaptureSync::Fence => ActiveSync::OneBehind,
+                            CaptureSync::Vblank | CaptureSync::Auto => {
+                                if vblank_ok {
+                                    ActiveSync::Vblank
+                                } else {
+                                    ActiveSync::OneBehind
+                                }
                             }
                         }
                     };
