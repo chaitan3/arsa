@@ -149,17 +149,26 @@ fn main() -> Result<()> {
         ((w + 1) / 2, (h + 1) / 2)
     };
     let dims = [(w, h), (cw, ch), (cw, ch)];
+    let export_planes = env_u32("EXPORT", 0) == 1;
     let mut planes = Vec::new();
     for &(pw_, ph_) in &dims {
-        let im = vk.create_image(
-            vk::Format::R8_UNORM,
-            pw_,
-            ph_,
-            vk::ImageUsageFlags::STORAGE
-                | vk::ImageUsageFlags::TRANSFER_SRC
-                | vk::ImageUsageFlags::SAMPLED,
-            vk::ImageTiling::OPTIMAL,
-        )?;
+        let usage = vk::ImageUsageFlags::STORAGE
+            | vk::ImageUsageFlags::TRANSFER_SRC
+            | vk::ImageUsageFlags::SAMPLED;
+        let im = if export_planes {
+            // the client's GPU path: linear, dma-buf-exportable planes
+            let (im, _fd, _pitch) =
+                vk.create_exportable_image(vk::Format::R8_UNORM, pw_, ph_, usage)?;
+            im
+        } else {
+            vk.create_image(
+                vk::Format::R8_UNORM,
+                pw_,
+                ph_,
+                usage,
+                vk::ImageTiling::OPTIMAL,
+            )?
+        };
         vk.transition(
             im.image,
             vk::ImageLayout::UNDEFINED,
@@ -248,6 +257,10 @@ fn main() -> Result<()> {
     let reuse_luma = mean_std(luma.as_slice());
 
     // --- variant 3: decode_gpu + device_wait_idle ----------------------------
+    // WRONG for correctness: with no release sync PyroWave never flushes
+    // Granite's frame context, so the decode does not run; device_wait_idle
+    // returns immediately and a real consumer (GL importing the planes) reads
+    // stale/uninitialized data. Kept only to show why it looks "fast".
     let mut dev_us = Vec::new();
     for it in 0..iters {
         let frame = encode_once(&mut bitstream)?;
@@ -319,18 +332,19 @@ fn main() -> Result<()> {
 
     let raw = w as usize * h as usize * 4;
     println!(
-        "[lossy-bench] {}x{} {} budget {} KiB | coded {} B ({} pkts, {}x) | iters {}",
+        "[lossy-bench] {}x{} {} budget {} KiB | planes {} | coded {} B ({} pkts, {}x) | iters {}",
         w,
         h,
         if chroma444 { "444" } else { "420" },
         budget / 1024,
+        if export_planes { "linear/exported" } else { "optimal" },
         coded_len,
         npkts,
         raw / coded_len.max(1),
         iters
     );
     println!(
-        "[lossy-bench] encode p50 {:.2} ms (incl. packetize) | decode wait: fresh-sync p50 {:.2} ms | reused-sync p50 {:.2} ms | device-wait p50 {:.2} ms | queue-only p50 {:.2} ms",
+        "[lossy-bench] encode p50 {:.2} ms (incl. packetize) | decode wait: fresh-sync p50 {:.2} ms | reused-sync p50 {:.2} ms | device-wait p50 {:.2} ms (WRONG: no flush) | queue-only p50 {:.2} ms",
         median(&mut enc_us),
         median(&mut synced_us),
         median(&mut reuse_us),

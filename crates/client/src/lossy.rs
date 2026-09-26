@@ -21,8 +21,7 @@ use rdma_display_vkcore::{HostBuffer, Image, VkCore};
 pub struct LossyDecoder {
     vk: VkCore,
     pw: Pyrowave,
-    /// kept alive for the decoder's lifetime (raw handle; no Drop)
-    _dev: PyrowaveDevice,
+    dev: PyrowaveDevice,
     dec: PyrowaveDecoder,
     w: u32,
     h: u32,
@@ -117,7 +116,7 @@ impl LossyDecoder {
         Ok(Self {
             vk,
             pw,
-            _dev: dev,
+            dev,
             dec,
             w,
             h,
@@ -182,14 +181,14 @@ impl LossyDecoder {
         let bufs = PyrowaveGpuBuffers {
             planes: [self.plane_view(0), self.plane_view(1), self.plane_view(2)],
         };
-        // `decode_gpu` submits the decode to our shared Vulkan queue (the
-        // non-borrowed-command-buffer path submits directly, see
-        // `pyrowave_decoder_decode_gpu_buffer`), so a device wait is a valid
-        // completion wait. `decode_gpu_synced` instead creates + destroys a
-        // timeline-semaphore sync object every frame — ~0.9 ms of pure
-        // per-frame overhead for a ~0.15 ms decode.
-        self.pw.decode_gpu(self.dec, &bufs)?;
-        self.vk.device_wait_idle()?;
+        // `decode_gpu_synced` creates a timeline-semaphore sync object and
+        // passes it as the release sync. That release is what flushes Granite's
+        // frame context (`pyrowave_decoder_decode_gpu_buffer` only *queues* the
+        // decode unless a sync object is signaled), so the CPU wait on it is a
+        // real completion wait. Do NOT replace this with `decode_gpu` +
+        // device_wait_idle: with no release sync the decode is never flushed,
+        // so the planes are read un-decoded (green first frame, one-frame lag).
+        self.pw.decode_gpu_synced(self.dev, self.dec, &bufs)?;
         Ok(())
     }
 
