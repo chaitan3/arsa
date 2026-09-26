@@ -199,6 +199,7 @@ const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
 const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
 const GL_RGBA8: u32 = 0x8058;
 const GL_READ_WRITE: u32 = 0x88BA;
+const GL_WRITE_ONLY: u32 = 0x88B9;
 const GL_SHADER_IMAGE_ACCESS_BARRIER_BIT: u32 = 0x0000_0020;
 const GL_TEXTURE_FETCH_BARRIER_BIT: u32 = 0x0000_0008;
 
@@ -1460,6 +1461,13 @@ pub struct GpuVideoDecoder {
     _gl_lib: Option<libloading::Library>,
     _egl_lib: Option<libloading::Library>,
     dec_prog: u32,
+    /// portable path: copy the just-decoded frame into `ref_tex` (0 = unused)
+    copy_prog: u32,
+    /// true when `dec_prog` is the portable readonly/writeonly variant and the
+    /// reference lives in `ref_tex` rather than in the presenter's texture
+    pp: bool,
+    /// reference texture for the `pp` path (lazily created)
+    ref_tex: std::cell::Cell<u32>,
     _coded: u32,
     coded_map: *mut u8,
     coded_len: usize,
@@ -1478,7 +1486,32 @@ impl GpuVideoDecoder {
     ) -> Result<Self> {
         geom.validate()?;
         let gl = unsafe { Gl::load(get_proc, gl_lib.as_ref())? };
-        let dec_prog = build_program(&gl, &dec_tex_src())?;
+        // Prefer the read-write single-texture decode (NVIDIA, one texture, no
+        // copy). Mesa/Intel correctly rejects that shader (ESSL 3.1 forbids
+        // read-write images whose format is not r32f/r32i/r32ui), so fall back
+        // to the portable readonly/writeonly pair plus a reference copy.
+        // RDMA_LOSSLESS_GL_PP=1 forces the portable path (A/B + bench).
+        let force_pp = std::env::var_os("RDMA_LOSSLESS_GL_PP").is_some();
+        let (dec_prog, copy_prog, pp) = if !force_pp {
+            match build_program(&gl, &dec_tex_src()) {
+                Ok(p) => (p, 0, false),
+                Err(e) => {
+                    eprintln!(
+                        "[gpu-dec] read-write decode shader rejected ({e:#}); \
+                         using the portable readonly/writeonly decode"
+                    );
+                    let p = build_program(&gl, &dec_pp_src())
+                        .context("portable decode shader (dec_pp_src)")?;
+                    let c = build_program(&gl, DEC_COPY_SRC)
+                        .context("portable reference-copy shader")?;
+                    (p, c, true)
+                }
+            }
+        } else {
+            let p = build_program(&gl, &dec_pp_src()).context("portable decode shader")?;
+            let c = build_program(&gl, DEC_COPY_SRC).context("portable reference-copy shader")?;
+            (p, c, true)
+        };
         let coded_len = geom.max_coded_len();
         let index_cap = geom.tile_count();
         let payload_base_words = ((HEADER_LEN + index_cap * INDEX_WORDS * 4) / 4) as u32;
@@ -1507,13 +1540,21 @@ impl GpuVideoDecoder {
                 bail!("persistent map of the gpu decoder buffer failed");
             }
             (gl.bind_buffer_base)(GL_SHADER_STORAGE_BUFFER, 4, coded);
-            eprintln!("[gpu-dec] attached ({}x{})", geom.width, geom.height);
+            eprintln!(
+                "[gpu-dec] attached ({}x{}){}",
+                geom.width,
+                geom.height,
+                if pp { " [portable readonly/writeonly]" } else { "" }
+            );
             Ok(Self {
                 geom,
                 gl,
                 _gl_lib: gl_lib,
                 _egl_lib: None,
                 dec_prog,
+                copy_prog,
+                pp,
+                ref_tex: std::cell::Cell::new(0),
                 _coded: coded,
                 coded_map: coded_map as *mut u8,
                 coded_len,
@@ -1632,6 +1673,9 @@ impl GpuVideoDecoder {
             bail!("decoder count {count} > capacity {}", self.index_cap);
         }
         let g = self.geom;
+        if self.pp {
+            return unsafe { self.decode_pp(tex, count) };
+        }
         unsafe {
             (self.gl.bind_image_texture)(0, tex, 0, 0, 0, GL_READ_WRITE, GL_RGBA8);
             (self.gl.use_program)(self.dec_prog);
@@ -1655,6 +1699,71 @@ impl GpuVideoDecoder {
             }
             (self.gl.finish)();
         }
+        Ok(())
+    }
+
+    /// Portable decode: reference (`ref_tex`, readonly) -> current (`tex`,
+    /// writeonly), then copy the current frame back into `ref_tex` so the next
+    /// frame reads it. Used when the read-write single-texture shader is
+    /// unavailable (Mesa/Intel). The first frame is full, and a full frame
+    /// never uses `REF` (see `ENC_BODY`), so the uninitialized `ref_tex` is not
+    /// read before the first refresh.
+    unsafe fn decode_pp(&self, tex: u32, count: usize) -> Result<()> {
+        let g = self.geom;
+        let mut rt = self.ref_tex.get();
+        if rt == 0 {
+            (self.gl.gen_textures)(1, &mut rt);
+            (self.gl.bind_texture)(GL_TEXTURE_2D, rt);
+            (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST as i32);
+            (self.gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST as i32);
+            (self.gl.tex_storage_2d)(GL_TEXTURE_2D, 1, GL_RGBA8, g.width as i32, g.height as i32);
+            (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
+            let err = (self.gl.get_error)();
+            if err != 0 {
+                bail!("portable decode reference texture glError 0x{err:04x}");
+            }
+            self.ref_tex.set(rt);
+        }
+        // decode: previous frame (ref_tex) -> current (tex)
+        (self.gl.bind_image_texture)(0, rt, 0, 0, 0, GL_READ_ONLY, GL_RGBA8);
+        (self.gl.bind_image_texture)(1, tex, 0, 0, 0, GL_WRITE_ONLY, GL_RGBA8);
+        (self.gl.use_program)(self.dec_prog);
+        let u = |name: &str| {
+            let c = CString::new(name).unwrap();
+            (self.gl.get_uniform_location)(self.dec_prog, c.as_ptr() as *const u8)
+        };
+        (self.gl.uniform1ui)(u("u_width"), g.width);
+        (self.gl.uniform1ui)(u("u_height"), g.height);
+        (self.gl.uniform1ui)(u("u_stride_px"), self.stride_px);
+        (self.gl.uniform1ui)(u("u_tiles_x"), g.tiles_x() as u32);
+        (self.gl.uniform1ui)(u("u_count"), count as u32);
+        (self.gl.uniform1ui)(u("u_pbase_words"), self.payload_base_words);
+        (self.gl.dispatch_compute)(count as u32, 1, 1);
+        (self.gl.memory_barrier)(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        // refresh the reference: current (tex) -> ref_tex
+        (self.gl.bind_image_texture)(0, tex, 0, 0, 0, GL_READ_ONLY, GL_RGBA8);
+        (self.gl.bind_image_texture)(1, rt, 0, 0, 0, GL_WRITE_ONLY, GL_RGBA8);
+        (self.gl.use_program)(self.copy_prog);
+        let cu = |name: &str| {
+            let c = CString::new(name).unwrap();
+            (self.gl.get_uniform_location)(self.copy_prog, c.as_ptr() as *const u8)
+        };
+        let pixels = g.width * g.height;
+        (self.gl.uniform1ui)(cu("u_width"), g.width);
+        (self.gl.uniform1ui)(cu("u_pixels"), pixels);
+        (self.gl.dispatch_compute)((pixels + 255) / 256, 1, 1);
+        (self.gl.memory_barrier)(
+            GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT,
+        );
+        // unbind so the presenter's sampler never sees an image in flight:
+        // Mesa keeps the image-store result in a write cache until unbound
+        (self.gl.bind_image_texture)(0, 0, 0, 0, 0, GL_READ_WRITE, GL_RGBA8);
+        (self.gl.bind_image_texture)(1, 0, 0, 0, 0, GL_READ_WRITE, GL_RGBA8);
+        let err = (self.gl.get_error)();
+        if err != 0 {
+            bail!("decode_to_image (portable) glError 0x{err:04x}");
+        }
+        (self.gl.finish)();
         Ok(())
     }
 }
@@ -2094,3 +2203,38 @@ void store_px(uint x, uint y, uint v) {{ imageStore(u_img, ivec2(int(x), int(y))
 {DEC_PRELUDE}\n{DEC_BODY}\n"
     )
 }
+
+/// Portable decode variant. ESSL 3.1 forbids read-write images whose format is
+/// not r32f/r32i/r32ui, so Mesa/Intel rejects [`dec_tex_src`] (NVIDIA happens
+/// to accept it). Here the reference read is a `readonly` image and the output
+/// write a separate `writeonly` image; [`DEC_COPY_SRC`] refreshes the reference
+/// afterwards. Selected automatically when the read-write shader fails.
+fn dec_pp_src() -> String {
+    format!(
+        "#version 310 es\nprecision highp int;\nlayout(local_size_x = 256) in;\n\
+uniform uint u_width, u_height, u_stride_px, u_tiles_x, u_count, u_pbase_words;\n\
+layout(std430, binding = 4) readonly buffer In {{ uint inb[]; }};\n\
+layout(rgba8, binding = 0) uniform highp readonly image2D u_img;\n\
+layout(rgba8, binding = 1) uniform highp writeonly image2D u_out;\n\
+uint read_coded(uint i) {{ return inb[i]; }}\n\
+uint load_px(uint x, uint y) {{ return packUnorm4x8(imageLoad(u_img, ivec2(int(x), int(y)))); }}\n\
+void store_px(uint x, uint y, uint v) {{ imageStore(u_out, ivec2(int(x), int(y)), unpackUnorm4x8(v)); }}\n\
+{DEC_PRELUDE}\n{DEC_BODY}\n"
+    )
+}
+
+/// Copy `u_src` (binding 0) into `u_dst` (binding 1): refreshes the portable
+/// decoder's reference from the frame just decoded.
+const DEC_COPY_SRC: &str = r#"#version 310 es
+precision highp int;
+layout(local_size_x = 256) in;
+uniform uint u_width, u_pixels;
+layout(rgba8, binding = 0) uniform highp readonly image2D u_src;
+layout(rgba8, binding = 1) uniform highp writeonly image2D u_dst;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= u_pixels) return;
+    ivec2 p = ivec2(int(i % u_width), int(i / u_width));
+    imageStore(u_dst, p, imageLoad(u_src, p));
+}
+"#;

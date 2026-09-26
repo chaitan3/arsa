@@ -218,6 +218,7 @@ fn decoder_roundtrip(geom: Geometry, frames: &[Vec<u32>]) -> Result<()> {
     let dec = GpuVideoDecoder::attach_current(geom)?;
     let tex = dec.create_texture(W, H)?;
     let mut out = vec![0u8; geom.frame_bytes()];
+    let mut dec_us = Vec::new();
     for (i, frame) in frames.iter().enumerate() {
         let fb = words_bytes(frame);
         gpu.upload(fb)?;
@@ -226,7 +227,9 @@ fn decoder_roundtrip(geom: Geometry, frames: &[Vec<u32>]) -> Result<()> {
         gpu.update_reference()?;
         let count = rdma_display_codec::Header::parse(gpu.coded(n))?.count as usize;
         dec.upload(gpu.coded(n))?;
+        let t = std::time::Instant::now();
         dec.decode_to_image(tex, count)?;
+        dec_us.push(t.elapsed().as_secs_f64() * 1e3);
         dec.read_texture(tex, &mut out)?;
         if out != fb {
             let off = out.iter().zip(fb.iter()).position(|(a, b)| a != b).unwrap();
@@ -239,9 +242,12 @@ fn decoder_roundtrip(geom: Geometry, frames: &[Vec<u32>]) -> Result<()> {
             );
         }
     }
+    let avg = dec_us[1..].iter().sum::<f64>() / (dec_us.len() - 1) as f64;
     eprintln!(
-        "[decoder] all {} frames decoded into a texture bit-exact",
-        frames.len()
+        "[decoder] all {} frames decoded into a texture bit-exact | texture decode: full {:.2} ms, steady delta {:.2} ms",
+        frames.len(),
+        dec_us[0],
+        avg
     );
     Ok(())
 }
