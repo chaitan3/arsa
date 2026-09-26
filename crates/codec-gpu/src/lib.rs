@@ -898,6 +898,23 @@ impl GpuCodec {
         }
 
         let (w, h) = (self.geom.width as i32, self.geom.height as i32);
+        // Model what the *sampler* sees. A production external image is a
+        // dma-buf whose fourcc the external sampler interprets as real colour
+        // (R=R); a GL-texture-backed EGLImage, as used here, returns the
+        // texture's raw RGBA instead. So for the external path upload the wire
+        // bytes with R and B swapped (the colour order the dma-buf sampler
+        // reports). The linear/2D path keeps the raw byte order, because a
+        // dma-buf bound to GL_TEXTURE_2D is read as bytes by texelFetch.
+        let swapped: Vec<u8>;
+        let upload: &[u8] = if linear {
+            frame
+        } else {
+            swapped = frame
+                .chunks_exact(4)
+                .flat_map(|p| [p[2], p[1], p[0], p[3]])
+                .collect();
+            &swapped
+        };
         let tex2d = unsafe {
             let mut t = [0u32; 1];
             (self.gl.gen_textures)(1, t.as_mut_ptr());
@@ -914,7 +931,7 @@ impl GpuCodec {
                 h,
                 GL_RGBA,
                 GL_UNSIGNED_BYTE,
-                frame.as_ptr() as *const c_void,
+                upload.as_ptr() as *const c_void,
             );
             // finish the upload outside the caller's timed region
             (self.gl.finish)();
@@ -1828,7 +1845,10 @@ shared uint s_changed;
 shared uint s_k;
 uint word(uint x, uint y) {
     vec2 uv = (vec2(float(x), float(y)) + 0.5) / vec2(float(u_width), float(u_height));
-    return packUnorm4x8(texture(u_src, uv));
+    // The external sampler returns real colour (R,G,B) for a dma-buf fourcc,
+    // while the wire word is B,G,R,A. Swizzle exactly like BLIT_FS does, or the
+    // coded word comes out R,G,B and the client shows red/blue swapped.
+    return packUnorm4x8(texture(u_src, uv).bgra);
 }
 void main() {
     uint tid = gl_LocalInvocationID.x;

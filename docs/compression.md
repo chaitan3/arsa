@@ -147,6 +147,13 @@ The blit and image swizzle `.bgra`, so the source image's `R,G,B,A` equals the
 wire bytes `B,G,R,A` — exactly what `glReadPixels(GL_BGRA)` of the materializer's
 linear target yields — so the coded byte format is identical on every path.
 
+The external-texture compute (`ENC_EXT_SRC`) must swizzle `.bgra` as well: for a
+dma-buf fourcc the external sampler returns real colour `(R,G,B)`, whereas the
+coded word is `B,G,R,A`. Omitting it makes the encoder emit `R,G,B`, which the
+client shows as a red/blue (purple/blue) swap. `codecbench`'s synthetic external
+image is a GL-texture EGLImage, whose sampler returns raw RGBA instead, so that
+harness uploads the frame R/B-swapped to model the dma-buf sampler.
+
 ### Fallbacks
 
 - **Readback fallback** (no dmabuf, import unsupported, or no GPU encoder): the
