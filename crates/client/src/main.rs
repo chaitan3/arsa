@@ -40,11 +40,6 @@ fn main() -> Result<()> {
     // lossy: force the CPU download+upload path instead of the all-GPU
     // Vulkan->GL dma-buf interop (also honours RDMA_DISPLAY_LOSSY_CPU=1)
     let mut lossy_cpu = std::env::var_os("RDMA_DISPLAY_LOSSY_CPU").is_some();
-    // lossless: force the CPU decode + full-frame upload instead of the GPU
-    // texture decode (also honours RDMA_DISPLAY_LOSSLESS_CPU=1). Escape hatch
-    // for GL drivers whose compute image stores are not coherent with the
-    // presenter's sampling of the same texture.
-    let mut lossless_cpu = std::env::var_os("RDMA_DISPLAY_LOSSLESS_CPU").is_some();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -86,7 +81,6 @@ fn main() -> Result<()> {
                 };
             }
             "--lossy-cpu" => lossy_cpu = true,
-            "--lossless-cpu" => lossless_cpu = true,
             "--help" | "-h" => {
                 println!("usage: rdma-display-client --server HOST:PORT [--device mlx5_0] [--slots 3] [--dump frame.ppm] [--seconds N]");
                 println!("  --slot-mem host|cuda  receive slots: host = pinned RAM (default); cuda = dormant GPU path");
@@ -102,7 +96,6 @@ fn main() -> Result<()> {
                 println!("  --transport auto|rdma|tcp  video transport (default auto: RDMA/RoCE when available, else TCP); negotiated with the server");
                 println!("  --scale-filter auto|nearest|linear|cubic|area  sampler for the letterboxed frame (default auto: nearest at integer scale, area when downscaling, else linear)");
                 println!("  --lossy-cpu           lossy: decode + download + upload on the CPU instead of the all-GPU Vulkan->GL dma-buf interop (default all-GPU, with an automatic fallback when the interop is unavailable)");
-                println!("  --lossless-cpu        lossless: decode on the CPU and upload the full frame instead of the GPU texture decode (default GPU; escape hatch for GL drivers whose compute image stores are not coherent with the presenter)");
                 println!("  RDMA_DISPLAY_LOSSY_DEBUG=1  lossy: verbose dma-buf import diagnostics (extension strings, importable formats/modifiers, every import attempt)");
                 println!("  Ctrl+Alt+M            (--output egl) grab keyboard+mouse for the guest: the local compositor's");
                 println!("                        own shortcuts (alt-f4, alt-tab, alt-f1, ...) reach the guest too; Ctrl+Alt+M again");
@@ -217,7 +210,7 @@ fn main() -> Result<()> {
     // in that context (the presenter draws it) instead of a full-frame CPU
     // decode followed by a full-frame upload.
     let mut gl_lossless: Option<(rdma_display_codec_gpu::GpuVideoDecoder, u32)> = None;
-    if link.codec == rdma_display_codec::Codec::Lossless && presenter.is_some() && !lossless_cpu {
+    if link.codec == rdma_display_codec::Codec::Lossless && presenter.is_some() {
         let geom = rdma_display_codec::Geometry::new(
             link.meta.width,
             link.meta.height,
