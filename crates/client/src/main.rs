@@ -19,8 +19,11 @@ use rdma_display_proto::Conn;
 
 mod lossy;
 
+/// Default signaling port, used when `--server`/`-s` omits a port.
+const DEFAULT_PORT: u16 = 4791;
+
 fn main() -> Result<()> {
-    let mut server: String = "127.0.0.1:4791".to_string();
+    let mut server: String = format!("127.0.0.1:{DEFAULT_PORT}");
     let mut device: Option<String> = None;
     let mut slots: usize = 3;
     let mut dump: Option<String> = None;
@@ -44,7 +47,7 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--server" => server = args.next().expect("--server needs a value"),
+            "-s" | "--server" => server = args.next().expect("--server needs a value"),
             "--device" => device = Some(args.next().expect("--device needs a value")),
             "--slots" => slots = args.next().expect("--slots needs a value").parse()?,
             "--dump" => dump = Some(args.next().expect("--dump needs a value")),
@@ -53,7 +56,7 @@ fn main() -> Result<()> {
             "--cuda-device" => cuda_device = args.next().expect("--cuda-device needs a value").parse()?,
             "--output" => output = args.next().expect("--output needs a value").to_string(),
             "--metrics" => metrics_on = true,
-            "--fullscreen" => fullscreen = true,
+            "-f" | "--fullscreen" => fullscreen = true,
             "--audio" => audio_on = true,
             "--no-audio" => audio_on = false,
             "--audio-buffer-ms" => {
@@ -82,11 +85,12 @@ fn main() -> Result<()> {
             }
             "--lossy-cpu" => lossy_cpu = true,
             "--help" | "-h" => {
-                println!("usage: rdma-display-client --server HOST:PORT [--device mlx5_0] [--slots 3] [--dump frame.ppm] [--seconds N]");
+                println!("usage: rdma-display-client -s HOST[:PORT] [--device mlx5_0] [--slots 3] [--dump frame.ppm] [--seconds N]");
+                println!("  -s, --server HOST[:PORT]  server address (default host 127.0.0.1; :{DEFAULT_PORT} assumed when the port is omitted)");
                 println!("  --slot-mem host|cuda  receive slots: host = pinned RAM (default); cuda = dormant GPU path");
                 println!("  --cuda-device N       CUDA device ordinal for --slot-mem cuda (default 0)");
                 println!("  --output egl|none     egl = present in a Wayland window (default; needs --slot-mem host); none = headless (e.g. with --dump)");
-                println!("  --fullscreen          fullscreen on the current output; frame letterboxed/scaled to the screen with aspect kept (compositor's own fullscreen toggle also works)");
+                println!("  -f, --fullscreen      fullscreen on the current output; frame letterboxed/scaled to the screen with aspect kept (compositor's own fullscreen toggle also works)");
                 println!("  --audio | --no-audio  play the server's audio side-channel (default sink; server captures its own monitor source). Default on; --no-audio disables");
                 println!("  --audio-buffer-ms N   client playout buffer depth / pulse tlength (default {}; lower = less latency, less jitter headroom)", rdma_display_audio::wire::BUFFER_MS);
                 println!("  --metrics             per-stage latency overlay (capture, send, transfer, upload, present, on-screen) + clock-sync pings");
@@ -111,6 +115,8 @@ fn main() -> Result<()> {
         anyhow::bail!("--slot-mem must be host|cuda, got {slot_mem:?}");
     }
 
+    // `-s host` / `--server host` without a port uses the default port
+    let server = with_default_port(&server);
     let addr = server
         .to_socket_addrs()?
         .next()
@@ -714,4 +720,21 @@ fn dump_ppm(path: &str, meta: &rdma_display_proto::DisplayMeta, bytes: &[u8]) ->
     std::fs::write(path, &ppm).with_context(|| format!("write {path}"))?;
     eprintln!("dumped {path}");
     Ok(())
+}
+
+/// Append the default signaling port when the user gives only a host or IP
+/// (`-s 192.168.4.2`). An explicit port is left alone, including the bracketed
+/// IPv6 form `[::1]:4791`; a bare IPv6 literal is also left alone (it needs
+/// brackets to carry a port).
+fn with_default_port(s: &str) -> String {
+    let has_port = if let Some(rest) = s.strip_prefix('[') {
+        rest.contains("]:")
+    } else {
+        s.matches(':').count() == 1
+    };
+    if s.is_empty() || has_port {
+        s.to_string()
+    } else {
+        format!("{s}:{DEFAULT_PORT}")
+    }
 }
