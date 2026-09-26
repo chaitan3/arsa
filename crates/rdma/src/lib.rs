@@ -1585,6 +1585,14 @@ impl ClientLink {
         }
     }
 
+    /// The frame produced by the most recent [`frame`](Self::frame) call,
+    /// without decoding again. `None` when the link has no CPU decoder (raw).
+    /// The presenter uses this on the CPU lossless path, where the receive loop
+    /// has already decoded the newest frame in order.
+    pub fn decoded(&self) -> Option<&[u8]> {
+        self.decoder.as_ref().map(|d| d.frame())
+    }
+
     /// True when frames land in GPU memory with no CPU view.
     pub fn slots_gpu_only(&self) -> bool {
         match &self.rx {

@@ -425,6 +425,16 @@ fn main() -> Result<()> {
                     } else {
                         win.present(d.read_rgba()?, ov)?
                     }
+                } else if let Some(frame) = link.decoded() {
+                    // The receive loop already decoded every frame in order to
+                    // advance the delta chain, so the newest is the decoder's
+                    // current frame. Decoding it again here would apply the
+                    // same delta twice and corrupt the reference (a permanent
+                    // trail on the CPU lossless path).
+                    win.present(
+                        frame,
+                        overlay.as_ref().map(|(r, w, h)| (&r[..], *w, *h)),
+                    )?
                 } else {
                     let frame = link.frame(slot)?;
                     win.present(

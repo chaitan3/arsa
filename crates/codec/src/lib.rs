@@ -667,6 +667,15 @@ impl Decoder {
         self.geom
     }
 
+    /// The most recently decoded frame, without decoding again. The CPU
+    /// lossless client decodes every received frame (to advance the delta
+    /// chain), so the presenter must borrow this rather than call `decode` on
+    /// the newest frame a second time — re-applying a delta against an
+    /// already-advanced reference corrupts the chain.
+    pub fn frame(&self) -> &[u8] {
+        &self.frame
+    }
+
     /// Decode `coded` and return the full reconstructed frame (stride·height).
     /// The returned slice is valid until the next decode.
     pub fn decode(&mut self, coded: &[u8]) -> Result<&[u8]> {
