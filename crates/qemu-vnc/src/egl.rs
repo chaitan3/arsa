@@ -6,8 +6,11 @@
 //! GL_TEXTURE_EXTERNAL_OES, blit into a linear RGBA8 target, and read the
 //! frame back with glReadPixels(GL_BGRA) — bytes land in B,G,R,X order,
 //! exactly the pixman X8R8G8B8 layout the bridge already sends to VNC
-//! clients. The OES sampling lands row order correct as-is for these
-//! dmabufs (y0_top=false, verified in production); no flip.
+//! clients. The external-OES sampling applies an implicit Y flip relative to
+//! the buffer's memory order, so a bottom-up buffer (QEMU's y0_top=false)
+//! already lands top-first in the readback, while a top-down buffer
+//! (y0_top=true) lands bottom-first and the blit re-flips it, keeping the VNC
+//! framebuffer top-first.
 //!
 //! Thread model: EGL/GL objects are used with make_current()/done_current()
 //! around each download, so the caller (zbus's connection executor thread)
@@ -218,6 +221,8 @@ struct Gl {
     delete_textures: unsafe extern "system" fn(i32, *const u32),
     read_pixels: unsafe extern "system" fn(i32, i32, i32, i32, u32, u32, *mut core::ffi::c_void),
     use_program: unsafe extern "system" fn(u32),
+    get_uniform_location: unsafe extern "system" fn(u32, *const i8) -> i32,
+    uniform1f: unsafe extern "system" fn(i32, f32),
     draw_arrays: unsafe extern "system" fn(u32, i32, i32),
     viewport: unsafe extern "system" fn(i32, i32, i32, i32),
     get_error: unsafe extern "system" fn() -> u32,
@@ -255,6 +260,8 @@ impl Gl {
             delete_textures: load!("glDeleteTextures"),
             read_pixels: load!("glReadPixels"),
             use_program: load!("glUseProgram"),
+            get_uniform_location: load!("glGetUniformLocation"),
+            uniform1f: load!("glUniform1f"),
             draw_arrays: load!("glDrawArrays"),
             viewport: load!("glViewport"),
             get_error: load!("glGetError"),
@@ -274,11 +281,16 @@ fn gl_proc_ptr(egl: &Egl, name: &str) -> Result<*const core::ffi::c_void> {
 
 const VS_SRC: &str = r#"#version 310 es
 out vec2 v_uv;
+// 1.0 when the source dmabuf is top-down (y0_top=true). The external-OES
+// sampling flips Y, so a top-down buffer would read back bottom-first;
+// re-flip it to the top-first order VNC expects.
+uniform float u_flip;
 void main() {
     // full-screen triangle from gl_VertexID, no VBO needed
     float x = float((gl_VertexID == 1) ? 3 : -1);
     float y = float((gl_VertexID == 2) ? 3 : -1);
-    v_uv = vec2(x, y) * 0.5 + 0.5;
+    vec2 uv = vec2(x, y) * 0.5 + 0.5;
+    v_uv = vec2(uv.x, mix(uv.y, 1.0 - uv.y, u_flip));
     gl_Position = vec4(vec2(x, y), 0.0, 1.0);
 }
 "#;
@@ -300,6 +312,8 @@ pub struct DmabufFmt {
     pub fourcc: u32,
     pub modifier: u64,
     pub stride: u32,
+    /// QEMU's ScanoutDMABUF y0_top: true = buffer row 0 is the top row.
+    pub y0_top: bool,
 }
 
 /// Imports QEMU scanout dmabufs and downloads them to host memory.
@@ -316,6 +330,8 @@ pub struct Grabber {
     /// 1x1 pbuffer, only when surfaceless context is unsupported
     pbuf: EglHandle,
     prog: u32,
+    /// location of the VS `u_flip` uniform (set per blit from fmt.y0_top)
+    u_flip: i32,
     linear_tex: u32,
     fbo: u32,
     /// (EGLImage, GL texture) of the most recent import
@@ -419,6 +435,7 @@ impl Grabber {
             ctx,
             pbuf,
             prog: 0,
+            u_flip: -1,
             linear_tex: 0,
             fbo: 0,
             img: None,
@@ -468,6 +485,11 @@ impl Grabber {
             (self.gl.get_programiv)(prog, GL_LINK_STATUS, &mut ok);
             if ok == 0 {
                 bail!("GL program link failed");
+            }
+            let name = CString::new("u_flip")?;
+            self.u_flip = (self.gl.get_uniform_location)(prog, name.as_ptr());
+            if self.u_flip < 0 {
+                bail!("shader uniform u_flip not found");
             }
             self.prog = prog;
         }
@@ -594,8 +616,8 @@ impl Grabber {
             self.img = Some((img, tex));
         }
         eprintln!(
-            "[egl] imported dmabuf {}x{} fourcc={:#010x} modifier={:#x}",
-            fmt.width, fmt.height, fmt.fourcc, fmt.modifier
+            "[egl] imported dmabuf {}x{} fourcc={:#010x} modifier={:#x} y0_top={}",
+            fmt.width, fmt.height, fmt.fourcc, fmt.modifier, fmt.y0_top
         );
         Ok(())
     }
@@ -606,6 +628,7 @@ impl Grabber {
         let mut buf = vec![0u8; fmt.width as usize * 4 * fmt.height as usize];
         unsafe {
             (self.gl.use_program)(self.prog);
+            (self.gl.uniform1f)(self.u_flip, if fmt.y0_top { 1.0 } else { 0.0 });
             (self.gl.bind_framebuffer)(GL_FRAMEBUFFER, self.fbo);
             (self.gl.viewport)(0, 0, fmt.width as i32, fmt.height as i32);
             (self.gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, *tex);
@@ -641,11 +664,12 @@ impl Grabber {
         fourcc: u32,
         modifier: u64,
         stride: u32,
+        y0_top: bool,
     ) -> Result<()> {
         if num_planes != 1 {
             bail!("multi-plane dmabuf not supported (planes={num_planes})");
         }
-        let fmt = DmabufFmt { width, height, fourcc, modifier, stride };
+        let fmt = DmabufFmt { width, height, fourcc, modifier, stride, y0_top };
         self.acquire_current()?;
         let res = (|| -> Result<()> {
             self.build_targets(fmt.width, fmt.height)?;

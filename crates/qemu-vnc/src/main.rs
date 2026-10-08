@@ -389,7 +389,7 @@ impl Server {
             eprintln!("qemu-vnc: no EGL grabber (init failed) - cannot serve dmabuf scanout");
             return;
         };
-        if let Err(e) = grab.import(&s.fd, s.num_planes, s.width, s.height, s.fourcc, s.modifier, s.stride[0]) {
+        if let Err(e) = grab.import(&s.fd, s.num_planes, s.width, s.height, s.fourcc, s.modifier, s.stride[0], s.y0_top) {
             eprintln!("qemu-vnc: dmabuf import failed: {e:#}");
         }
     }
