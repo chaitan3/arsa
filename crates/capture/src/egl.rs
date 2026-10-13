@@ -16,6 +16,7 @@
 use std::ffi::CString;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -27,12 +28,11 @@ use crate::{CaptureEvent, DmabufScanout, FrameFormat, FrameMaterializer};
 const EGL_SURFACE_TYPE: i32 = 0x3033;
 const EGL_PBUFFER_BIT: i32 = 0x0001;
 const EGL_RENDERABLE_TYPE: i32 = 0x3040;
-const EGL_OPENGL_BIT: i32 = 0x0008;
-const EGL_OPENGL_API: u32 = 0x30A2;
+const EGL_OPENGL_ES3_BIT: i32 = 0x0040;
+const EGL_OPENGL_ES_API: u32 = 0x30A0;
 const GL_TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
 const EGL_NONE: i32 = 0x3038;
-const EGL_CONTEXT_MAJOR_VERSION: i32 = 0x3098;
-const EGL_CONTEXT_MINOR_VERSION: i32 = 0x30FB;
+const EGL_CONTEXT_CLIENT_VERSION: i32 = 0x3098;
 const EGL_PBUFFER_WIDTH: i32 = 0x3050;
 const EGL_PBUFFER_HEIGHT: i32 = 0x3051;
 const EGL_PLATFORM_DEVICE_EXT: i32 = 0x313F;
@@ -428,19 +428,52 @@ impl Drop for StageSlots {
     }
 }
 
+/// Per-phase timing (µs) for [`EglMaterializer::new_timed`]: library load,
+/// device display, `eglInitialize`, config selection, context creation, and
+/// the GL program build. Lets the startup preflight / reinit bench see where
+/// EGL bring-up goes, which decides what is worth keeping warm across idle.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EglInitPhases {
+    pub load: u128,
+    pub display: u128,
+    pub initialize: u128,
+    pub config: u128,
+    pub context: u128,
+    pub program: u128,
+}
+
+impl EglInitPhases {
+    pub fn total(&self) -> u128 {
+        self.load + self.display + self.initialize + self.config + self.context + self.program
+    }
+}
+
 impl EglMaterializer {
     pub fn new(rendernode: Option<&str>) -> Result<Self> {
-        let egl = Egl::load()?;
-        let dpy = device_display(&egl, rendernode)?;
+        Ok(Self::new_timed(rendernode)?.0)
+    }
 
+    /// [`Self::new`], additionally reporting where the time went.
+    pub fn new_timed(rendernode: Option<&str>) -> Result<(Self, EglInitPhases)> {
+        let mut ph = EglInitPhases::default();
+        let t = Instant::now();
+        let egl = Egl::load()?;
+        ph.load = t.elapsed().as_micros();
+
+        let t = Instant::now();
+        let dpy = device_display(&egl, rendernode)?;
+        ph.display = t.elapsed().as_micros();
+
+        let t = Instant::now();
         let mut major = 0;
         let mut minor = 0;
         if unsafe { (egl.initialize)(dpy, &mut major, &mut minor) } == 0 {
             bail!("eglInitialize failed (err {:#06x})", egl.get_error());
         }
+        ph.initialize = t.elapsed().as_micros();
         eprintln!("[egl] EGL {}.{} on {:?}", major, minor, rendernode.unwrap_or("default device"));
-        if unsafe { (egl.bind_api)(EGL_OPENGL_API) } == 0 {
-            bail!("eglBindAPI(OpenGL) failed");
+        if unsafe { (egl.bind_api)(EGL_OPENGL_ES_API) } == 0 {
+            bail!("eglBindAPI(OpenGL ES) failed");
         }
         // log the extensions we care about for debugging
         unsafe {
@@ -463,20 +496,23 @@ impl EglMaterializer {
                 }
             }
         }
+        let t = Instant::now();
         let cfg_attribs =
-            [EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT, EGL_NONE];
+            [EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_NONE];
         let mut cfg: EglHandle = std::ptr::null_mut();
         let mut n = 0;
         if unsafe { (egl.choose_config)(dpy, cfg_attribs.as_ptr(), &mut cfg, 1, &mut n) } == 0
             || n < 1
         {
-            bail!("eglChooseConfig: no OpenGL-capable config");
+            bail!("eglChooseConfig: no GLES3-capable config");
         }
-        let ctx_attribs = [EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 1, EGL_NONE];
+        ph.config = t.elapsed().as_micros();
+        let t = Instant::now();
+        let ctx_attribs = [EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE];
         let ctx = unsafe { (egl.create_context)(dpy, cfg, std::ptr::null_mut(), ctx_attribs.as_ptr()) };
         if ctx.is_null() {
             bail!(
-                "eglCreateContext failed (version 3.1, err {:#06x})",
+                "eglCreateContext failed (GLES 3, err {:#06x})",
                 egl.get_error()
             );
         }
@@ -501,8 +537,43 @@ impl EglMaterializer {
             eprintln!("[egl] using pbuffer context");
             pb_surf
         };
+        ph.context = t.elapsed().as_micros();
         eprintln!("[egl] GL ES 3.1 context ready");
 
+        let t = Instant::now();
+        let gl = Gl::load(&egl)?;
+        let mut mat = EglMaterializer {
+            egl,
+            gl,
+            dpy,
+            ctx,
+            pbuf,
+            prog: 0,
+            linear_tex: 0,
+            fbo: 0,
+            fmt: None,
+            img: None,
+            dirty: false,
+            last_mat: MatTimes::ZERO,
+            stage: None,
+            stage_work: Vec::new(),
+        };
+        mat.build_program()?;
+        ph.program = t.elapsed().as_micros();
+        Ok((mat, ph))
+    }
+
+    /// [`Self::new`], but using a context created elsewhere
+    /// ([`rdma_display_egl::SharedContext`]) instead of a private one. The
+    /// shared context must be GLES 3.x and is kept alive by the caller; this
+    /// only builds the materializer's GL program on it. Avoids the ~49 ms
+    /// per-context cost when the GPU codec already owns a compatible context.
+    pub fn new_shared(sh: &rdma_display_egl::SharedContext) -> Result<Self> {
+        let egl = Egl::load()?;
+        let dpy = sh.dpy();
+        let ctx = sh.ctx();
+        let pbuf = sh.pbuf();
+        sh.make_current()?;
         let gl = Gl::load(&egl)?;
         let mut mat = EglMaterializer {
             egl,

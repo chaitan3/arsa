@@ -1853,6 +1853,7 @@ dependencies = [
  "libc",
  "libloading",
  "qemu-display",
+ "rdma-display-egl",
  "rdma-display-proto",
  "zbus",
 ]
@@ -1890,6 +1891,15 @@ dependencies = [
  "anyhow",
  "libloading",
  "rdma-display-codec",
+ "rdma-display-egl",
+]
+
+[[package]]
+name = "rdma-display-egl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libloading",
 ]
 
 [[package]]
@@ -1918,6 +1928,7 @@ dependencies = [
  "rdma-display-capture",
  "rdma-display-codec",
  "rdma-display-codec-gpu",
+ "rdma-display-egl",
  "rdma-display-proto",
  "rdma-display-rdma",
  "rdma-display-vkcore",

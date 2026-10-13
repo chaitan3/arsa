@@ -4,6 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 publish = false
 
+[[bin]]
+name = "reinit-bench"
+path = "src/bin/reinit_bench.rs"
+
 [dependencies]
 rdma-display-proto.workspace = true
 rdma-display-rdma = { path = "../rdma" }
@@ -12,6 +16,7 @@ rdma-display-codec = { path = "../codec" }
 rdma-display-codec-gpu = { path = "../codec-gpu" }
 rdma-display-vkcore = { path = "../vkcore" }
 rdma-display-audio = { path = "../audio" }
+rdma-display-egl = { path = "../egl" }
 anyhow.workspace = true
 ibverbs.workspace = true
 libc = "0.2"

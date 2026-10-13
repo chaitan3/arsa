@@ -13,3 +13,4 @@ path = "src/bin/codecbench.rs"
 anyhow.workspace = true
 libloading = "0.8"
 rdma-display-codec.workspace = true
+rdma-display-egl = { path = "../egl" }

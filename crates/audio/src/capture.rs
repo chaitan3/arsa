@@ -94,6 +94,13 @@ impl Mailbox {
             g = g2;
         }
     }
+
+    /// Block up to `timeout` for the next captured packet. Returns false on
+    /// timeout. Used by the server's startup preflight to prove the capture
+    /// path actually produces audio, then stop.
+    pub fn wait_first(&self, timeout: Duration) -> bool {
+        self.take_wait(timeout).is_some()
+    }
 }
 
 /// Start the capture supervisor. Fails fast on an obviously broken setup

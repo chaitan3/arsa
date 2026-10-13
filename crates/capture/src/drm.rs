@@ -363,6 +363,25 @@ impl DrmKmsSource {
     }
 }
 
+/// Cheap preflight probe for the DRM source: open the card, find the active
+/// scanout, and read the current framebuffer's format — without starting the
+/// polling capture thread. Used at server init to validate the setup and to
+/// cache the display geometry so a client connect can negotiate slots before
+/// the first captured frame arrives. The card is closed on return.
+pub fn probe_display(card: Option<&str>) -> Result<FrameFormat> {
+    let (fd, target) = open_card(card)?;
+    let fdi = fd.as_raw_fd();
+    let fb = match target {
+        Target::Crtc(id) => get_crtc(fdi, id)?.fb_id,
+        Target::Plane(id) => get_plane(fdi, id)?.fb_id,
+    };
+    if fb == 0 {
+        bail!("no bound framebuffer (display off?)");
+    }
+    let d = import_fb(&fd, fb)?;
+    Ok(d.format.clone())
+}
+
 impl CaptureSource for DrmKmsSource {
     fn name(&self) -> &'static str {
         "drm-kms"

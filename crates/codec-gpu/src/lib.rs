@@ -14,15 +14,7 @@ use std::ffi::{c_void, CStr, CString};
 use anyhow::{bail, Context, Result};
 use rdma_display_codec::{Geometry, Header, BPP, HEADER_LEN, INDEX_WORDS};
 
-const EGL_PLATFORM_DEVICE_EXT: u32 = 0x313F;
-const EGL_DRM_DEVICE_FILE_EXT: i32 = 0x3233;
-const EGL_OPENGL_ES_API: u32 = 0x30A0;
-const EGL_SURFACE_TYPE: i32 = 0x3033;
-const EGL_PBUFFER_BIT: i32 = 0x0001;
-const EGL_RENDERABLE_TYPE: i32 = 0x3040;
-const EGL_OPENGL_ES3_BIT: i32 = 0x0040;
 const EGL_NONE: i32 = 0x3038;
-const EGL_CONTEXT_CLIENT_VERSION: i32 = 0x3098;
 
 const GL_SHADER_STORAGE_BUFFER: u32 = 0x90D2;
 const GL_MAP_READ_BIT: u32 = 0x0001;
@@ -70,15 +62,6 @@ const GL_FRAMEBUFFER_BARRIER_BIT: u32 = 0x0000_0400;
 
 type Handle = *mut c_void;
 type FnGetProc = unsafe extern "system" fn(*const u8) -> *const c_void;
-
-type FnGetPlatformDisplay = unsafe extern "system" fn(u32, Handle, *const i64) -> Handle;
-type FnQueryDevices = unsafe extern "system" fn(i32, *mut Handle, *mut i32) -> i32;
-type FnQueryDeviceString = unsafe extern "system" fn(Handle, i32) -> *const u8;
-type FnInitialize = unsafe extern "system" fn(Handle, *mut i32, *mut i32) -> u32;
-type FnBindApi = unsafe extern "system" fn(u32) -> u32;
-type FnChooseConfig = unsafe extern "system" fn(Handle, *const i32, *mut Handle, i32, *mut i32) -> u32;
-type FnCreateContext = unsafe extern "system" fn(Handle, Handle, Handle, *const i32) -> Handle;
-type FnMakeCurrent = unsafe extern "system" fn(Handle, Handle, Handle, Handle) -> u32;
 type FnCreateImageKhr =
     unsafe extern "system" fn(Handle, Handle, u32, Handle, *const i32) -> Handle;
 type FnDestroyImageKhr = unsafe extern "system" fn(Handle, Handle) -> u32;
@@ -290,11 +273,11 @@ struct SrcImport {
 pub struct GpuCodec {
     geom: Geometry,
     gl: Gl,
-    _egl: libloading::Library,
+    /// shared EGL context (owned jointly with the materializer)
+    sh: std::sync::Arc<rdma_display_egl::SharedContext>,
     _gl_lib: Option<libloading::Library>,
     dpy: Handle,
     ctx: Handle,
-    make_current: FnMakeCurrent,
     create_image: Option<FnCreateImageKhr>,
     destroy_image: Option<FnDestroyImageKhr>,
     egl_get_error: Option<FnEglGetError>,
@@ -351,105 +334,29 @@ pub struct GpuCodec {
 
 impl GpuCodec {
     pub fn new(geom: Geometry) -> Result<Self> {
+        let sh = std::sync::Arc::new(rdma_display_egl::SharedContext::new(None)?);
+        Self::new_shared(geom, sh)
+    }
+
+    /// [`Self::new`], using a context created elsewhere
+    /// ([`rdma_display_egl::SharedContext`]) instead of a private one. The
+    /// materializer and the encoder then share one EGL context, so a client
+    /// connect pays context creation (~49 ms on this stack) once, not twice.
+    pub fn new_shared(
+        geom: Geometry,
+        sh: std::sync::Arc<rdma_display_egl::SharedContext>,
+    ) -> Result<Self> {
         geom.validate()?;
         unsafe {
-            let egl = libloading::Library::new("libEGL.so.1")
-                .or_else(|_| libloading::Library::new("libEGL.so"))
-                .context("dlopen libEGL")?;
-
-            let get_proc: FnGetProc = *egl
-                .get::<FnGetProc>(b"eglGetProcAddress")
-                .context("eglGetProcAddress")?;
-            let initialize: FnInitialize = load_sym(get_proc, Some(&egl), &["eglInitialize"])?;
-            let bind_api: FnBindApi = load_sym(get_proc, Some(&egl), &["eglBindAPI"])?;
-            let choose_config: FnChooseConfig =
-                load_sym(get_proc, Some(&egl), &["eglChooseConfig"])?;
-            let create_context: FnCreateContext =
-                load_sym(get_proc, Some(&egl), &["eglCreateContext"])?;
-            let make_current: FnMakeCurrent =
-                load_sym(get_proc, Some(&egl), &["eglMakeCurrent"])?;
-            let get_platform_display: FnGetPlatformDisplay =
-                load_sym(get_proc, Some(&egl), &["eglGetPlatformDisplayEXT"])?;
-            let query_devices: FnQueryDevices =
-                load_sym(get_proc, Some(&egl), &["eglQueryDevicesEXT"])?;
-            let query_device_string: FnQueryDeviceString =
-                load_sym(get_proc, Some(&egl), &["eglQueryDeviceStringEXT"])?;
+            let get_proc: FnGetProc = sh.get_proc_address();
             // dmabuf image import is optional: if absent, the texture-direct
             // path is disabled and the caller falls back to upload+encode.
-            let create_image = load_sym::<FnCreateImageKhr>(
-                get_proc,
-                Some(&egl),
-                &["eglCreateImageKHR", "eglCreateImage"],
-            )
-            .ok();
-            let destroy_image = load_sym::<FnDestroyImageKhr>(
-                get_proc,
-                Some(&egl),
-                &["eglDestroyImageKHR", "eglDestroyImage"],
-            )
-            .ok();
-            let egl_get_error =
-                load_sym::<FnEglGetError>(get_proc, Some(&egl), &["eglGetError"]).ok();
-
-            let mut devs: [Handle; 16] = [std::ptr::null_mut(); 16];
-            let mut n = 0i32;
-            query_devices(16, devs.as_mut_ptr(), &mut n);
-            if n < 1 {
-                bail!("eglQueryDevicesEXT: no devices");
-            }
-            let mut dpy = std::ptr::null_mut();
-            let mut fallback: Handle = std::ptr::null_mut();
-            for d in &devs[..n as usize] {
-                let path = query_device_string(*d, EGL_DRM_DEVICE_FILE_EXT);
-                let cand = get_platform_display(EGL_PLATFORM_DEVICE_EXT, *d, std::ptr::null());
-                if cand.is_null() {
-                    continue;
-                }
-                if !path.is_null() {
-                    let s = CStr::from_ptr(path as *const i8).to_string_lossy();
-                    if s.contains("renderD128") {
-                        dpy = cand;
-                        break;
-                    }
-                }
-                if fallback.is_null() {
-                    fallback = cand;
-                }
-            }
-            if dpy.is_null() {
-                dpy = fallback;
-            }
-            if dpy.is_null() {
-                bail!("no EGL device display");
-            }
-
-            let (mut major, mut minor) = (0i32, 0i32);
-            if initialize(dpy, &mut major, &mut minor) == 0 {
-                bail!("eglInitialize failed");
-            }
-            if bind_api(EGL_OPENGL_ES_API) == 0 {
-                bail!("eglBindAPI(ES) failed");
-            }
-            let cfg_attr = [
-                EGL_SURFACE_TYPE,
-                EGL_PBUFFER_BIT,
-                EGL_RENDERABLE_TYPE,
-                EGL_OPENGL_ES3_BIT,
-                EGL_NONE,
-            ];
-            let mut cfg: Handle = std::ptr::null_mut();
-            let mut ncfg = 0i32;
-            if choose_config(dpy, cfg_attr.as_ptr(), &mut cfg, 1, &mut ncfg) == 0 || ncfg < 1 {
-                bail!("eglChooseConfig failed");
-            }
-            let ctx_attr = [EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE];
-            let ctx = create_context(dpy, cfg, std::ptr::null_mut(), ctx_attr.as_ptr());
-            if ctx.is_null() {
-                bail!("eglCreateContext failed");
-            }
-            if make_current(dpy, std::ptr::null_mut(), std::ptr::null_mut(), ctx) == 0 {
-                bail!("eglMakeCurrent(surfaceless) failed");
-            }
+            let create_image = sh.create_image_fn();
+            let destroy_image = sh.destroy_image_fn();
+            let egl_get_error = Some(sh.get_error_fn());
+            let dpy = sh.dpy();
+            let ctx = sh.ctx();
+            sh.make_current()?;
 
             let gl_lib = libloading::Library::new("libGLESv2.so.2")
                 .or_else(|_| libloading::Library::new("libGLESv2.so"))
@@ -604,11 +511,10 @@ impl GpuCodec {
             Ok(Self {
                 geom,
                 gl,
-                _egl: egl,
+                sh,
                 _gl_lib: gl_lib,
                 dpy,
                 ctx,
-                make_current,
                 create_image,
                 destroy_image,
                 egl_get_error,
@@ -653,16 +559,11 @@ impl GpuCodec {
         self.geom
     }
 
-    /// Make this codec's EGL context current on the calling thread. Required
-    /// before `upload`/`encode`/`decode` when another GL context (e.g. the
-    /// capture materializer) may have been current.
+    /// Make this codec's EGL context current on the calling thread. With a
+    /// shared context this is usually already current (the materializer and
+    /// the codec use the same context), so it is cheap.
     pub fn activate(&self) -> Result<()> {
-        if unsafe { (self.make_current)(self.dpy, std::ptr::null_mut(), std::ptr::null_mut(), self.ctx) }
-            == 0
-        {
-            bail!("eglMakeCurrent(gpu codec) failed");
-        }
-        Ok(())
+        self.sh.make_current()
     }
 
     /// Bring the encode reference up to date with the frame just encoded, so

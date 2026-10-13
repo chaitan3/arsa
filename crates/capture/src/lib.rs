@@ -20,7 +20,7 @@ pub mod materializer;
 pub mod qemu;
 
 pub use materializer::FrameMaterializer;
-pub use egl::{EglMaterializer, ReadBenchOpts, run_readback_bench};
+pub use egl::{run_readback_bench, EglInitPhases, EglMaterializer, ReadBenchOpts};
 pub use input::{InputSink, QemuDbusInput, UinputSink};
 pub use drm::DrmKmsSource;
 pub use qemu::QemuDbusSource;

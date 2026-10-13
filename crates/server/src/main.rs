@@ -392,11 +392,27 @@ fn run_capture(
         None
     };
     let audio_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // One EGL context shared by the materializer and the lossless encoder:
+    // both import the same scanout dmabufs and run on the server thread, so a
+    // single GLES 3.x context serves both and saves a second context creation
+    // (~49 ms on this stack) per session. Only built when something needs GL.
+    let needs_egl = (codec != rdma_display_codec::Codec::Lossy && materialize == "egl")
+        || codec == rdma_display_codec::Codec::Lossless;
+    let gl: Option<Arc<rdma_display_egl::SharedContext>> = if needs_egl {
+        Some(Arc::new(rdma_display_egl::SharedContext::new(rendernode)?))
+    } else {
+        None
+    };
+
     let mut mat: Box<dyn FrameMaterializer> = if codec == rdma_display_codec::Codec::Lossy {
         Box::new(lossy::LossyMaterializer::new(lossy_budget, lossy_chroma444)?)
     } else {
         match materialize {
-            "egl" => Box::new(rdma_display_capture::EglMaterializer::new(rendernode)?),
+            "egl" => Box::new(match gl.as_ref() {
+                Some(gl) => rdma_display_capture::EglMaterializer::new_shared(gl)?,
+                None => rdma_display_capture::EglMaterializer::new(rendernode)?,
+            }),
             "plain" => Box::new(rdma_display_capture::materializer::PlainMaterializer::new()),
             other => bail!("materializer {other:?} not implemented (egl|plain)"),
         }
@@ -751,9 +767,10 @@ fn run_capture(
                                 meta.height,
                                 meta.stride,
                                 meta.frame_bytes as usize,
+                                gl.as_ref(),
                             )?;
-                            // configure may have created the GPU encoder's own
-                            // EGL context; restore ours before any GL work
+                            // configure may have created/activated the shared
+                            // GL context; restore the materializer's view
                             mat.activate()?;
                             frame_dirty = true;
                             pipelined_capable = external.is_some()
@@ -824,6 +841,7 @@ fn run_capture(
                                 fmt.height,
                                 fmt.stride,
                                 fmt.frame_bytes() as usize,
+                                gl.as_ref(),
                             )?;
                             mat.activate()?;
                         }
@@ -1127,6 +1145,7 @@ impl FrameCodec {
         height: u32,
         stride: u32,
         frame_bytes: usize,
+        gl: Option<&Arc<rdma_display_egl::SharedContext>>,
     ) -> Result<()> {
         self.frame_bytes = frame_bytes;
         self.geom = None;
@@ -1140,7 +1159,11 @@ impl FrameCodec {
                 let geom = rdma_display_codec::Geometry::new(width, height, stride);
                 self.buf.resize(geom.max_coded_len(), 0);
                 self.geom = Some(geom);
-                match rdma_display_codec_gpu::GpuCodec::new(geom) {
+                let gpu = match gl {
+                    Some(gl) => rdma_display_codec_gpu::GpuCodec::new_shared(geom, gl.clone()),
+                    None => rdma_display_codec_gpu::GpuCodec::new(geom),
+                };
+                match gpu {
                     Ok(g) => {
                         eprintln!("[server] lossless encoder: GPU (GLES compute)");
                         self.gpu = Some(g);
@@ -1645,7 +1668,7 @@ mod codec_tests {
         let geom = Geometry::new(w, h, stride);
         let fb = geom.frame_bytes();
         let mut fc = FrameCodec::new();
-        fc.configure(Codec::Lossless, w, h, stride, fb).unwrap();
+        fc.configure(Codec::Lossless, w, h, stride, fb, None).unwrap();
         let mut dec = Decoder::new(geom).unwrap();
         let mut slot = vec![0u8; geom.max_coded_len()];
         let base = synthetic(w, h, 1);
