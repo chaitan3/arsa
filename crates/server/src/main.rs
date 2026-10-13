@@ -637,10 +637,6 @@ fn run_capture(
     let mut session_connected_at: Option<std::time::Instant> = None;
     // one-shot: log when the first captured scanout arrives after connect
     let mut first_scanout_logged = false;
-    // diagnostic: count send-block entries to time the connect->first-send path
-    let mut diag_send_entries: u32 = 0;
-    // diagnostic: count accepted connections to time their arrival
-    let mut diag_conns: u32 = 0;
     // per-session workers (capture source, input sink, audio); stopped when
     // the session ends so an idle server holds none of them
     let mut workers: Option<SessionWorkers> = None;
@@ -729,8 +725,6 @@ fn run_capture(
                 send_prep = None;
                 session_connected_at = None;
                 first_scanout_logged = false;
-                diag_send_entries = 0;
-                diag_conns = 0;
                 eprintln!("[server] session ended; pipeline idle");
             }
         }
@@ -827,25 +821,8 @@ fn run_capture(
             // timeout keeps a silent connection from stalling the capture loop
             let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
             let mut tag = [0u8; 1];
-            let t_tag = std::time::Instant::now();
             let tag_ok = std::io::Read::read_exact(&mut stream, &mut tag).is_ok();
-            if t_tag.elapsed().as_millis() > 50 {
-                eprintln!(
-                    "[diag] tag read from {addr} took {} ms (stalls the loop)",
-                    t_tag.elapsed().as_millis()
-                );
-            }
             let _ = stream.set_read_timeout(None);
-            if let Some(t) = session_connected_at {
-                if diag_conns < 12 {
-                    diag_conns += 1;
-                    eprintln!(
-                        "[diag] conn #{diag_conns} from {addr} tag={:#04x} at {} ms",
-                        tag[0],
-                        t.elapsed().as_millis()
-                    );
-                }
-            }
             if !tag_ok {
                 eprintln!("[server] connection with no routing tag dropped ({addr})");
             } else if tag[0] == rdma_display_audio::wire::TAG_AUDIO {
@@ -1064,16 +1041,6 @@ fn run_capture(
         // work of the frame just issued.
         if frame_dirty && session.is_some() && gate_open {
             let t_block = std::time::Instant::now();
-            if diag_send_entries < 10 {
-                if let Some(t) = session_connected_at {
-                    diag_send_entries += 1;
-                    eprintln!(
-                        "[diag] send block #{} entered at {} ms after connect",
-                        diag_send_entries,
-                        t.elapsed().as_millis()
-                    );
-                }
-            }
             // Pickup time: when the sender decided to send the frame. The
             // fps gate and event-queue wait before this point are `queue`
             // time; a wait for a staging slot after it is `slot` time.
@@ -1277,17 +1244,7 @@ fn run_capture(
                             eprintln!("[stats] frames={} uptime={:?}", seq, started.elapsed());
                         }
                     }
-                    Ok(None) => {
-                        if let Some(t) = session_connected_at {
-                            if diag_send_entries <= 10 {
-                                eprintln!(
-                                    "[diag] send -> none (no video / unchanged) at {} ms",
-                                    t.elapsed().as_millis()
-                                );
-                            }
-                        }
-                        frame_dirty = false;
-                    }
+                    Ok(None) => frame_dirty = false,
                     Err(e) => {
                         eprintln!("[server] send failed: {e:#}");
                         session = None;
