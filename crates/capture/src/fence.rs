@@ -30,32 +30,51 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
-use std::thread::JoinHandle;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-/// The kernel's per-frame completion-fence signals.
-pub struct FenceWatch {
-    /// one timestamp (unix us) per observed completion-fence signal
-    pub rx: Receiver<u64>,
+/// Shared state the worker publishes and the capture source reads.
+#[derive(Default)]
+struct FenceShared {
+    /// latest signal: `seq` increments per signal, `latest_us` is its time
+    seq: AtomicU64,
+    latest_us: AtomicU64,
     /// true once calibration succeeded and signals are being forwarded
-    ready: Arc<AtomicBool>,
-    tracefs: String,
-    /// the background calibration/reader thread; detached at process exit
-    _worker: JoinHandle<()>,
+    ready: AtomicBool,
+}
+
+/// The kernel's per-frame completion-fence signals, as a process-wide
+/// singleton: the watched context is the compositor's and tracefs is global,
+/// so exactly one worker may own it. The capture source (re-spawned per
+/// session) only reads the latest published signal, so a session restart can
+/// never race another watch over tracefs.
+pub struct FenceWatch {
+    shared: Arc<FenceShared>,
 }
 
 impl FenceWatch {
     /// Whether calibration has finished and the completion fence is being
     /// watched. While false the caller should use its own fallback (one-behind).
     pub fn ready(&self) -> bool {
-        self.ready.load(Ordering::Relaxed)
+        self.shared.ready.load(Ordering::Relaxed)
+    }
+
+    /// The newest signal as `(seq, unix_us)`, or `None` if none arrived since
+    /// `since_seq`. The caller captures with `unix_us` as `t0` when it changes.
+    pub fn signal_since(&self, since_seq: u64) -> Option<(u64, u64)> {
+        let s = self.shared.seq.load(Ordering::Relaxed);
+        if s != since_seq {
+            Some((s, self.shared.latest_us.load(Ordering::Relaxed)))
+        } else {
+            None
+        }
     }
 }
+
+static WATCH: OnceLock<FenceWatch> = OnceLock::new();
 
 const TRACEFS_CANDIDATES: [&str; 2] = ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"];
 
@@ -194,9 +213,9 @@ fn configure_signal(tracefs: &str, ctx: u32) -> Result<()> {
     Ok(())
 }
 
-/// Read `trace_pipe` until it errors/EOF, forwarding one timestamp per
+/// Read `trace_pipe` until it errors/EOF, publishing one timestamp per
 /// completion-fence signal. Returns when the stream ends (caller recalibrates).
-fn read_signals(tracefs: &str, tx: &Sender<u64>) {
+fn read_signals(tracefs: &str, shared: &FenceShared) {
     let Ok(pipe) = std::fs::OpenOptions::new()
         .read(true)
         .open(format!("{tracefs}/trace_pipe"))
@@ -210,10 +229,9 @@ fn read_signals(tracefs: &str, tx: &Sender<u64>) {
         match br.read_line(&mut line) {
             Ok(0) => break,
             Ok(_) => {
-                if line.contains("dma_fence_signaled:")
-                    && tx.send(rdma_display_proto::unix_now_us()).is_err()
-                {
-                    break;
+                if line.contains("dma_fence_signaled:") {
+                    shared.latest_us.store(rdma_display_proto::unix_now_us(), Ordering::Relaxed);
+                    shared.seq.fetch_add(1, Ordering::Relaxed);
                 }
             }
             Err(_) => break,
@@ -222,8 +240,8 @@ fn read_signals(tracefs: &str, tx: &Sender<u64>) {
 }
 
 /// Background loop: calibrate (retrying until the screen is active), then
-/// forward completion-fence signals.
-fn worker_loop(tracefs: &str, calib: Duration, tx: Sender<u64>, ready: Arc<AtomicBool>) {
+/// forward completion-fence signals. Runs for the process lifetime.
+fn worker_loop(tracefs: &str, calib: Duration, shared: Arc<FenceShared>) {
     let mut attempts: u32 = 0;
     loop {
         match calibrate(tracefs, calib) {
@@ -243,9 +261,9 @@ fn worker_loop(tracefs: &str, calib: Duration, tx: Sender<u64>, ready: Arc<Atomi
                     "[capture-drm] fence watch: switching to fence-triggered capture \
                      (context {ctx})"
                 );
-                ready.store(true, Ordering::Relaxed);
-                read_signals(tracefs, &tx);
-                ready.store(false, Ordering::Relaxed);
+                shared.ready.store(true, Ordering::Relaxed);
+                read_signals(tracefs, &shared);
+                shared.ready.store(false, Ordering::Relaxed);
                 eprintln!("[capture-drm] fence watch: signal stream ended; recalibrating");
             }
             Err(e) => {
@@ -264,39 +282,19 @@ fn worker_loop(tracefs: &str, calib: Duration, tx: Sender<u64>, ready: Arc<Atomi
     }
 }
 
-/// Mount tracefs and start the background calibration/reader thread. Returns an
-/// error only if tracefs itself is unavailable; an idle screen is fine (the
+/// Mount tracefs and start the process-wide fence watch (idempotent). Returns
+/// an error only if tracefs itself is unavailable; an idle screen is fine (the
 /// caller uses one-behind until [`FenceWatch::ready`]).
-pub fn start(calib: Duration) -> Result<FenceWatch> {
-    let tracefs = ensure_tracefs()?;
-    let (tx, rx) = mpsc::channel::<u64>();
-    let ready = Arc::new(AtomicBool::new(false));
-    let ready_worker = ready.clone();
-    let tracefs_worker = tracefs.clone();
-    let worker = std::thread::Builder::new()
-        .name("fence-watch".into())
-        .spawn(move || worker_loop(&tracefs_worker, calib, tx, ready_worker))
-        .context("spawn fence-watch thread")?;
-    Ok(FenceWatch {
-        rx,
-        ready,
-        tracefs,
-        _worker: worker,
-    })
-}
-
-impl Drop for FenceWatch {
-    fn drop(&mut self) {
-        let p = &self.tracefs;
-        let _ = write_str(&format!("{p}/tracing_on"), "0\n");
-        let _ = write_str(
-            &format!("{p}/events/dma_fence/dma_fence_signaled/enable"),
-            "0\n",
-        );
-        let _ = std::fs::write(
-            format!("{p}/events/dma_fence/dma_fence_signaled/filter"),
-            b"",
-        );
-        let _ = write_str(&format!("{p}/events/enable"), "0\n");
+pub fn start(calib: Duration) -> Result<&'static FenceWatch> {
+    if let Some(w) = WATCH.get() {
+        return Ok(w);
     }
+    let tracefs = ensure_tracefs()?;
+    let shared = Arc::new(FenceShared::default());
+    let worker_shared = shared.clone();
+    std::thread::Builder::new()
+        .name("fence-watch".into())
+        .spawn(move || worker_loop(&tracefs, calib, worker_shared))
+        .context("spawn fence-watch thread")?;
+    Ok(WATCH.get_or_init(|| FenceWatch { shared }))
 }

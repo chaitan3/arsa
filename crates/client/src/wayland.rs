@@ -122,7 +122,7 @@ struct St {
     /// feedback objects still awaiting presented/discarded
     fbs: Vec<Fb>,
     /// completed feedbacks, arrival order: (id, client-unix-us, presented)
-    fb_done: std::collections::VecDeque<(u64, u64, bool)>,
+    fb_done: std::collections::VecDeque<(u64, u64, bool, u32)>,
     /// id to hand to the next feedback request
     fb_next: u64,
     /// grab-mode keep-alives (dropping them releases the constraint)
@@ -526,9 +526,11 @@ impl Presenter {
         Some(id)
     }
 
-    /// Drain completed feedbacks: `(id, client-unix-us, presented)`. Present
-    /// in commit order; the caller folds each into the matching metrics sample.
-    pub fn take_presented(&mut self) -> Vec<(u64, u64, bool)> {
+    /// Drain completed feedbacks: `(id, client-unix-us, presented, flags)`.
+    /// Present in commit order; the caller folds each into the matching metrics
+    /// sample. `flags` is the wp_presentation_feedback bitfield (vsync,
+    /// hw_clock, hw_completion, zero_copy).
+    pub fn take_presented(&mut self) -> Vec<(u64, u64, bool, u32)> {
         self.state.fb_done.drain(..).collect()
     }
 }
@@ -760,11 +762,11 @@ impl St {
     }
 
     /// Queue a presentation result for the main loop (bounded).
-    fn push_presented(&mut self, id: u64, unix_us: u64, presented: bool) {
+    fn push_presented(&mut self, id: u64, unix_us: u64, presented: bool, flags: u32) {
         if self.fb_done.len() >= 256 {
             self.fb_done.pop_front();
         }
-        self.fb_done.push_back((id, unix_us, presented));
+        self.fb_done.push_back((id, unix_us, presented, flags));
     }
 }
 
@@ -923,25 +925,31 @@ impl Dispatch<WpPresentationFeedback, ()> for St {
         _: &Connection,
         _: &QueueHandle<St>,
     ) {
-        let (unix_us, presented) = match ev {
+        let (unix_us, presented, flags) = match ev {
             wp_presentation_feedback::Event::Presented {
                 tv_sec_hi,
                 tv_sec_lo,
                 tv_nsec,
+                flags,
                 ..
             } => {
                 let secs = ((tv_sec_hi as u64) << 32) | tv_sec_lo as u64;
+                let flags = match flags {
+                    wayland_client::WEnum::Value(k) => u32::from(k),
+                    wayland_client::WEnum::Unknown(v) => v,
+                };
                 (
                     presentation_to_unix_us(state.pres_clock, secs, tv_nsec),
                     true,
+                    flags,
                 )
             }
-            wp_presentation_feedback::Event::Discarded => (0, false),
+            wp_presentation_feedback::Event::Discarded => (0, false, 0),
             _ => return, // sync_output: which output; not needed here
         };
         if let Some(i) = state.fbs.iter().position(|f| f.proxy.id() == obj.id()) {
             let f = state.fbs.remove(i);
-            state.push_presented(f.id, unix_us, presented);
+            state.push_presented(f.id, unix_us, presented, flags);
         }
     }
 }

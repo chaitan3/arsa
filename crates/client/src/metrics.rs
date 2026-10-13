@@ -40,14 +40,18 @@
 //! End to end is assembled from those per-host pieces rather than from a
 //! cross-host timestamp subtraction (so clock skew cannot poison it):
 //!
-//!   e2e = (t2c - t0) + (client_end - t3)
-//!       = queue+slot+material+post+transfer + upload+present+display
+//!   e2e = (t2c - t0) + (client_end - t3) + net
+//!       = queue+slot+material+post+transfer+net + upload+present+display
 //!
-//! The only unmeasured sliver is the client's CQE observation delay between
-//! the server's send completion and t3 (polling granularity, sub-ms). The
-//! min-RTT ping/pong offset is still tracked for diagnostics, but no reported
-//! stage depends on it. Known honesty limit: without wp_presentation
-//! (`display n/a`) the client span ends at SwapBuffers return, not scanout.
+//! where `net` is 0 for RDMA (its `transfer` = t2c-t2 is the sender's WRITE
+//! completion, i.e. "written on the client", so the transit is already in it)
+//! and the ping/pong min-RTT one-way estimate for TCP (whose `transfer` is
+//! only the local socket write). The only unmeasured sliver is the client's
+//! CQE observation delay between the server's send completion and t3
+//! (polling granularity, sub-ms). The min-RTT ping/pong offset is still
+//! tracked for diagnostics, but no *same-host* stage depends on it. Known
+//! honesty limit: without wp_presentation (`display n/a`) the client span
+//! ends at SwapBuffers return, not scanout.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -58,11 +62,14 @@ use rdma_display_rdma::ControlEvent;
 const WINDOW: usize = 64;
 /// Max frames kept waiting for their server stamp (staleness guard).
 const PENDING_CAP: usize = 256;
+/// wp_presentation_feedback.presented flag bits (wayland presentation-time).
+const PRES_VSYNC: u32 = 0x1;
+const PRES_ZERO_COPY: u32 = 0x8;
 /// Overlay geometry: 8x8 bitmap glyphs scaled by `FONT_SCALE` (2 = twice the
 /// old UI in each dimension), `COLS` columns, `LINES` lines.
 const FONT_SCALE: usize = 2;
 const COLS: usize = 50;
-const LINES: usize = 12;
+const LINES: usize = 13;
 pub const OVERLAY_W: u32 = ((COLS * 8 + 8) * FONT_SCALE) as u32;
 pub const OVERLAY_H: u32 = ((LINES * 8 + 8) * FONT_SCALE) as u32;
 /// Milliseconds between overlay text refreshes.
@@ -91,7 +98,7 @@ struct Sample {
     pres: u64,  // t5 - t4    draw + swap submission
     disp: u64,  // tp - t5    compositor queue + scanout (0 = unknown)
     // --- clock-free end to end -------------------------------------------
-    e2e: u64, // (t2c - t0) + (client_end - t3)
+    e2e: u64, // (t2c - t0) + (client_end - t3) + net (TCP one-way)
     fb_id: Option<u64>,
 }
 
@@ -126,6 +133,13 @@ pub struct Metrics {
     clock: ClockSync,
     /// whether the presenter bound wp_presentation (display stage meaningful)
     onscreen: bool,
+    /// TCP transport: `xfer` does not include the network transit, so the
+    /// min-RTT one-way estimate is added to `e2e`
+    tcp: bool,
+    /// presentation-feedback flags over the current window
+    pres_count: u64,
+    zero_copy_count: u64,
+    vsync_count: u64,
     text: String,
 }
 
@@ -182,8 +196,19 @@ impl Metrics {
             last_ping: None,
             clock: ClockSync::new(),
             onscreen: false,
+            tcp: false,
+            pres_count: 0,
+            zero_copy_count: 0,
+            vsync_count: 0,
             text: String::new(),
         }
+    }
+
+    /// Tell the metrics whether the video transport is TCP, so the network
+    /// one-way estimate is added to the end-to-end total (RDMA's `transfer`
+    /// already includes the transit).
+    pub fn set_tcp(&mut self, tcp: bool) {
+        self.tcp = tcp;
     }
 
     /// Count one received frame's bytes — the actual bytes the NIC/TCP moved
@@ -249,10 +274,21 @@ impl Metrics {
     /// Attach a wp_presentation result to its frame: the frame may still be
     /// waiting for its server stamp (stash it) or already be matched (update
     /// the `display` stage and the end-to-end total in place).
-    pub fn on_presented(&mut self, fb_id: u64, unix_us: u64, presented: bool) {
+    pub fn on_presented(&mut self, fb_id: u64, unix_us: u64, presented: bool, flags: u32) {
         if !presented {
             // discarded (superseded / not shown): leave `display` unknown
             return;
+        }
+        // wp_presentation_feedback flags: direct scanout (zero-copy) and
+        // vsync. Aggregated per window so the overlay can show whether the
+        // compositor is scanning out directly (and whether VRR is dropping
+        // vsync), independent of the stamp matching below.
+        self.pres_count += 1;
+        if flags & PRES_ZERO_COPY != 0 {
+            self.zero_copy_count += 1;
+        }
+        if flags & PRES_VSYNC != 0 {
+            self.vsync_count += 1;
         }
         if let Some(l) = self.local.iter_mut().find(|l| l.fb_id == Some(fb_id)) {
             l.presented = Some(unix_us);
@@ -291,7 +327,15 @@ impl Metrics {
             let upl = front.t4.saturating_sub(front.t3);
             let pres = front.t5.saturating_sub(front.t4);
             let disp = tp.map(|us| us.saturating_sub(front.t5)).unwrap_or(0);
-            let e2e = q + prep + sw + mat + post + xfer + upl + pres + disp;
+            // TCP: `xfer` is only the local socket write, so add the ping/pong
+            // one-way estimate to account for the network transit (RDMA's
+            // `xfer` already covers it).
+            let net = if self.tcp {
+                self.clock.rtt_min().unwrap_or(0) / 2
+            } else {
+                0
+            };
+            let e2e = q + prep + sw + mat + post + xfer + net + upl + pres + disp;
             let sample = Sample {
                 seq: front.seq,
                 q,
@@ -473,10 +517,26 @@ impl Metrics {
             po_m, xf_m
         ));
         t.push_str(&format!(
-            "\nnetwork      rtt min {:>5.2}  one-way {:>5.2} ms",
+            "\nnetwork      rtt {:>5.2}  one-way {:>5.2} ms{}",
             rtt_min,
-            rtt_min / 2.0
+            rtt_min / 2.0,
+            if self.tcp { " (e2e)" } else { "" }
         ));
+        // presentation-feedback flags: zero-copy => the compositor scanned our
+        // buffer out directly; vsync absent => VRR did not force a vblank.
+        let pc = self.pres_count;
+        let zc = self.zero_copy_count;
+        let vs = self.vsync_count;
+        let pct = |n: u64| if pc > 0 { n as f64 * 100.0 / pc as f64 } else { 0.0 };
+        t.push_str(&format!(
+            "\nscanout     zero-copy {:>3.0}% vsync {:>3.0}% n={}",
+            pct(zc),
+            pct(vs),
+            pc
+        ));
+        self.pres_count = 0;
+        self.zero_copy_count = 0;
+        self.vsync_count = 0;
         t.push_str(&format!(
             "\nclient       p50 {:>6.2}   p95 {:>6.2} ms",
             cli_m, cli_p
@@ -785,7 +845,7 @@ mod tests {
     fn presented_before_stamp_is_folded_in() {
         let mut m = Metrics::new();
         m.record(1, 10_000, 10_200, 10_500, Some(7));
-        m.on_presented(7, 10_900, true); // arrives before the server stamp
+        m.on_presented(7, 10_900, true, 0); // arrives before the server stamp
         m.on_control(ControlEvent::Stamp(stamp(1)));
         let s = m.samples.front().unwrap();
         assert_eq!(s.disp, 400);
@@ -798,7 +858,7 @@ mod tests {
         m.record(1, 10_000, 10_200, 10_500, Some(7));
         m.on_control(ControlEvent::Stamp(stamp(1)));
         assert_eq!(m.samples.front().unwrap().e2e, SERVER + CLIENT);
-        m.on_presented(7, 11_000, true);
+        m.on_presented(7, 11_000, true, 0);
         let s = m.samples.front().unwrap();
         assert_eq!(s.disp, 500);
         assert_eq!(s.e2e, SERVER + CLIENT + 500);
@@ -808,7 +868,7 @@ mod tests {
     fn discarded_leaves_display_unknown() {
         let mut m = Metrics::new();
         m.record(1, 10_000, 10_200, 10_500, Some(7));
-        m.on_presented(7, 0, false); // discarded: no timestamp
+        m.on_presented(7, 0, false, 0); // discarded: no timestamp
         m.on_control(ControlEvent::Stamp(stamp(1)));
         let s = m.samples.front().unwrap();
         assert_eq!(s.disp, 0);
@@ -837,7 +897,7 @@ mod tests {
             s.t1 = 1_002_500;
             s.t2 = 1_002_560;
             s.t2c = 1_005_600;
-            m.on_presented(i, 1_001_100 + i, true);
+            m.on_presented(i, 1_001_100 + i, true, 0);
             m.on_control(ControlEvent::Stamp(s));
         }
         let t = m.refresh().expect("text changed");

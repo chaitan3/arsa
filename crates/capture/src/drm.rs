@@ -1371,13 +1371,15 @@ fn run(
     let mut stracker = SettleTracker::new(settle_ms);
     let mut ftracker = FenceTracker::default();
     // completion-fence watch (`fence` mode); started once, falls back on error
-    let mut fence: Option<crate::fence::FenceWatch> = None;
+    let mut fence: Option<&'static crate::fence::FenceWatch> = None;
     let mut fence_tried = false;
     // fence-mode runtime state: calibration becomes `ready` in the background
     // (an idle screen at boot has nothing to calibrate against), so we capture
     // with one-behind until then and switch over when signals start flowing
     let mut fence_ready = false;
     let mut fence_last_ms = 0u64;
+    // last signal sequence consumed from the (process-wide) fence watch
+    let mut fence_seq: u64 = 0;
     let mut active = ActiveSync::OneBehind;
     let mut crtc_id: Option<u32> = None;
     let started = std::time::Instant::now();
@@ -1653,45 +1655,27 @@ fn run(
                         }
                     }
                 } else {
-                    // drain the completion-fence signals, keeping only the latest
-                    let mut sig: Option<u64> = None;
-                    let mut disconnected = false;
-                    if let Some(w) = fence.as_ref() {
-                        loop {
-                            match w.rx.try_recv() {
-                                Ok(t) => {
-                                    sig = Some(t);
-                                    fence_last_ms = now_ms;
-                                }
-                                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                    disconnected = true;
-                                    break;
-                                }
-                            }
-                        }
+                    // newest completion-fence signal since we last looked
+                    // (process-wide watch; a session restart does not reset it)
+                    let sig = fence.and_then(|w| w.signal_since(fence_seq));
+                    if let Some((s, _)) = sig {
+                        fence_seq = s;
+                        fence_last_ms = now_ms;
                     }
-                    if disconnected {
-                        eprintln!("[capture-drm] fence watch ended; switching to one-behind");
-                        fence = None;
-                        active = ActiveSync::OneBehind;
-                        tracker = FbTracker::default();
-                    } else {
-                        // signal-driven capture, with a defensive capture if the
-                        // stream stalls while the fb is still changing
-                        let trigger = sig.or_else(|| {
-                            (now_ms.saturating_sub(fence_last_ms) > FENCE_STALL_MS)
-                                .then_some(now_us)
-                        });
-                        match ftracker.update(fb, trigger) {
-                            FbAction::None => {}
-                            FbAction::Disabled => disabled(&mut disabled_reported),
-                            FbAction::Capture(id, t0) => {
-                                if emit_scanout(&card.as_ref().unwrap().0, id, t0, &tx) {
-                                    disabled_reported = false;
-                                } else {
-                                    ftracker.capture_failed();
-                                }
+                    // signal-driven capture, with a defensive capture if the
+                    // stream stalls while the fb is still changing
+                    let trigger = sig.map(|(_, t)| t).or_else(|| {
+                        (now_ms.saturating_sub(fence_last_ms) > FENCE_STALL_MS)
+                            .then_some(now_us)
+                    });
+                    match ftracker.update(fb, trigger) {
+                        FbAction::None => {}
+                        FbAction::Disabled => disabled(&mut disabled_reported),
+                        FbAction::Capture(id, t0) => {
+                            if emit_scanout(&card.as_ref().unwrap().0, id, t0, &tx) {
+                                disabled_reported = false;
+                            } else {
+                                ftracker.capture_failed();
                             }
                         }
                     }

@@ -268,6 +268,9 @@ fn main() -> Result<()> {
     if let (Some((p, _)), Some(m)) = (presenter.as_ref(), metrics.as_mut()) {
         m.set_onscreen(p.has_presentation());
     }
+    if let Some(m) = metrics.as_mut() {
+        m.set_tcp(link.transport() == rdma_display_rdma::Transport::Tcp);
+    }
     let mut last_overlay = Instant::now();
 
     // audio side-channel: second connection to the same port, tagged 0x02;
@@ -483,9 +486,9 @@ fn main() -> Result<()> {
             // sync warm; fold in any on-screen timestamps the compositor
             // reported (dispatched by the pump at the top of this iteration)
             if let Some(m) = metrics.as_mut() {
-                for (id, us, presented) in p.take_presented() {
+                for (id, us, presented, flags) in p.take_presented() {
                     if presented {
-                        m.on_presented(id, us, true);
+                        m.on_presented(id, us, true, flags);
                     }
                 }
                 while let Some(ev) = link.try_control() {
