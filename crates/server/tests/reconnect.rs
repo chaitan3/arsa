@@ -20,6 +20,13 @@ fn shared_context_reconnect_loop() {
         }
     };
     let geom = Geometry::new(1920, 1080, 1920 * 4);
+    let rss = || -> u64 {
+        std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .map(|p| p * 4)
+            .unwrap_or(0)
+    };
     for i in 0..5 {
         // per-session: materializer + codec on the shared context
         let mut mat = match EglMaterializer::new_shared(&sh) {
@@ -34,6 +41,6 @@ fn shared_context_reconnect_loop() {
         drop(codec); // deletes its GL objects
         mat.release(); // frees FBO/texture/PBOs
         drop(mat);
-        eprintln!("[reconnect] iteration {i} ok");
+        eprintln!("[reconnect] iteration {i} ok (rss {} KB)", rss());
     }
 }
