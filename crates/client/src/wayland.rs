@@ -51,6 +51,10 @@ use wayland_protocols::wp::presentation_time::client::wp_presentation::{self, Wp
 use wayland_protocols::wp::presentation_time::client::wp_presentation_feedback::{
     self, WpPresentationFeedback,
 };
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_feedback_v1::{
+    self, ZwpLinuxDmabufFeedbackV1,
+};
+use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use wayland_protocols::xdg::shell::client::xdg_surface::{self, XdgSurface};
@@ -81,6 +85,72 @@ pub struct Presented {
     /// refresh interval the compositor used, ns (0 = unknown). Varies under
     /// VRR, which is how the client can tell VRR is actually engaged.
     pub refresh: u32,
+}
+
+/// Accumulator for `zwp_linux_dmabuf_feedback_v1`: the compositor's advertised
+/// format/modifier pairs, split into preference tranches. The tranche with the
+/// `scanout` flag is what it can scan out directly, so this is the authoritative
+/// answer to "which buffer modifier would direct-scanout".
+#[derive(Default)]
+struct DmabufFeedback {
+    table: Vec<(u32, u64)>, // (fourcc, modifier)
+    main_device: Vec<u8>,
+    cur: Tranche,
+    tranches: Vec<Tranche>,
+    logged: bool,
+}
+
+#[derive(Default, Clone)]
+struct Tranche {
+    target: Vec<u8>,
+    flags: u32,
+    formats: Vec<u16>,
+}
+
+impl DmabufFeedback {
+    fn dev_str(d: &[u8]) -> String {
+        if d.len() >= 8 {
+            let major = u32::from_ne_bytes([d[0], d[1], d[2], d[3]]);
+            let minor = u32::from_ne_bytes([d[4], d[5], d[6], d[7]]);
+            format!("{major}:{minor}")
+        } else {
+            format!("{d:02x?}")
+        }
+    }
+
+    fn log(&mut self) {
+        if self.logged || self.tranches.is_empty() {
+            return;
+        }
+        self.logged = true;
+        eprintln!(
+            "[wl] dmabuf feedback: main_device={} tranches={}",
+            Self::dev_str(&self.main_device),
+            self.tranches.len()
+        );
+        for (i, t) in self.tranches.iter().enumerate() {
+            let mut fmts: Vec<String> = t
+                .formats
+                .iter()
+                .filter_map(|&idx| {
+                    self.table
+                        .get(idx as usize)
+                        .map(|(f, m)| format!("{f:#010x}/mod{m:#x}"))
+                })
+                .collect();
+            if fmts.len() > 8 {
+                fmts.truncate(8);
+                fmts.push("...".into());
+            }
+            eprintln!(
+                "[wl]   tranche {i}: target={} scanout={} sampling={} formats=[{}]",
+                Self::dev_str(&t.target),
+                t.flags & 1 != 0,
+                t.flags & 2 != 0,
+                fmts.join(", ")
+            );
+        }
+    }
 }
 
 struct St {
@@ -130,6 +200,10 @@ struct St {
     /// wp_presentation: the compositor's true on-screen timestamp for the
     /// commit that carried a frame — the `display`/end-to-end metrics stage
     presentation: Option<WpPresentation>,
+    /// linux-dmabuf feedback: keep-alive + the parsed tranches (scanout set)
+    _dmabuf: Option<ZwpLinuxDmabufV1>,
+    _dmabuf_fb: Option<ZwpLinuxDmabufFeedbackV1>,
+    dmabuf_feedback: DmabufFeedback,
     /// clock domain wp_presentation timestamps use (KWin: CLOCK_MONOTONIC)
     pres_clock: i32,
     /// feedback objects still awaiting presented/discarded
@@ -302,6 +376,10 @@ impl Presenter {
         // the only honest end of the video-latency chain. Absence only means
         // the metrics `display` stage reads n/a.
         let presentation: Option<WpPresentation> = globals.bind(&qh, 1..=2, ()).ok();
+        // linux-dmabuf feedback: which format+modifier pairs the compositor can
+        // scan out directly (the `scanout` tranche). Diagnostic only — the
+        // presenter uses EGL's own swapchain buffers.
+        let dmabuf: Option<ZwpLinuxDmabufV1> = globals.bind(&qh, 1..=5, ()).ok();
         // viewporter + fractional-scale: buffer stays at the NATIVE guest
         // frame size; the compositor maps it 1:1 onto physical pixels at
         // whatever output scale the desktop runs (no upscale/blur)
@@ -349,6 +427,11 @@ impl Presenter {
 
         let surface = compositor.create_surface(&qh, ());
         let viewport = viewporter.get_viewport(&surface, &qh, ());
+        // surface feedback (v4+): KWin sends the format/modifier tranches for
+        // this surface, including the direct-scanout set
+        let dmabuf_fb = dmabuf.as_ref().and_then(|d| {
+            (d.version() >= 4).then(|| d.get_surface_feedback(&surface, &qh, ()))
+        });
         let fs_obj: Option<WpFractionalScaleV1> =
             fs_mgr.as_ref().map(|m| m.get_fractional_scale(&surface, &qh, ()));
         let xdg_surface = wmbase.get_xdg_surface(&surface, &qh, ());
@@ -397,6 +480,9 @@ impl Presenter {
                 inhibit_mgr,
                 inhibitor: None,
                 presentation,
+                _dmabuf: dmabuf,
+                _dmabuf_fb: dmabuf_fb,
+                dmabuf_feedback: DmabufFeedback::default(),
                 pres_clock: libc::CLOCK_MONOTONIC,
                 fbs: Vec::new(),
                 fb_done: std::collections::VecDeque::new(),
@@ -874,6 +960,7 @@ quiet!(WpCursorShapeManagerV1 => ());
 quiet!(WpCursorShapeDeviceV1 => ());
 quiet!(WpViewporter => ());
 quiet!(WpViewport => ());
+quiet!(ZwpLinuxDmabufV1 => ());
 quiet!(WpFractionalScaleManagerV1 => ());
 quiet!(ZxdgDecorationManagerV1 => ());
 quiet!(ZwpRelativePointerManagerV1 => ());
@@ -1011,6 +1098,72 @@ impl Dispatch<WpPresentationFeedback, ()> for St {
         if let Some(i) = state.fbs.iter().position(|f| f.proxy.id() == obj.id()) {
             let f = state.fbs.remove(i);
             state.push_presented(Presented { id: f.id, ..presented });
+        }
+    }
+}
+
+impl Dispatch<ZwpLinuxDmabufFeedbackV1, ()> for St {
+    fn event(
+        state: &mut St,
+        _: &ZwpLinuxDmabufFeedbackV1,
+        ev: zwp_linux_dmabuf_feedback_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<St>,
+    ) {
+        use zwp_linux_dmabuf_feedback_v1::Event as E;
+        match ev {
+            E::FormatTable { fd, size } => {
+                let size = size as usize;
+                if size >= 16 {
+                    let n = size / 16;
+                    let mut table = Vec::with_capacity(n);
+                    unsafe {
+                        let p = libc::mmap(
+                            std::ptr::null_mut(),
+                            size,
+                            libc::PROT_READ,
+                            libc::MAP_PRIVATE,
+                            fd.as_raw_fd(),
+                            0,
+                        );
+                        if p != libc::MAP_FAILED {
+                            let bytes = std::slice::from_raw_parts(p as *const u8, size);
+                            for i in 0..n {
+                                let e = &bytes[i * 16..i * 16 + 16];
+                                let format =
+                                    u32::from_ne_bytes([e[0], e[1], e[2], e[3]]);
+                                let modifier = u64::from_ne_bytes([
+                                    e[8], e[9], e[10], e[11], e[12], e[13], e[14], e[15],
+                                ]);
+                                table.push((format, modifier));
+                            }
+                            libc::munmap(p, size);
+                        }
+                    }
+                    state.dmabuf_feedback.table = table;
+                }
+            }
+            E::MainDevice { device } => state.dmabuf_feedback.main_device = device,
+            E::TrancheTargetDevice { device } => state.dmabuf_feedback.cur.target = device,
+            E::TrancheFlags { flags } => {
+                state.dmabuf_feedback.cur.flags = match flags {
+                    wayland_client::WEnum::Value(k) => u32::from(k),
+                    wayland_client::WEnum::Unknown(v) => v,
+                };
+            }
+            E::TrancheFormats { indices } => {
+                state.dmabuf_feedback.cur.formats = indices
+                    .chunks_exact(2)
+                    .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+                    .collect();
+            }
+            E::TrancheDone => {
+                let cur = std::mem::take(&mut state.dmabuf_feedback.cur);
+                state.dmabuf_feedback.tranches.push(cur);
+            }
+            E::Done => state.dmabuf_feedback.log(),
+            _ => {}
         }
     }
 }
