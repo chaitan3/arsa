@@ -140,6 +140,9 @@ pub struct Metrics {
     pres_count: u64,
     zero_copy_count: u64,
     vsync_count: u64,
+    /// min/max refresh interval (ns) the compositor reported this window
+    refresh_min: u32,
+    refresh_max: u32,
     text: String,
 }
 
@@ -200,6 +203,8 @@ impl Metrics {
             pres_count: 0,
             zero_copy_count: 0,
             vsync_count: 0,
+            refresh_min: u32::MAX,
+            refresh_max: 0,
             text: String::new(),
         }
     }
@@ -274,7 +279,7 @@ impl Metrics {
     /// Attach a wp_presentation result to its frame: the frame may still be
     /// waiting for its server stamp (stash it) or already be matched (update
     /// the `display` stage and the end-to-end total in place).
-    pub fn on_presented(&mut self, fb_id: u64, unix_us: u64, presented: bool, flags: u32) {
+    pub fn on_presented(&mut self, fb_id: u64, unix_us: u64, presented: bool, flags: u32, refresh: u32) {
         if !presented {
             // discarded (superseded / not shown): leave `display` unknown
             return;
@@ -289,6 +294,11 @@ impl Metrics {
         }
         if flags & PRES_VSYNC != 0 {
             self.vsync_count += 1;
+        }
+        // the refresh interval the compositor used; it varies under VRR
+        if refresh > 0 {
+            self.refresh_min = self.refresh_min.min(refresh);
+            self.refresh_max = self.refresh_max.max(refresh);
         }
         if let Some(l) = self.local.iter_mut().find(|l| l.fb_id == Some(fb_id)) {
             l.presented = Some(unix_us);
@@ -523,20 +533,33 @@ impl Metrics {
             if self.tcp { " (e2e)" } else { "" }
         ));
         // presentation-feedback flags: zero-copy => the compositor scanned our
-        // buffer out directly; vsync absent => VRR did not force a vblank.
+        // buffer out directly; vsync absent => VRR did not force a vblank; the
+        // refresh range widens when VRR is actually varying the interval.
         let pc = self.pres_count;
         let zc = self.zero_copy_count;
         let vs = self.vsync_count;
         let pct = |n: u64| if pc > 0 { n as f64 * 100.0 / pc as f64 } else { 0.0 };
+        let refstr = if self.refresh_max > 0 {
+            format!(
+                "{:.1}-{:.1}",
+                self.refresh_min as f64 / 1e6,
+                self.refresh_max as f64 / 1e6
+            )
+        } else {
+            "n/a".to_string()
+        };
         t.push_str(&format!(
-            "\nscanout     zero-copy {:>3.0}% vsync {:>3.0}% n={}",
+            "\nscanout     zc {:>3.0}% vsync {:>3.0}% ref {} n={}",
             pct(zc),
             pct(vs),
+            refstr,
             pc
         ));
         self.pres_count = 0;
         self.zero_copy_count = 0;
         self.vsync_count = 0;
+        self.refresh_min = u32::MAX;
+        self.refresh_max = 0;
         t.push_str(&format!(
             "\nclient       p50 {:>6.2}   p95 {:>6.2} ms",
             cli_m, cli_p
@@ -845,7 +868,7 @@ mod tests {
     fn presented_before_stamp_is_folded_in() {
         let mut m = Metrics::new();
         m.record(1, 10_000, 10_200, 10_500, Some(7));
-        m.on_presented(7, 10_900, true, 0); // arrives before the server stamp
+        m.on_presented(7, 10_900, true, 0, 0); // arrives before the server stamp
         m.on_control(ControlEvent::Stamp(stamp(1)));
         let s = m.samples.front().unwrap();
         assert_eq!(s.disp, 400);
@@ -858,7 +881,7 @@ mod tests {
         m.record(1, 10_000, 10_200, 10_500, Some(7));
         m.on_control(ControlEvent::Stamp(stamp(1)));
         assert_eq!(m.samples.front().unwrap().e2e, SERVER + CLIENT);
-        m.on_presented(7, 11_000, true, 0);
+        m.on_presented(7, 11_000, true, 0, 0);
         let s = m.samples.front().unwrap();
         assert_eq!(s.disp, 500);
         assert_eq!(s.e2e, SERVER + CLIENT + 500);
@@ -868,7 +891,7 @@ mod tests {
     fn discarded_leaves_display_unknown() {
         let mut m = Metrics::new();
         m.record(1, 10_000, 10_200, 10_500, Some(7));
-        m.on_presented(7, 0, false, 0); // discarded: no timestamp
+        m.on_presented(7, 0, false, 0, 0); // discarded: no timestamp
         m.on_control(ControlEvent::Stamp(stamp(1)));
         let s = m.samples.front().unwrap();
         assert_eq!(s.disp, 0);
@@ -897,7 +920,7 @@ mod tests {
             s.t1 = 1_002_500;
             s.t2 = 1_002_560;
             s.t2c = 1_005_600;
-            m.on_presented(i, 1_001_100 + i, true, 0);
+            m.on_presented(i, 1_001_100 + i, true, 0, 0);
             m.on_control(ControlEvent::Stamp(s));
         }
         let t = m.refresh().expect("text changed");

@@ -486,9 +486,9 @@ fn main() -> Result<()> {
             // sync warm; fold in any on-screen timestamps the compositor
             // reported (dispatched by the pump at the top of this iteration)
             if let Some(m) = metrics.as_mut() {
-                for (id, us, presented, flags) in p.take_presented() {
-                    if presented {
-                        m.on_presented(id, us, true, flags);
+                for pr in p.take_presented() {
+                    if pr.presented {
+                        m.on_presented(pr.id, pr.unix_us, true, pr.flags, pr.refresh);
                     }
                 }
                 while let Some(ev) = link.try_control() {

@@ -70,6 +70,19 @@ struct Fb {
     proxy: WpPresentationFeedback,
 }
 
+/// A completed presentation feedback, folded into metrics by the main loop.
+#[derive(Clone, Copy)]
+pub struct Presented {
+    pub id: u64,
+    pub unix_us: u64,
+    pub presented: bool,
+    /// wp_presentation_feedback flags (vsync/hw_clock/hw_completion/zero_copy)
+    pub flags: u32,
+    /// refresh interval the compositor used, ns (0 = unknown). Varies under
+    /// VRR, which is how the client can tell VRR is actually engaged.
+    pub refresh: u32,
+}
+
 struct St {
     // compositor/wmbase are used; the others are keep-alive handles (their
     // proxies must outlive the window; events keep flowing to the Dispatch
@@ -122,7 +135,7 @@ struct St {
     /// feedback objects still awaiting presented/discarded
     fbs: Vec<Fb>,
     /// completed feedbacks, arrival order: (id, client-unix-us, presented)
-    fb_done: std::collections::VecDeque<(u64, u64, bool, u32)>,
+    fb_done: std::collections::VecDeque<Presented>,
     /// id to hand to the next feedback request
     fb_next: u64,
     /// grab-mode keep-alives (dropping them releases the constraint)
@@ -312,6 +325,27 @@ impl Presenter {
                 None => "unavailable".to_string(),
             },
         );
+        // Direct-scanout capabilities: KWin decides based on the buffer's
+        // dmabuf format/modifier. Which buffer-allocation protocols the
+        // compositor advertises (and their versions) tells us whether the
+        // driver can use linux-dmabuf feedback (scanout-capable modifiers)
+        // or the legacy wl_drm path (fixed format set).
+        {
+            let mut caps: Vec<String> = globals
+                .contents()
+                .clone_list()
+                .iter()
+                .filter(|g| {
+                    g.interface.contains("dmabuf")
+                        || g.interface.contains("drm")
+                        || g.interface.contains("syncobj")
+                        || g.interface.contains("linux")
+                })
+                .map(|g| format!("{} v{}", g.interface, g.version))
+                .collect();
+            caps.sort();
+            eprintln!("[wl] scanout-related globals: {}", caps.join(", "));
+        }
 
         let surface = compositor.create_surface(&qh, ());
         let viewport = viewporter.get_viewport(&surface, &qh, ());
@@ -526,11 +560,9 @@ impl Presenter {
         Some(id)
     }
 
-    /// Drain completed feedbacks: `(id, client-unix-us, presented, flags)`.
-    /// Present in commit order; the caller folds each into the matching metrics
-    /// sample. `flags` is the wp_presentation_feedback bitfield (vsync,
-    /// hw_clock, hw_completion, zero_copy).
-    pub fn take_presented(&mut self) -> Vec<(u64, u64, bool, u32)> {
+    /// Drain completed feedbacks in commit order. The caller folds each into
+    /// the matching metrics sample.
+    pub fn take_presented(&mut self) -> Vec<Presented> {
         self.state.fb_done.drain(..).collect()
     }
 }
@@ -726,7 +758,14 @@ impl St {
     fn apply_mode(&mut self, qh: &QueueHandle<St>, lw: u32, lh: u32) {
         self.logical_w = lw;
         self.logical_h = lh;
-        self.viewport.set_destination(lw as i32, lh as i32);
+        // At scale 1.0 the buffer and the logical size are identical, so drop
+        // the viewport scaling entirely: some compositors refuse direct scanout
+        // when a wp_viewport destination is set, even when it is a no-op.
+        if self.scale120 == 120 {
+            self.viewport.set_destination(-1, -1);
+        } else {
+            self.viewport.set_destination(lw as i32, lh as i32);
+        }
         self.xdg_surface.set_window_geometry(0, 0, lw as i32, lh as i32);
         self.set_opaque(qh, lw, lh);
         if !self.fullscreened {
@@ -742,6 +781,19 @@ impl St {
             lh,
             self.dev_w,
             self.dev_h,
+            self.width,
+            self.height
+        );
+        eprintln!(
+            "[wl] scanout-check: fullscreen={} buffer={}x{} scale={}/120 viewport_dest={}x{} opaque={}x{} frame={}x{}",
+            self.fullscreened,
+            self.dev_w,
+            self.dev_h,
+            self.scale120,
+            lw,
+            lh,
+            lw,
+            lh,
             self.width,
             self.height
         );
@@ -762,11 +814,11 @@ impl St {
     }
 
     /// Queue a presentation result for the main loop (bounded).
-    fn push_presented(&mut self, id: u64, unix_us: u64, presented: bool, flags: u32) {
+    fn push_presented(&mut self, p: Presented) {
         if self.fb_done.len() >= 256 {
             self.fb_done.pop_front();
         }
-        self.fb_done.push_back((id, unix_us, presented, flags));
+        self.fb_done.push_back(p);
     }
 }
 
@@ -925,11 +977,12 @@ impl Dispatch<WpPresentationFeedback, ()> for St {
         _: &Connection,
         _: &QueueHandle<St>,
     ) {
-        let (unix_us, presented, flags) = match ev {
+        let presented = match ev {
             wp_presentation_feedback::Event::Presented {
                 tv_sec_hi,
                 tv_sec_lo,
                 tv_nsec,
+                refresh,
                 flags,
                 ..
             } => {
@@ -938,18 +991,26 @@ impl Dispatch<WpPresentationFeedback, ()> for St {
                     wayland_client::WEnum::Value(k) => u32::from(k),
                     wayland_client::WEnum::Unknown(v) => v,
                 };
-                (
-                    presentation_to_unix_us(state.pres_clock, secs, tv_nsec),
-                    true,
+                Presented {
+                    id: 0, // filled from the matching Fb below
+                    unix_us: presentation_to_unix_us(state.pres_clock, secs, tv_nsec),
+                    presented: true,
                     flags,
-                )
+                    refresh,
+                }
             }
-            wp_presentation_feedback::Event::Discarded => (0, false, 0),
+            wp_presentation_feedback::Event::Discarded => Presented {
+                id: 0,
+                unix_us: 0,
+                presented: false,
+                flags: 0,
+                refresh: 0,
+            },
             _ => return, // sync_output: which output; not needed here
         };
         if let Some(i) = state.fbs.iter().position(|f| f.proxy.id() == obj.id()) {
             let f = state.fbs.remove(i);
-            state.push_presented(f.id, unix_us, presented, flags);
+            state.push_presented(Presented { id: f.id, ..presented });
         }
     }
 }
