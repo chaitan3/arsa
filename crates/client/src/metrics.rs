@@ -273,6 +273,8 @@ impl Metrics {
             ControlEvent::Rumble(_) => {}
             // handled by the presenter (window/meta apply), not metrics
             ControlEvent::Meta(_) => {}
+            // the pre-handshake mode result is consumed by connect_with
+            ControlEvent::ModeReply(_) => {}
         }
     }
 

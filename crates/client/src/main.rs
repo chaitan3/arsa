@@ -41,6 +41,10 @@ fn main() -> Result<()> {
     let mut fake_gamepad = false;
     let mut transport = rdma_display_rdma::TransportPref::Auto;
     let mut scale_filter: u32 = 0; // 0=auto 1=nearest 2=linear 3=cubic 4=area
+    // display-mode request sent to the server before the session is set up:
+    // --native asks for this client's own output mode; --set-mode names one
+    let mut native = false;
+    let mut set_mode: Option<String> = None;
     // lossy: force the CPU download+upload path instead of the all-GPU
     // Vulkan->GL dma-buf interop (also honours RDMA_DISPLAY_LOSSY_CPU=1)
     let mut lossy_cpu = std::env::var_os("RDMA_DISPLAY_LOSSY_CPU").is_some();
@@ -85,6 +89,8 @@ fn main() -> Result<()> {
                 };
             }
             "--lossy-cpu" => lossy_cpu = true,
+            "--native" => native = true,
+            "--set-mode" => set_mode = Some(args.next().expect("--set-mode needs a value")),
             "--help" | "-h" => {
                 println!("usage: rdma-display-client [HOST[:PORT]] [--device mlx5_0] [--slots 3] [--dump frame.ppm] [--seconds N]");
                 println!("  HOST[:PORT]           server address, given as the first positional argument (default host 127.0.0.1; :{DEFAULT_PORT} assumed when the port is omitted)");
@@ -101,6 +107,8 @@ fn main() -> Result<()> {
                 println!("  --fake-gamepad        synthesize a controller (slot 0) for testing without hardware");
                 println!("  --transport auto|rdma|tcp  video transport (default auto: RDMA/RoCE when available, else TCP); negotiated with the server");
                 println!("  --scale-filter auto|nearest|linear|cubic|area  sampler for the letterboxed frame (default auto: nearest at integer scale, area when downscaling, else linear)");
+                println!("  --native              ask the server to set its output to this client's monitor mode (read from wl_output) before the session starts");
+                println!("  --set-mode WxH[@R]    ask the server to set its output to this size/refresh before the session starts (R in Hz; omitted = any)");
                 println!("  --lossy-cpu           lossy: decode + download + upload on the CPU instead of the all-GPU Vulkan->GL dma-buf interop (default all-GPU, with an automatic fallback when the interop is unavailable)");
                 println!("  RDMA_DISPLAY_LOSSY_DEBUG=1  lossy: verbose dma-buf import diagnostics (extension strings, importable formats/modifiers, every import attempt)");
                 println!("  Ctrl+Alt+M            (--output egl) grab keyboard+mouse for the guest: the local compositor's");
@@ -167,6 +175,9 @@ fn main() -> Result<()> {
         "cuda" => rdma_display_rdma::SlotMem::Cuda { device: cuda_device },
         other => anyhow::bail!("--slot-mem must be host|cuda, got {other:?}"),
     };
+    // display-mode request: resolved here (before the handshake) so the server
+    // can reconfigure its output before it sizes the session
+    let mode_req = resolve_mode_request(native, set_mode.as_deref(), &output)?;
     let mut link = rdma_display_rdma::ClientLink::connect_with(
         Conn::new(stream),
         transport,
@@ -174,6 +185,7 @@ fn main() -> Result<()> {
         Some(addr),
         slots,
         mem,
+        mode_req,
     )?;
     if link.slots_gpu_only() {
         eprintln!("[client] GPU slots without CPU mapping: content checks use the verification-only device->host copy (the render path itself stays zero-copy)");
@@ -668,6 +680,19 @@ fn route_control(
         }
         // the presenter applies the new meta to the link/window
         rdma_display_rdma::ControlEvent::Meta(m) => Some(m),
+        rdma_display_rdma::ControlEvent::ModeReply(r) => {
+            eprintln!(
+                "[client] display mode: {} ({}{})",
+                r.mode_label(),
+                if r.ok { "ok" } else { "failed" },
+                if r.message.is_empty() {
+                    String::new()
+                } else {
+                    format!("; {}", r.message)
+                }
+            );
+            None
+        }
         other => {
             if let Some(m) = metrics {
                 m.on_control(other);
@@ -744,6 +769,73 @@ fn dump_ppm(path: &str, meta: &rdma_display_proto::DisplayMeta, bytes: &[u8]) ->
     std::fs::write(path, &ppm).with_context(|| format!("write {path}"))?;
     eprintln!("dumped {path}");
     Ok(())
+}
+
+/// Resolve the `--native` / `--set-mode` flags into a pre-handshake display
+/// mode request. `--native` reads this client's own output mode (from
+/// `wl_output`); a failure just means no change is requested.
+fn resolve_mode_request(
+    native: bool,
+    set_mode: Option<&str>,
+    output: &str,
+) -> Result<rdma_display_proto::ModeRequest> {
+    use rdma_display_proto::ModeRequest;
+    if let Some(s) = set_mode {
+        let (w, h, r) = parse_mode_spec(s).with_context(|| format!("--set-mode {s:?}"))?;
+        return Ok(ModeRequest::Set {
+            width: w,
+            height: h,
+            refresh_mhz: r,
+        });
+    }
+    if native {
+        if output == "none" {
+            eprintln!("[client] --native ignored with --output none (no output to query)");
+            return Ok(ModeRequest::Keep);
+        }
+        match wayland::query_output_mode() {
+            Ok((w, h, r)) => {
+                eprintln!("[client] --native: output mode {w}x{h}@{r} mHz");
+                return Ok(ModeRequest::Set {
+                    width: w,
+                    height: h,
+                    refresh_mhz: r,
+                });
+            }
+            Err(e) => {
+                eprintln!(
+                    "[client] --native: could not read the output mode ({e:#}); \
+                     not requesting a change"
+                );
+                return Ok(ModeRequest::Keep);
+            }
+        }
+    }
+    Ok(ModeRequest::Keep)
+}
+
+/// Parse `WxH` or `WxH@R` (R in Hz, fractional allowed; a trailing unit like
+/// `Hz` is ignored) into `(width, height, refresh_mhz)`.
+fn parse_mode_spec(s: &str) -> Result<(u32, u32, u32)> {
+    let (wh, r) = match s.split_once('@') {
+        Some((a, b)) => (a, Some(b)),
+        None => (s, None),
+    };
+    let (w, h) = wh.split_once('x').context("expected WxH[@R]")?;
+    let w: u32 = w.trim().parse().context("width")?;
+    let h: u32 = h.trim().parse().context("height")?;
+    let refresh_mhz = match r {
+        Some(r) => {
+            let rf: f64 = r
+                .trim()
+                .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+                .parse()
+                .context("refresh")?;
+            (rf * 1000.0).round() as u32
+        }
+        None => 0,
+    };
+    Ok((w, h, refresh_mhz))
 }
 
 /// Append the default signaling port when the user gives only a host or IP

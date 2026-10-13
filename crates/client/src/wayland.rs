@@ -24,6 +24,7 @@ use anyhow::{bail, Context, Result};
 use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_display::WlDisplay;
+use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_keyboard::{self, KeyState, WlKeyboard};
 use wayland_client::protocol::wl_pointer::{self, Axis, ButtonState, WlPointer};
 use wayland_client::protocol::wl_registry::WlRegistry;
@@ -332,6 +333,78 @@ fn presentation_to_unix_us(clk: libc::clockid_t, secs: u64, nsec: u32) -> u64 {
     let delta = clock_us(libc::CLOCK_REALTIME) - clock_us(clk);
     let ts = secs as i64 * 1_000_000 + nsec as i64 / 1000;
     (ts + delta).max(0) as u64
+}
+
+/// One-shot query of this client's current output mode, for `--native`: connect
+/// to the compositor, bind the first `wl_output`, and read its `CURRENT` mode.
+/// Returns `(width, height, refresh_mhz)`.
+pub fn query_output_mode() -> Result<(u32, u32, u32)> {
+    #[derive(Default)]
+    struct OutputQuery {
+        mode: Option<(u32, u32, u32)>,
+    }
+    impl Dispatch<WlRegistry, GlobalListContents> for OutputQuery {
+        fn event(
+            _: &mut Self,
+            _: &WlRegistry,
+            _: <WlRegistry as Proxy>::Event,
+            _: &GlobalListContents,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    impl Dispatch<WlOutput, ()> for OutputQuery {
+        fn event(
+            state: &mut Self,
+            _: &WlOutput,
+            ev: <WlOutput as Proxy>::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let wl_output::Event::Mode {
+                flags,
+                width,
+                height,
+                refresh,
+            } = ev
+            {
+                let current = match flags {
+                    WEnum::Value(m) => m.contains(wl_output::Mode::Current),
+                    WEnum::Unknown(v) => v & 1 != 0,
+                };
+                if current {
+                    state.mode = Some((
+                        width.max(0) as u32,
+                        height.max(0) as u32,
+                        refresh.max(0) as u32,
+                    ));
+                }
+            }
+        }
+    }
+
+    let conn = Connection::connect_to_env()
+        .context("wayland connect (for --native): needs WAYLAND_DISPLAY + XDG_RUNTIME_DIR")?;
+    let (globals, mut queue) =
+        wayland_client::globals::registry_queue_init::<OutputQuery>(&conn).context("registry")?;
+    let qh = queue.handle();
+    let _output: WlOutput = globals
+        .bind(&qh, 1..=4, ())
+        .context("bind wl_output (no output?)")?;
+    let mut state = OutputQuery::default();
+    // the geometry/mode/scale/done burst follows the bind; one roundtrip is
+    // normally enough, a second is harmless
+    for _ in 0..2 {
+        queue.roundtrip(&mut state).context("wl_output roundtrip")?;
+        if state.mode.is_some() {
+            break;
+        }
+    }
+    state
+        .mode
+        .context("no CURRENT wl_output mode reported")
 }
 
 impl Presenter {
