@@ -8,7 +8,7 @@
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::mpsc::Sender;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::{CaptureEvent, CaptureSource, DmabufScanout, DirtyRect, FrameFormat, Running, Stop};
 
@@ -153,6 +153,22 @@ pub async fn open_console(
     // live forever anyway
     let conn: &'static zbus::Connection = Box::leak(Box::new(conn));
     qemu_display::Console::new(conn, console).await.context("console proxy")
+}
+
+/// Cheap preflight probe for the QEMU source: open the console proxy and read
+/// its current size, without registering a listener or streaming. The D-Bus
+/// connection is leaked (see `open_console`), so call this at most once per
+/// process.
+pub fn probe_console(dbus_socket: &Option<String>, console: u32) -> Result<(u32, u32)> {
+    async_std::task::block_on(async {
+        let c = open_console(dbus_socket, console).await?;
+        let w = c.width().await.unwrap_or(0);
+        let h = c.height().await.unwrap_or(0);
+        if w == 0 || h == 0 {
+            bail!("console reported {w}x{h}");
+        }
+        Ok((w, h))
+    })
 }
 
 pub struct QemuDbusSource {

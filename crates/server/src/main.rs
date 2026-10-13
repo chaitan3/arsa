@@ -379,7 +379,14 @@ fn run_capture(
     // `sudo -E`) warns and leaves audio off rather than blocking video.
     let audio_mbox = if audio {
         match rdma_display_audio::capture::start_capture(audio_device) {
-            Ok(m) => Some(m),
+            Ok(a) => {
+                if a.mailbox.wait_first(std::time::Duration::from_secs(3)) {
+                    eprintln!("[preflight] audio capture ok");
+                } else {
+                    eprintln!("[preflight] audio: no packet within 3 s (continuing)");
+                }
+                Some(a)
+            }
             Err(e) => {
                 eprintln!(
                     "[audio] capture unavailable ({e:#}); streaming video without audio \
@@ -405,6 +412,29 @@ fn run_capture(
         None
     };
 
+    // input sink: explicit --input wins, else paired default
+    let input_name = input_name.unwrap_or(match source_name {
+        "drm" => "uinput",
+        _ => "qemu",
+    });
+    if input_name == "qemu" && source_name == "drm" {
+        bail!("--input qemu injects into the QEMU guest, which --source drm does not capture (use --input uinput)");
+    }
+    if input_name == "uinput" && source_name == "qemu" {
+        bail!("--input uinput injects into the host compositor, but --source qemu captures the guest (use --input qemu)");
+    }
+
+    // startup preflight: validate/probe each element once; the heavy pipeline
+    // is (re)started on demand per client (Phase 2). The probed geometry lets
+    // a client connect negotiate slots before the first captured frame.
+    let geometry = preflight(source_name, input_name, drm_card, dbus_socket, console, codec, gl.as_ref());
+    if let Some(m) = geometry.as_ref() {
+        eprintln!(
+            "[preflight] geometry cached: {}x{} stride {} (sizes slots on connect)",
+            m.width, m.height, m.stride
+        );
+    }
+
     let mut mat: Box<dyn FrameMaterializer> = if codec == rdma_display_codec::Codec::Lossy {
         Box::new(lossy::LossyMaterializer::new(lossy_budget, lossy_chroma444)?)
     } else {
@@ -420,16 +450,6 @@ fn run_capture(
     eprintln!("[server] capture materializer: {}", mat.name());
 
     // input sink: explicit --input wins, else paired default
-    let input_name = input_name.unwrap_or(match source_name {
-        "drm" => "uinput",
-        _ => "qemu",
-    });
-    if input_name == "qemu" && source_name == "drm" {
-        bail!("--input qemu injects into the QEMU guest, which --source drm does not capture (use --input uinput)");
-    }
-    if input_name == "uinput" && source_name == "qemu" {
-        bail!("--input uinput injects into the host compositor, but --source qemu captures the guest (use --input qemu)");
-    }
     let screen = ScreenSize::new();
     let (input_tx, input_rx) = mpsc::channel::<rdma_display_proto::InputEvent>();
     // host-game rumble on the virtual pad rides this hub to the current
@@ -1641,6 +1661,97 @@ fn meta_plain(fmt: &FrameFormat) -> DisplayMeta {
         frame_bytes: fmt.frame_bytes(),
         gen: 0,
     }
+}
+
+/// Best-effort DisplayMeta from a probed size (QEMU console): XR24, linear.
+fn meta_from_size(w: u32, h: u32) -> DisplayMeta {
+    DisplayMeta {
+        width: w,
+        height: h,
+        stride: w * 4,
+        fourcc: 0x3432_5258,
+        modifier: 0,
+        y0_top: false,
+        frame_bytes: w * 4 * h,
+        gen: 0,
+    }
+}
+
+/// Startup preflight: validate each element of the pipeline once and probe the
+/// display geometry, without starting the (heavy, per-session) capture. Every
+/// failure here is logged, not fatal — the pipeline still starts on connect and
+/// re-learns what it can (except core pieces already opened before this).
+/// Returns the probed geometry, if any, so a connect can size slots up front.
+#[allow(clippy::too_many_arguments)]
+fn preflight(
+    source_name: &str,
+    input_name: &str,
+    drm_card: &Option<String>,
+    dbus_socket: &Option<String>,
+    console: u32,
+    codec: rdma_display_codec::Codec,
+    gl: Option<&Arc<rdma_display_egl::SharedContext>>,
+) -> Option<DisplayMeta> {
+    let mut geometry = None;
+
+    // 1. display geometry (and proof the source can be opened at all)
+    match source_name {
+        "drm" => match rdma_display_capture::drm::probe_display(drm_card.as_deref()) {
+            Ok(fmt) => {
+                eprintln!(
+                    "[preflight] drm scanout {}x{} '{}' modifier={:#x}",
+                    fmt.width,
+                    fmt.height,
+                    rdma_display_capture::fourcc_name(fmt.fourcc),
+                    fmt.modifier
+                );
+                geometry = Some(meta_linear(&fmt));
+            }
+            Err(e) => eprintln!("[preflight] drm probe failed: {e:#}"),
+        },
+        "qemu" => match rdma_display_capture::qemu::probe_console(dbus_socket, console) {
+            Ok((w, h)) => {
+                eprintln!("[preflight] qemu console {w}x{h}");
+                geometry = Some(meta_from_size(w, h));
+            }
+            Err(e) => eprintln!("[preflight] qemu probe failed: {e:#}"),
+        },
+        _ => {}
+    }
+
+    // 2. lossless GPU encoder (shader compile + buffers) on the shared context
+    if codec == rdma_display_codec::Codec::Lossless {
+        if let Some(gl) = gl {
+            let g = geometry
+                .as_ref()
+                .map(|m| rdma_display_codec::Geometry::new(m.width, m.height, m.stride))
+                .unwrap_or_else(|| rdma_display_codec::Geometry::new(1920, 1080, 1920 * 4));
+            match rdma_display_codec_gpu::GpuCodec::new_shared(g, gl.clone()) {
+                Ok(c) => {
+                    c.sync();
+                    drop(c);
+                    eprintln!("[preflight] lossless GPU encoder ok ({}x{})", g.width, g.height);
+                }
+                Err(e) => {
+                    eprintln!("[preflight] lossless GPU encoder failed: {e:#} (will fall back to CPU)")
+                }
+            }
+        }
+    }
+
+    // 3. input injection (uinput device creation; QEMU input shares the
+    //    console probe above)
+    if input_name == "uinput" {
+        match rdma_display_capture::input::UinputMouse::open() {
+            Ok(m) => {
+                drop(m);
+                eprintln!("[preflight] uinput ok");
+            }
+            Err(e) => eprintln!("[preflight] uinput failed: {e:#}"),
+        }
+    }
+
+    geometry
 }
 
 #[cfg(test)]
