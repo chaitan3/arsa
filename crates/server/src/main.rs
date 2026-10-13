@@ -893,12 +893,14 @@ fn run_capture(
                 }
             } else if tag[0] == rdma_display_proto::TAG_VIDEO {
                 // client's TCP video socket (negotiated transport == TCP)
+                let mut video_attached = false;
                 match session.as_mut() {
                     Some(s)
                         if s.transport() == rdma_display_rdma::Transport::Tcp
                             && !s.has_video() =>
                     {
                         s.attach_video(stream);
+                        video_attached = true;
                         if let Some(t) = session_connected_at {
                             eprintln!(
                                 "[session] video socket attached {} ms after connect",
@@ -909,6 +911,15 @@ fn run_capture(
                     _ => {
                         eprintln!("[server] unexpected TAG_VIDEO connection dropped ({addr})")
                     }
+                }
+                if video_attached {
+                    // the client can receive now: re-arm so the CURRENT frame is
+                    // sent immediately. The frame that was ready before the
+                    // socket attached was dropped (send_frame_tcp returns None
+                    // without a video socket), and on a static screen no new
+                    // scanout may arrive for a long time.
+                    mat.mark_dirty();
+                    frame_dirty = true;
                 }
             } else if session.is_none() {
                 if let Some(meta) = geometry.clone().or_else(|| pending_meta.clone()) {
