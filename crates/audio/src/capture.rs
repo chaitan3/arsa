@@ -132,27 +132,31 @@ pub fn start_capture(dev: Option<&str>) -> Result<AudioCapture> {
     let dev = dev.unwrap_or("@DEFAULT_MONITOR@").to_string();
     let mbox = Mailbox::new();
 
-    // sudo case: XDG_RUNTIME_DIR points at the user's session but is owned
-    // by another uid — libpulse refuses to even resolve the socket path.
-    // A helper child running as that uid is the only way through.
-    let helper = match std::env::var("XDG_RUNTIME_DIR") {
-        Ok(dir) => {
-            let st = stat_dir(&dir).with_context(|| format!("stat {dir}"))?;
-            let my_uid = unsafe { libc::getuid() } as u32;
-            if st.uid() == my_uid {
-                None // normal user run: in-process capture
-            } else {
-                Some((st.uid(), st.gid()))
+    // The setuid helper exists only for the root/sudo case: root runs with the
+    // user's XDG_RUNTIME_DIR (owned by another uid), and libpulse refuses to
+    // resolve a socket it doesn't own, so a helper child dropped to that uid is
+    // the only way through. A non-root process — including a CAP_SYS_ADMIN
+    // setcap binary, whose uid is still the user — owns/uses its own session
+    // socket directly and could not drop to another uid anyway, so it always
+    // captures in-process (no fork).
+    let helper = if unsafe { libc::getuid() } == 0 {
+        match std::env::var("XDG_RUNTIME_DIR") {
+            Ok(dir) => {
+                let st = stat_dir(&dir).with_context(|| format!("stat {dir}"))?;
+                if st.uid() == 0 {
+                    None // root's own session (unusual): in-process
+                } else {
+                    Some((st.uid(), st.gid()))
+                }
             }
-        }
-        Err(_) => {
-            // no runtime dir: as a regular user pulse can fall back to its
-            // legacy $HOME paths; as root there is no sane fallback at all
-            if unsafe { libc::getuid() } == 0 {
+            Err(_) => {
+                // no runtime dir: as a regular user pulse can fall back to its
+                // legacy $HOME paths; as root there is no sane fallback at all
                 bail!("--audio: XDG_RUNTIME_DIR is not set; run with sudo -E (or XDG_RUNTIME_DIR=/run/user/<uid>) so the user's pipewire-pulse session can be reached");
             }
-            None
         }
+    } else {
+        None
     };
 
     let pulse = Pulse::dlopen()?;
