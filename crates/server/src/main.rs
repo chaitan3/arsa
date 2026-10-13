@@ -639,6 +639,8 @@ fn run_capture(
     let mut first_scanout_logged = false;
     // diagnostic: count send-block entries to time the connect->first-send path
     let mut diag_send_entries: u32 = 0;
+    // diagnostic: count accepted connections to time their arrival
+    let mut diag_conns: u32 = 0;
     // per-session workers (capture source, input sink, audio); stopped when
     // the session ends so an idle server holds none of them
     let mut workers: Option<SessionWorkers> = None;
@@ -728,6 +730,7 @@ fn run_capture(
                 session_connected_at = None;
                 first_scanout_logged = false;
                 diag_send_entries = 0;
+                diag_conns = 0;
                 eprintln!("[server] session ended; pipeline idle");
             }
         }
@@ -833,6 +836,16 @@ fn run_capture(
                 );
             }
             let _ = stream.set_read_timeout(None);
+            if let Some(t) = session_connected_at {
+                if diag_conns < 12 {
+                    diag_conns += 1;
+                    eprintln!(
+                        "[diag] conn #{diag_conns} from {addr} tag={:#04x} at {} ms",
+                        tag[0],
+                        t.elapsed().as_millis()
+                    );
+                }
+            }
             if !tag_ok {
                 eprintln!("[server] connection with no routing tag dropped ({addr})");
             } else if tag[0] == rdma_display_audio::wire::TAG_AUDIO {
