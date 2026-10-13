@@ -1205,7 +1205,7 @@ fn run_capture(
                         frame_dirty = false;
                         last_send = Some(std::time::Instant::now());
                         eprintln!("[server] frame {} sent", seq);
-                        if seq == 1 {
+                        if seq == 0 {
                             if let Some(t) = session_connected_at {
                                 eprintln!(
                                     "[session] first frame {} ms after connect",
@@ -1282,7 +1282,7 @@ fn run_capture(
                     Ok(Some(seq)) => {
                         last_send = Some(std::time::Instant::now());
                         eprintln!("[server] frame {} sent", seq);
-                        if seq == 1 {
+                        if seq == 0 {
                             if let Some(t) = session_connected_at {
                                 eprintln!(
                                     "[session] first frame {} ms after connect",

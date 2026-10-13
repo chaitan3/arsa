@@ -212,7 +212,7 @@ fn in_process_loop(pulse: Pulse, dev: String, mbox: Mailbox, stop: Stop) {
                     fed += 1;
                     if mbox.put_overwrites(pkt) {
                         drops += 1;
-                        if drops == 1 || drops % 1000 == 0 {
+                        if drops == 1 || drops % 10000 == 0 {
                             eprintln!("[audio] capture dropped {drops} packets (no consumer or stalled client)");
                         }
                     }
@@ -312,7 +312,7 @@ fn helper_loop(
                             seq = seq.wrapping_add(1);
                             if mbox.put_overwrites(pkt) {
                                 drops += 1;
-                                if drops == 1 || drops % 1000 == 0 {
+                                if drops == 1 || drops % 10000 == 0 {
                                     eprintln!("[audio] capture dropped {drops} packets (no consumer or stalled client)");
                                 }
                             }
