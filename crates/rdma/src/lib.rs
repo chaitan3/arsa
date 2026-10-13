@@ -39,6 +39,8 @@ pub enum ControlEvent {
     Rumble(proto::gamepad::Rumble),
     /// server → client: the display meta changed (new generation)
     Meta(proto::DisplayMeta),
+    /// server → client: the result of the pre-handshake display-mode request
+    ModeReply(proto::ModeReply),
 }
 
 pub mod cuda;
@@ -314,6 +316,45 @@ enum Tx {
     },
 }
 
+/// Server side of the pre-handshake: negotiate the video transport (the
+/// `Hello` exchange) and read the client's display-mode request. Returns the
+/// still-open control connection, the negotiated transport, and the request.
+///
+/// The caller applies the mode (and re-probes the display) *before* calling
+/// [`ServerLink::accept_negotiated`], so the session's slots are sized for the
+/// final geometry — no mid-session resize and no reconnect. The client blocks
+/// in its own handshake until it reads the [`proto::ModeReply`] the caller
+/// sends with [`send_mode_reply`].
+pub fn handshake_server(
+    stream: TcpStream,
+    session_nonce: u64,
+    pref: TransportPref,
+    server_has_rdma: bool,
+) -> Result<(Conn<TcpStream>, Transport, proto::ModeRequest)> {
+    let mut conn = Conn::new(stream);
+    let transport = hello_server(&mut conn, session_nonce, pref, server_has_rdma)?;
+    eprintln!(
+        "[rdma] video transport: {}{}",
+        match transport {
+            Transport::Rdma => "RDMA",
+            Transport::Tcp => "TCP",
+        },
+        if transport == Transport::Tcp { " (RDMA unavailable)" } else { "" }
+    );
+    let req = match conn.recv()? {
+        Message::SetMode(r) => r,
+        other => anyhow::bail!("expected SetMode, got {other:?}"),
+    };
+    Ok((conn, transport, req))
+}
+
+/// Send the display-mode result to the client. Called after the mode has been
+/// applied (or rejected), before [`ServerLink::accept_negotiated`].
+pub fn send_mode_reply(conn: &mut Conn<TcpStream>, reply: &proto::ModeReply) -> Result<()> {
+    conn.send(&Message::ModeReply(reply.clone()))?;
+    Ok(())
+}
+
 pub struct ServerLink {
     /// credits arrive from the control-reader thread; None = client gone
     credit_rx: mpsc::Receiver<Option<u32>>,
@@ -331,14 +372,14 @@ pub struct ServerLink {
 }
 
 impl ServerLink {
-    /// Server half of a session on an accepted TCP stream. `meta` describes
-    /// the frames we will send (testcard or captured display format). The
-    /// video transport is negotiated from `pref`: auto prefers RDMA and falls
-    /// back to tagged TCP video when either side lacks an RDMA device.
+    /// Server half of a session whose `Hello` (and display-mode exchange) has
+    /// already been handled by [`handshake_server`]. `transport` is the
+    /// negotiated transport; `conn` is the still-open control connection.
+    /// Everything from the RDMA endpoint exchange onward lives here.
     #[allow(clippy::too_many_arguments)]
-    pub fn accept(
+    pub fn accept_negotiated(
         conn: Conn<TcpStream>,
-        pref: TransportPref,
+        transport: Transport,
         rdma: Option<(&ibverbs::Context, &ibverbs::ProtectionDomain)>,
         meta: &DisplayMeta,
         slots: usize,
@@ -348,7 +389,6 @@ impl ServerLink {
         input_tx: mpsc::Sender<proto::InputEvent>,
         external: Option<&[(*mut u8, usize)]>,
         rumble: &proto::gamepad::RumbleHub,
-        session_nonce: u64,
     ) -> Result<ServerLink> {
         // split the stream: reader thread gets the receive half, the frame
         // send path keeps a write-only clone for per-frame Stamps
@@ -356,18 +396,6 @@ impl ServerLink {
         let stamp_w = stream.try_clone().context("clone stream for stamps")?;
         let rumble_w = stream.try_clone().context("clone stream for rumble")?;
         let mut conn = Conn::new(stream);
-
-        // handshake first: the client advertises whether it can do RDMA; we
-        // choose the video transport and reply with the choice
-        let transport = hello_server(&mut conn, session_nonce, pref, rdma.is_some())?;
-        eprintln!(
-            "[rdma] video transport: {}{}",
-            match transport {
-                Transport::Rdma => "RDMA",
-                Transport::Tcp => "TCP",
-            },
-            if transport == Transport::Tcp { " (RDMA unavailable)" } else { "" }
-        );
 
         let tx = match transport {
             Transport::Rdma => {
@@ -1055,6 +1083,11 @@ fn spawn_control_reader(stream: TcpStream) -> mpsc::Receiver<ControlEvent> {
                             break;
                         }
                     }
+                    Ok(proto::Message::ModeReply(r)) => {
+                        if tx.send(ControlEvent::ModeReply(r)).is_err() {
+                            break;
+                        }
+                    }
                     Ok(other) => {
                         eprintln!("[rdma] unexpected client control message {other:?}");
                     }
@@ -1129,6 +1162,8 @@ pub struct ClientLink {
     decoder: Option<rdma_display_codec::Decoder>,
     /// session nonce the server assigned; presented on the input connection
     pub session_nonce: u64,
+    /// server's answer to this session's pre-handshake display-mode request
+    pub mode_reply: proto::ModeReply,
     rx: Rx,
     /// server→client control events (Stamps, Pongs) from the reader thread
     ctrl_rx: mpsc::Receiver<ControlEvent>,
@@ -1194,13 +1229,14 @@ impl ClientLink {
         addr: Option<std::net::SocketAddr>,
         slots: usize,
     ) -> Result<ClientLink> {
-        Self::connect_with(conn, pref, rdma, addr, slots, SlotMem::Host)
+        Self::connect_with(conn, pref, rdma, addr, slots, SlotMem::Host, proto::ModeRequest::Keep)
     }
 
     /// Client half of a session; `mem` chooses host vs GPU (GBM) slots (GPU
     /// slots are RDMA-only; TCP always uses host buffers). `addr` is the
     /// server endpoint, used to open the TAG_VIDEO socket when the negotiated
-    /// transport is TCP.
+    /// transport is TCP. `mode` is the pre-handshake display-mode request; the
+    /// server applies it before `Meta`, so the session is sized for the result.
     pub fn connect_with(
         conn: Conn<TcpStream>,
         pref: TransportPref,
@@ -1208,6 +1244,7 @@ impl ClientLink {
         addr: Option<std::net::SocketAddr>,
         slots: usize,
         mem: SlotMem,
+        mode: proto::ModeRequest,
     ) -> Result<ClientLink> {
         // split the stream: the frame/metrics reader gets the receive half as
         // its own clone; the link's conn keeps doing client→server sends
@@ -1234,6 +1271,24 @@ impl ClientLink {
                 Transport::Tcp => "TCP",
             },
             if transport == Transport::Tcp { " (RDMA unavailable)" } else { "" }
+        );
+
+        // display-mode request: sent right after Hello and before the server's
+        // Meta, so a changed mode is already in effect when slots are sized.
+        conn.send(&Message::SetMode(mode))?;
+        let mode_reply = match conn.recv()? {
+            Message::ModeReply(r) => r,
+            other => anyhow::bail!("expected ModeReply, got {other:?}"),
+        };
+        eprintln!(
+            "[rdma] display mode: {} ({}{})",
+            mode_reply.mode_label(),
+            if mode_reply.ok { "ok" } else { "failed" },
+            if mode_reply.message.is_empty() {
+                String::new()
+            } else {
+                format!("; {}", mode_reply.message)
+            }
         );
 
         // RDMA endpoint exchange happens before Meta (server sends Meta after)
@@ -1352,6 +1407,7 @@ impl ClientLink {
                     slot_len,
                     decoder,
                     session_nonce,
+                    mode_reply: mode_reply.clone(),
                     rx,
                     ctrl_rx: spawn_control_reader(reader_stream),
                     transport,
@@ -1388,6 +1444,7 @@ impl ClientLink {
             slot_len,
             decoder,
             session_nonce,
+            mode_reply,
             rx,
             ctrl_rx: spawn_control_reader(reader_stream),
             transport,

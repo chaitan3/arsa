@@ -11,7 +11,7 @@ pub mod gamepad;
 pub mod keymap;
 
 pub const MAGIC: u32 = 0x5244_4453; // "RDDS"
-pub const VERSION: u32 = 12; // v12: t0p (prepare/import done) stamp in the frame stamp
+pub const VERSION: u32 = 13; // v13: pre-handshake display mode request/reply (SetMode/ModeReply)
 
 /// First byte of every connection, so the server routes by an explicit tag
 /// rather than by guessing protocol bytes. Audio uses
@@ -60,6 +60,12 @@ pub enum MsgType {
     /// Sent right after `Meta`, before the client allocates its slots, so the
     /// client can size them for the codec's worst case.
     Codec = 13,
+    /// client → server, right after `Hello` and before the server sends `Meta`:
+    /// request a display mode change, so the server reconfigures its compositor
+    /// and sizes the session for the new geometry up front (see [`ModeRequest`]).
+    SetMode = 14,
+    /// server → client: the result of a [`ModeRequest`] (see [`ModeReply`]).
+    ModeReply = 15,
 }
 
 /// Server-side pipeline timestamps for one frame (all `unix_now_us`).
@@ -218,6 +224,96 @@ pub struct DisplayMeta {
     pub gen: u32,
 }
 
+/// Client → server display-mode request, sent right after `Hello` (and before
+/// the server sends `Meta`). The server applies it to its compositor output and
+/// re-probes the display, so the session's slots are sized for the new geometry
+/// from the start — no mid-session resize and no reconnect.
+///
+/// `native` is resolved by the client: it reads its own `wl_output` mode and
+/// sends the numbers as [`ModeRequest::Set`]. The server maps them to the
+/// nearest mode its output advertises.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModeRequest {
+    /// No change requested; the client just proceeds (the default).
+    Keep,
+    /// Ask the server output for this size. `refresh_mhz` 0 = any refresh.
+    Set {
+        width: u32,
+        height: u32,
+        refresh_mhz: u32,
+    },
+    /// Restore the mode the server had before this session changed it.
+    Reset,
+}
+
+impl ModeRequest {
+    /// The requested size, for logging (`None` for Keep/Reset).
+    pub fn size(&self) -> Option<(u32, u32, u32)> {
+        match self {
+            ModeRequest::Set {
+                width,
+                height,
+                refresh_mhz,
+            } => Some((*width, *height, *refresh_mhz)),
+            _ => None,
+        }
+    }
+}
+
+/// Server → client result of a [`ModeRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeReply {
+    /// true = the request was applied (or was a no-op `Keep`).
+    pub ok: bool,
+    /// the mode now in effect (0 when unknown / not applicable)
+    pub width: u32,
+    pub height: u32,
+    pub refresh_mhz: u32,
+    /// human-readable detail: the applied mode, or why it failed
+    pub message: String,
+}
+
+impl ModeReply {
+    /// A success carrying the mode now in effect.
+    pub fn ok(width: u32, height: u32, refresh_mhz: u32, message: impl Into<String>) -> Self {
+        ModeReply {
+            ok: true,
+            width,
+            height,
+            refresh_mhz,
+            message: message.into(),
+        }
+    }
+
+    /// A failure carrying the mode still in effect (best effort) and a reason.
+    pub fn err(width: u32, height: u32, refresh_mhz: u32, message: impl Into<String>) -> Self {
+        ModeReply {
+            ok: false,
+            width,
+            height,
+            refresh_mhz,
+            message: message.into(),
+        }
+    }
+
+    /// `"WxH@R"` (or `"WxH"` when the refresh is unknown); `"?"` when unknown.
+    pub fn mode_label(&self) -> String {
+        if self.width == 0 || self.height == 0 {
+            return "?".to_string();
+        }
+        if self.refresh_mhz > 0 {
+            format!(
+                "{}x{}@{:.2}",
+                self.width,
+                self.height,
+                self.refresh_mhz as f64 / 1000.0
+            )
+        } else {
+            format!("{}x{}", self.width, self.height)
+        }
+    }
+}
+
 /// One client receive slot the server may RDMA-WRITE into.
 #[derive(Debug, Clone, Copy)]
 pub struct SlotDesc {
@@ -367,6 +463,10 @@ pub enum Message {
     /// server → client: frame codec id, the slot byte size, and (lossy) the
     /// chroma subsampling (0 = 4:2:0, 1 = 4:4:4).
     Codec(u8, u32, u8),
+    /// client → server: pre-handshake display-mode request (see [`ModeRequest`])
+    SetMode(ModeRequest),
+    /// server → client: result of the request (see [`ModeReply`])
+    ModeReply(ModeReply),
 }
 
 /// Encode + frame one message onto any writer. `Conn::send` is a wrapper;
@@ -456,6 +556,40 @@ pub fn send_msg<T: Write>(io: &mut T, msg: &Message) -> std::io::Result<()> {
                 v.push(*id);
                 v.extend_from_slice(&slot_len.to_le_bytes());
                 v.push(*chroma);
+                v
+            },
+        ),
+        Message::SetMode(req) => (
+            MsgType::SetMode as u32,
+            match req {
+                ModeRequest::Keep => vec![0],
+                ModeRequest::Reset => vec![2],
+                ModeRequest::Set {
+                    width,
+                    height,
+                    refresh_mhz,
+                } => {
+                    let mut v = Vec::with_capacity(13);
+                    v.push(1);
+                    v.extend_from_slice(&width.to_le_bytes());
+                    v.extend_from_slice(&height.to_le_bytes());
+                    v.extend_from_slice(&refresh_mhz.to_le_bytes());
+                    v
+                }
+            },
+        ),
+        Message::ModeReply(r) => (
+            MsgType::ModeReply as u32,
+            {
+                let msg = r.message.as_bytes();
+                let n = msg.len().min(u16::MAX as usize);
+                let mut v = Vec::with_capacity(15 + n);
+                v.push(r.ok as u8);
+                v.extend_from_slice(&r.width.to_le_bytes());
+                v.extend_from_slice(&r.height.to_le_bytes());
+                v.extend_from_slice(&r.refresh_mhz.to_le_bytes());
+                v.extend_from_slice(&(n as u16).to_le_bytes());
+                v.extend_from_slice(&msg[..n]);
                 v
             },
         ),
@@ -646,6 +780,47 @@ impl<T: Read + Write> Conn<T> {
                 let chroma = *payload.get(5).unwrap_or(&0);
                 Message::Codec(id, slot_len, chroma)
             }
+            t if t == MsgType::SetMode as u32 => {
+                let kind = *payload.first().unwrap_or(&0);
+                let req = match kind {
+                    1 => {
+                        if payload.len() < 13 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "short set-mode payload",
+                            ));
+                        }
+                        ModeRequest::Set {
+                            width: u32_at(&payload, 1)?,
+                            height: u32_at(&payload, 5)?,
+                            refresh_mhz: u32_at(&payload, 9)?,
+                        }
+                    }
+                    2 => ModeRequest::Reset,
+                    _ => ModeRequest::Keep,
+                };
+                Message::SetMode(req)
+            }
+            t if t == MsgType::ModeReply as u32 => {
+                if payload.len() < 15 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "short mode-reply payload",
+                    ));
+                }
+                let n = u16::from_le_bytes(payload[13..15].try_into().unwrap()) as usize;
+                let message = String::from_utf8_lossy(
+                    payload.get(15..15 + n).unwrap_or(&[]),
+                )
+                .into_owned();
+                Message::ModeReply(ModeReply {
+                    ok: payload[0] != 0,
+                    width: u32_at(&payload, 1)?,
+                    height: u32_at(&payload, 5)?,
+                    refresh_mhz: u32_at(&payload, 9)?,
+                    message,
+                })
+            }
             other => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -697,6 +872,15 @@ mod tests {
                 duration_ms: 5000,
                 action: gamepad::RUMBLE_UPLOAD,
             }),
+            Message::SetMode(ModeRequest::Keep),
+            Message::SetMode(ModeRequest::Reset),
+            Message::SetMode(ModeRequest::Set {
+                width: 2880,
+                height: 1800,
+                refresh_mhz: 119_880,
+            }),
+            Message::ModeReply(ModeReply::ok(2560, 1440, 143_981, "applied 2560x1440@143.98")),
+            Message::ModeReply(ModeReply::err(1920, 1080, 0, "no display-control backend")),
         ];
         for m in msgs {
             let mut buf: Vec<u8> = Vec::new();
