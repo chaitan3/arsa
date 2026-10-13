@@ -75,6 +75,8 @@ const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: i32 = 0x3443;
 const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: i32 = 0x3444;
 const EGL_EXTENSIONS: i32 = 0x3055;
 const GL_EXTENSIONS: u32 = 0x1F03;
+const GL_VENDOR: u32 = 0x1F00;
+const GL_RENDERER: u32 = 0x1F01;
 // DRM fourccs we might export from Vulkan; queried for importability below.
 const DRM_FORMAT_ARGB8888: i32 = 0x3432_5241;
 const DRM_FORMAT_ABGR8888: i32 = 0x3432_4241;
@@ -617,6 +619,20 @@ impl EglWindow {
         }
         if metrics {
             me.build_overlay()?;
+        }
+        unsafe {
+            let s = |p: *const u8| {
+                if p.is_null() {
+                    String::new()
+                } else {
+                    std::ffi::CStr::from_ptr(p as *const i8).to_string_lossy().into_owned()
+                }
+            };
+            eprintln!(
+                "[eglwin] window GL: {} | {}",
+                s((me.gl.get_string)(GL_VENDOR)),
+                s((me.gl.get_string)(GL_RENDERER))
+            );
         }
         eprintln!("[eglwin] window surface ready: {width}x{height}, ES 3.0");
         Ok(me)
