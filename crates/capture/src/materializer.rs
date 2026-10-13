@@ -80,6 +80,12 @@ pub trait FrameMaterializer: Send {
     /// Drop any pipelined state (fences) after a session loss; the next
     /// issue_frame reuses the slots.
     fn drop_frames(&mut self) {}
+
+    /// Free the geometry-sized GPU resources (FBO/texture, staging PBOs,
+    /// imported image) so an idle server holds no per-session GPU memory. The
+    /// context/program stay warm; the next session re-creates what it needs.
+    /// Called on client disconnect.
+    fn release(&mut self) {}
 }
 
 /// The "plain" materializer: QEMU sends host-memory scanouts (requires

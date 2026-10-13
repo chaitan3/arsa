@@ -155,6 +155,8 @@ struct Gl {
     framebuffer_texture_2d: unsafe extern "system" fn(u32, u32, u32, u32, i32),
     check_framebuffer_status: unsafe extern "system" fn(u32) -> u32,
     delete_framebuffers: unsafe extern "system" fn(i32, *const u32),
+    delete_program: unsafe extern "system" fn(u32),
+    delete_buffers: unsafe extern "system" fn(i32, *const u32),
     read_pixels: unsafe extern "system" fn(i32, i32, i32, i32, u32, u32, *mut c_void),
     // texture-direct input + blit
     draw_arrays: unsafe extern "system" fn(u32, i32, i32),
@@ -228,6 +230,8 @@ impl Gl {
             framebuffer_texture_2d: s!("glFramebufferTexture2D"),
             check_framebuffer_status: s!("glCheckFramebufferStatus"),
             delete_framebuffers: s!("glDeleteFramebuffers"),
+            delete_program: s!("glDeleteProgram"),
+            delete_buffers: s!("glDeleteBuffers"),
             read_pixels: s!("glReadPixels"),
             draw_arrays: s!("glDrawArrays"),
             viewport: s!("glViewport"),
@@ -1340,14 +1344,62 @@ impl GpuCodec {
 
 impl Drop for GpuCodec {
     fn drop(&mut self) {
-        let _ = (
-            self.dpy,
-            self.ctx,
-            self.cur,
-            self.reference,
-            self.coded,
-            self.counter,
-        );
+        // Free the GL objects on the (shared, still-alive) context. Without
+        // this, a per-session codec would leak its buffers/textures/programs
+        // into the long-lived context on every reconnect.
+        let _ = self.sh.make_current();
+        unsafe {
+            for p in [
+                self.enc_prog,
+                self.dec_prog,
+                self.blit_prog,
+                self.enc_tex_prog,
+                self.enc_ext_prog,
+                self.enc_fetch_prog,
+                self.probe_buf_prog,
+                self.probe_ext_prog,
+                self.probe_2d_prog,
+            ] {
+                if p != 0 {
+                    (self.gl.delete_program)(p);
+                }
+            }
+            let mut bufs = vec![self.cur, self.reference, self.coded, self.counter, self.probe_out];
+            bufs.retain(|&b| b != 0);
+            bufs.sort_unstable();
+            bufs.dedup();
+            if !bufs.is_empty() {
+                (self.gl.delete_buffers)(bufs.len() as i32, bufs.as_ptr());
+            }
+            let mut texs = vec![self.src_img, self.src_tex, self.direct_img];
+            for e in &self.src_cache {
+                texs.push(e.tex);
+            }
+            texs.retain(|&t| t != 0);
+            texs.sort_unstable();
+            texs.dedup();
+            if !texs.is_empty() {
+                (self.gl.delete_textures)(texs.len() as i32, texs.as_ptr());
+            }
+            if self.src_fbo != 0 {
+                (self.gl.delete_framebuffers)(1, &self.src_fbo);
+            }
+            // destroy each imported EGLImage once
+            if let Some(destroy) = self.destroy_image {
+                let mut imgs: Vec<Handle> = Vec::new();
+                if !self.src_egl_image.is_null() {
+                    imgs.push(self.src_egl_image);
+                }
+                for e in &self.src_cache {
+                    imgs.push(e.img);
+                }
+                imgs.sort_by_key(|p| *p as usize);
+                imgs.dedup();
+                for img in imgs {
+                    (destroy)(self.dpy, img);
+                }
+            }
+        }
     }
 }
 

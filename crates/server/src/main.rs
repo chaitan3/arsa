@@ -346,6 +346,96 @@ fn testcard_fill(bytes: &mut [u8], frame: u64) {
 // capture mode
 // ---------------------------------------------------------------------------
 
+/// Per-session workers: the capture source and input sink, started on control
+/// connect and stopped when the session ends. Audio is managed separately
+/// because the helper path stays warm across sessions.
+struct SessionWorkers {
+    /// None when a fallback eager source (preflight found no geometry) is
+    /// already running and owned by the server.
+    source: Option<rdma_display_capture::Running>,
+    input: rdma_display_capture::Running,
+    input_tx: mpsc::Sender<rdma_display_proto::InputEvent>,
+}
+
+impl SessionWorkers {
+    fn stop(mut self) {
+        if let Some(s) = self.source.take() {
+            let mut s = s;
+            s.stop();
+        }
+        self.input.stop();
+    }
+}
+
+/// Best-effort audio capture start + first-packet probe. Used at startup (as
+/// preflight) and per session (in-process path).
+fn start_audio(
+    audio: bool,
+    dev: Option<&str>,
+) -> Option<rdma_display_audio::capture::AudioCapture> {
+    if !audio {
+        return None;
+    }
+    match rdma_display_audio::capture::start_capture(dev) {
+        Ok(a) => {
+            if a.mailbox.wait_first(std::time::Duration::from_secs(3)) {
+                eprintln!("[preflight] audio capture ok");
+            } else {
+                eprintln!("[preflight] audio: no packet within 3 s (continuing)");
+            }
+            Some(a)
+        }
+        Err(e) => {
+            eprintln!(
+                "[audio] capture unavailable ({e:#}); streaming video without audio \
+                 (pass --no-audio to silence this)"
+            );
+            None
+        }
+    }
+}
+
+/// `--input-test`: synthetic input injector. Runs for the life of the session
+/// (it stops when the session's input channel closes).
+fn spawn_input_test(tx: mpsc::Sender<rdma_display_proto::InputEvent>) -> Result<()> {
+    std::thread::Builder::new()
+        .name("input-test".into())
+        .spawn(move || {
+            eprintln!("[server] --input-test: injecting synthetic input");
+            let mut n = 0u32;
+            loop {
+                // key 'a' (qnum 0x1e) press+release
+                if tx
+                    .send(rdma_display_proto::InputEvent::Key { code: 0x1e, down: true })
+                    .is_err()
+                {
+                    return;
+                }
+                let _ = tx.send(rdma_display_proto::InputEvent::Key { code: 0x1e, down: false });
+                // mouse: absolute sweep + click (console dims fallback 1080p)
+                let (w, h) = (1920u32, 1080u32);
+                let x = w / 2 + (n % 40) as u32 * 8;
+                let y = h / 2 + (n % 20) as u32 * 10;
+                let _ = tx.send(rdma_display_proto::InputEvent::Abs { x, y });
+                if n % 2 == 0 {
+                    let _ = tx.send(rdma_display_proto::InputEvent::Btn {
+                        button: 0, // Left
+                        down: true,
+                    });
+                    let _ = tx.send(rdma_display_proto::InputEvent::Btn {
+                        button: 0,
+                        down: false,
+                    });
+                }
+                n += 1;
+                eprintln!("[server] input-test #{n}: key 'a' + mouse abs ({x},{y})");
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        })
+        .context("spawn input-test")?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_capture(
     rdma: Option<(&ibverbs::Context, &ibverbs::ProtectionDomain)>,
@@ -372,31 +462,18 @@ fn run_capture(
     if source_name == "drm" && materialize != "egl" && codec != rdma_display_codec::Codec::Lossy {
         bail!("--source drm requires --materialize egl (KMS capture is dmabuf-only)");
     }
-    // audio side-channel: capture starts with the server (video flows even
-    // if no client ever connects the audio stream; the mailbox just
-    // overwrites — realtime drop-oldest, zero backpressure). Capture is
-    // best-effort: a missing pipewire/pulse (e.g. running as root without
-    // `sudo -E`) warns and leaves audio off rather than blocking video.
-    let audio_mbox = if audio {
-        match rdma_display_audio::capture::start_capture(audio_device) {
-            Ok(a) => {
-                if a.mailbox.wait_first(std::time::Duration::from_secs(3)) {
-                    eprintln!("[preflight] audio capture ok");
-                } else {
-                    eprintln!("[preflight] audio: no packet within 3 s (continuing)");
-                }
-                Some(a)
-            }
-            Err(e) => {
-                eprintln!(
-                    "[audio] capture unavailable ({e:#}); streaming video without audio \
-                     (pass --no-audio to silence this)"
-                );
-                None
-            }
+    // audio side-channel: capture is per-session, except the setuid helper
+    // path (sudo), which is kept warm across sessions because restarting it
+    // costs a process spawn + pulse reopen. The in-process path is stopped
+    // while idle. Capture is best-effort: a missing pipewire/pulse warns and
+    // leaves audio off rather than blocking video.
+    let mut audio_capture = match start_audio(audio, audio_device) {
+        Some(a) if a.is_helper() => Some(a), // keep the helper warm
+        Some(mut a) => {
+            a.stop(); // in-process: start again on connect
+            None
         }
-    } else {
-        None
+        None => None,
     };
     let audio_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -449,76 +526,38 @@ fn run_capture(
     };
     eprintln!("[server] capture materializer: {}", mat.name());
 
-    // input sink: explicit --input wins, else paired default
+    // input: explicit --input wins, else paired default. The capture source
+    // and input sink are started per session (on control connect) and stopped
+    // on disconnect; the capture channel is long-lived so the server always
+    // holds a sender and the receiver never disconnects between sessions.
     let screen = ScreenSize::new();
-    let (input_tx, input_rx) = mpsc::channel::<rdma_display_proto::InputEvent>();
     // host-game rumble on the virtual pad rides this hub to the current
     // session's control stream (installed per-accept by the RDMA layer)
     let rumble_hub = rdma_display_proto::gamepad::RumbleHub::new();
-    let sink: Box<dyn InputSink> = match input_name {
-        "qemu" => Box::new(QemuDbusInput::new(dbus_socket.clone(), console)),
-        "uinput" => Box::new(rdma_display_capture::UinputSink),
-        other => bail!("input sink {other:?} not implemented (qemu|uinput)"),
-    };
-    let _input_handle = InputSink::spawn(sink, input_rx, screen.clone(), rumble_hub.clone())?;
-    eprintln!("[server] input sink: {input_name}");
-
     let (tx, rx) = mpsc::channel();
-    let source: Box<dyn CaptureSource> = match source_name {
-        "qemu" => Box::new(QemuDbusSource::new(dbus_socket.clone(), console)),
-        "drm" => Box::new(DrmKmsSource::with_sync(drm_card.clone(), capture_sync)),
-        other => bail!("source {other:?} not implemented (qemu|drm)"),
+    // Fallback: if preflight could not read the geometry (rare), keep a source
+    // running so the first frame can size the slots on connect; otherwise the
+    // source is started lazily per session.
+    let eager_source: Option<rdma_display_capture::Running> = if geometry.is_none() {
+        eprintln!("[server] no preflight geometry; capturing eagerly to learn it");
+        let source: Box<dyn CaptureSource> = match source_name {
+            "qemu" => Box::new(QemuDbusSource::new(dbus_socket.clone(), console)),
+            "drm" => Box::new(DrmKmsSource::with_sync(drm_card.clone(), capture_sync)),
+            other => bail!("source {other:?} not implemented (qemu|drm)"),
+        };
+        Some(CaptureSource::spawn(source, tx.clone())?)
+    } else {
+        None
     };
-    let _source_handle = CaptureSource::spawn(source, tx)?;
-    eprintln!("[server] capture running; listening on {listen}");
-
-    // --input-test: synthetic injector in the BACKGROUND so a client can
-    // still connect and watch its own display while the guest types 'a's
-    // and the synthetic mouse sweeps/clicks.
-    if input_test {
-        let injector_tx = input_tx.clone();
-        std::thread::Builder::new()
-            .name("input-test".into())
-            .spawn(move || {
-                eprintln!("[server] --input-test: injecting synthetic input");
-                let mut n = 0u32;
-                loop {
-                    // key 'a' (qnum 0x1e) press+release
-                    let _ = injector_tx.send(rdma_display_proto::InputEvent::Key {
-                        code: 0x1e,
-                        down: true,
-                    });
-                    let _ = injector_tx.send(rdma_display_proto::InputEvent::Key {
-                        code: 0x1e,
-                        down: false,
-                    });
-                    // mouse: absolute sweep + click (console dims fallback 1080p)
-                    let (w, h) = (1920u32, 1080u32);
-                    let x = w / 2 + (n % 40) as u32 * 8;
-                    let y = h / 2 + (n % 20) as u32 * 10;
-                    let _ = injector_tx.send(rdma_display_proto::InputEvent::Abs { x, y });
-                    if n % 2 == 0 {
-                        let _ = injector_tx.send(rdma_display_proto::InputEvent::Btn {
-                            button: 0, // Left
-                            down: true,
-                        });
-                        let _ = injector_tx.send(rdma_display_proto::InputEvent::Btn {
-                            button: 0,
-                            down: false,
-                        });
-                    }
-                    n += 1;
-                    eprintln!("[server] input-test #{n}: key 'a' + mouse abs ({x},{y})");
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-                }
-            })
-            .context("spawn input-test")?;
-    }
+    eprintln!("[server] listening on {listen} (pipeline starts on connect)");
 
     let listener = TcpListener::bind(listen)?;
     listener.set_nonblocking(true)?;
 
     let mut session: Option<rdma_display_rdma::ServerLink> = None;
+    // per-session workers (capture source, input sink, audio); stopped when
+    // the session ends so an idle server holds none of them
+    let mut workers: Option<SessionWorkers> = None;
     let mut pending_meta: Option<DisplayMeta> = None;
     // fps cap: `--fps 0` = uncapped (consumer-paced via slot credits).
     // Otherwise it is only a safety ceiling — the real pacing is the client's
@@ -578,9 +617,36 @@ fn run_capture(
             if gone {
                 eprintln!("[server] client disconnected");
                 session = None;
+            }
+        }
+
+        // a session that ended (hangup, send failure, Disabled) stops its
+        // per-session workers and frees the geometry-sized GPU resources, so
+        // an idle server holds none of the heavy pipeline
+        if session.is_none() {
+            if let Some(w) = workers.take() {
+                w.stop();
+                mat.release();
+                fc.teardown();
+                // stop in-process audio while idle; keep the helper warm
+                if let Some(a) = audio_capture.take() {
+                    if a.is_helper() {
+                        audio_capture = Some(a);
+                    } else {
+                        let mut a = a;
+                        a.stop();
+                    }
+                }
+                session_nonce.store(0, std::sync::atomic::Ordering::SeqCst);
+                pending_scanout = None;
+                have_frame = false;
+                frame_dirty = false;
+                session_meta = None;
                 pipelined = false;
                 issued.clear();
-                mat.drop_frames();
+                send_pickup = None;
+                send_prep = None;
+                eprintln!("[server] session ended; pipeline idle");
             }
         }
 
@@ -668,7 +734,7 @@ fn run_capture(
             if !tag_ok {
                 eprintln!("[server] connection with no routing tag dropped ({addr})");
             } else if tag[0] == rdma_display_audio::wire::TAG_AUDIO {
-                match audio_mbox.as_ref() {
+                match audio_capture.as_ref() {
                     Some(mbox) => {
                         if audio_busy
                             .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
@@ -699,10 +765,17 @@ fn run_capture(
                 // input has its own connection + thread, independent of the
                 // video/control path; the nonce binds it to the live session
                 let nonce_cell = session_nonce.clone();
-                let input_tx = input_tx.clone();
-                let _ = std::thread::Builder::new()
-                    .name("input-reader".into())
-                    .spawn(move || serve_input(stream, nonce_cell, input_tx, addr));
+                match workers.as_ref() {
+                    Some(w) => {
+                        let input_tx = w.input_tx.clone();
+                        let _ = std::thread::Builder::new()
+                            .name("input-reader".into())
+                            .spawn(move || serve_input(stream, nonce_cell, input_tx, addr));
+                    }
+                    None => eprintln!(
+                        "[input] input connection with no active session: dropped ({addr})"
+                    ),
+                }
             } else if tag[0] == rdma_display_proto::TAG_VIDEO {
                 // client's TCP video socket (negotiated transport == TCP)
                 match session.as_mut() {
@@ -717,8 +790,42 @@ fn run_capture(
                     }
                 }
             } else if session.is_none() {
-                if let Some(meta) = pending_meta.clone() {
+                if let Some(meta) = geometry.clone().or_else(|| pending_meta.clone()) {
                     eprintln!("client connected: {}", stream.peer_addr()?);
+                    // start the per-session pipeline (source, input, audio)
+                    let (input_tx, input_rx) = mpsc::channel::<rdma_display_proto::InputEvent>();
+                    let sink: Box<dyn InputSink> = match input_name {
+                        "qemu" => Box::new(QemuDbusInput::new(dbus_socket.clone(), console)),
+                        "uinput" => Box::new(rdma_display_capture::UinputSink),
+                        other => bail!("input sink {other:?} not implemented (qemu|uinput)"),
+                    };
+                    let input =
+                        InputSink::spawn(sink, input_rx, screen.clone(), rumble_hub.clone())?;
+                    eprintln!("[server] input sink: {input_name}");
+                    let source = if eager_source.is_some() {
+                        None
+                    } else {
+                        let source: Box<dyn CaptureSource> = match source_name {
+                            "qemu" => Box::new(QemuDbusSource::new(dbus_socket.clone(), console)),
+                            "drm" => {
+                                Box::new(DrmKmsSource::with_sync(drm_card.clone(), capture_sync))
+                            }
+                            other => bail!("source {other:?} not implemented (qemu|drm)"),
+                        };
+                        Some(CaptureSource::spawn(source, tx.clone())?)
+                    };
+                    eprintln!("[server] capture running");
+                    if input_test {
+                        spawn_input_test(input_tx.clone())?;
+                    }
+                    if audio_capture.is_none() {
+                        audio_capture = start_audio(audio, audio_device);
+                    }
+                    workers = Some(SessionWorkers {
+                        source,
+                        input,
+                        input_tx: input_tx.clone(),
+                    });
                     let nonce = rdma_display_rdma::random_nonce();
                     session_nonce.store(nonce, std::sync::atomic::Ordering::SeqCst);
                     let geom = rdma_display_codec::Geometry::new(
@@ -1156,6 +1263,18 @@ impl FrameCodec {
                 .unwrap_or(0),
             enc_frames: 0,
         }
+    }
+
+    /// Drop per-session encoder state so an idle server holds no codec
+    /// buffers; the next session reconfigures.
+    fn teardown(&mut self) {
+        self.gpu = None;
+        self.enc = None;
+        self.geom = None;
+        self.first = true;
+        self.scanout = false;
+        self.frame_bytes = 0;
+        self.buf.clear();
     }
 
     fn configure(

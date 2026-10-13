@@ -1178,6 +1178,33 @@ impl crate::FrameMaterializer for EglMaterializer {
         }
     }
 
+    fn release(&mut self) {
+        // make sure our (shared) context is current before deleting objects
+        let _ = self.activate();
+        self.drop_frames();
+        // staging PBOs: StageSlots::drop deletes them
+        self.stage = None;
+        self.stage_work.clear();
+        unsafe {
+            if let Some((img, tex)) = self.img.take() {
+                (self.gl.bind_texture)(GL_TEXTURE_EXTERNAL_OES, 0);
+                (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
+                (self.gl.delete_textures)(1, &[tex] as *const u32);
+                (self.egl.destroy_image)(self.dpy, img);
+            }
+            if self.fbo != 0 {
+                (self.gl.delete_framebuffers)(1, &[self.fbo] as *const u32);
+                self.fbo = 0;
+            }
+            if self.linear_tex != 0 {
+                (self.gl.delete_textures)(1, &[self.linear_tex] as *const u32);
+                self.linear_tex = 0;
+            }
+        }
+        self.fmt = None;
+        self.dirty = false;
+    }
+
     fn handle_event(&mut self, ev: CaptureEvent) -> Result<bool> {
         match ev {
             CaptureEvent::DmabufFrame(..) => {
