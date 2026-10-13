@@ -354,8 +354,8 @@ fn testcard_fill(bytes: &mut [u8], frame: u64) {
 // ---------------------------------------------------------------------------
 
 /// Per-session workers: the capture source and input sink, started on control
-/// connect and stopped when the session ends. Audio is managed separately
-/// because the helper path stays warm across sessions.
+/// connect and stopped when the session ends. Audio is managed separately but
+/// follows the same lifecycle.
 struct SessionWorkers {
     /// None when a fallback eager source (preflight found no geometry) is
     /// already running and owned by the server.
@@ -374,8 +374,8 @@ impl SessionWorkers {
     }
 }
 
-/// Best-effort audio capture start + first-packet probe. Used at startup (as
-/// preflight) and per session (in-process path).
+/// Best-effort audio capture start. Used per session (and by the startup
+/// probe). Returns None when audio is disabled or unavailable.
 fn start_audio(
     audio: bool,
     dev: Option<&str>,
@@ -384,14 +384,7 @@ fn start_audio(
         return None;
     }
     match rdma_display_audio::capture::start_capture(dev) {
-        Ok(a) => {
-            if a.mailbox.wait_first(std::time::Duration::from_secs(3)) {
-                eprintln!("[preflight] audio capture ok");
-            } else {
-                eprintln!("[preflight] audio: no packet within 3 s (continuing)");
-            }
-            Some(a)
-        }
+        Ok(a) => Some(a),
         Err(e) => {
             eprintln!(
                 "[audio] capture unavailable ({e:#}); streaming video without audio \
@@ -546,19 +539,19 @@ fn run_capture(
     if idle_metrics > 0 {
         spawn_resource_metrics(idle_metrics, session_active.clone());
     }
-    // audio side-channel: capture is per-session, except the setuid helper
-    // path (sudo), which is kept warm across sessions because restarting it
-    // costs a process spawn + pulse reopen. The in-process path is stopped
-    // while idle. Capture is best-effort: a missing pipewire/pulse warns and
-    // leaves audio off rather than blocking video.
-    let mut audio_capture = match start_audio(audio, audio_device) {
-        Some(a) if a.is_helper() => Some(a), // keep the helper warm
-        Some(mut a) => {
-            a.stop(); // in-process: start again on connect
-            None
+    // audio side-channel: per-session. At startup a one-shot probe (start +
+    // first packet) validates the setup, then stops; capture is (re)started on
+    // connect and stopped on disconnect, so nothing runs while idle.
+    // Best-effort: a missing pipewire/pulse warns rather than blocking video.
+    if let Some(mut a) = start_audio(audio, audio_device) {
+        if a.mailbox.wait_first(std::time::Duration::from_secs(3)) {
+            eprintln!("[preflight] audio capture ok");
+        } else {
+            eprintln!("[preflight] audio: no packet within 3 s (continuing)");
         }
-        None => None,
-    };
+        a.stop(); // preflight probe only
+    }
+    let mut audio_capture: Option<rdma_display_audio::capture::AudioCapture> = None;
     let audio_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // One EGL context shared by the materializer and the lossless encoder:
@@ -715,14 +708,9 @@ fn run_capture(
                 w.stop();
                 mat.release();
                 fc.teardown();
-                // stop in-process audio while idle; keep the helper warm
-                if let Some(a) = audio_capture.take() {
-                    if a.is_helper() {
-                        audio_capture = Some(a);
-                    } else {
-                        let mut a = a;
-                        a.stop();
-                    }
+                // audio is per-session too: stop it (and the helper) while idle
+                if let Some(mut a) = audio_capture.take() {
+                    a.stop();
                 }
                 session_nonce.store(0, std::sync::atomic::Ordering::SeqCst);
                 pending_scanout = None;

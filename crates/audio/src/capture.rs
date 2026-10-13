@@ -111,20 +111,13 @@ impl Mailbox {
 pub struct AudioCapture {
     pub mailbox: Mailbox,
     handle: Running,
-    /// true when capture runs through the setuid helper child (the sudo case):
-    /// restarting it costs a process spawn + pulse reopen, so the server keeps
-    /// it warm across sessions; the in-process path is stopped while idle.
-    helper: bool,
 }
 
 impl AudioCapture {
-    /// Stop capture and join the worker. Idempotent.
+    /// Stop capture and join the worker (and kill the setuid helper child on
+    /// the helper path). Idempotent.
     pub fn stop(&mut self) {
         self.handle.stop();
-    }
-
-    pub fn is_helper(&self) -> bool {
-        self.helper
     }
 }
 
@@ -165,7 +158,6 @@ pub fn start_capture(dev: Option<&str>) -> Result<AudioCapture> {
     let pulse = Pulse::dlopen()?;
     let stop = Stop::new();
     let worker_stop = stop.clone();
-    let helper_path = helper.is_some();
     let join = match helper {
         None => {
             let m = mbox.clone();
@@ -186,7 +178,6 @@ pub fn start_capture(dev: Option<&str>) -> Result<AudioCapture> {
     Ok(AudioCapture {
         mailbox: mbox,
         handle: Running::new(stop, vec![join]),
-        helper: helper_path,
     })
 }
 
