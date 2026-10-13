@@ -635,6 +635,8 @@ fn run_capture(
     // when the current session's control connection was accepted, for
     // measuring connect -> first-frame latency
     let mut session_connected_at: Option<std::time::Instant> = None;
+    // one-shot: log when the first captured scanout arrives after connect
+    let mut first_scanout_logged = false;
     // per-session workers (capture source, input sink, audio); stopped when
     // the session ends so an idle server holds none of them
     let mut workers: Option<SessionWorkers> = None;
@@ -722,6 +724,7 @@ fn run_capture(
                 send_pickup = None;
                 send_prep = None;
                 session_connected_at = None;
+                first_scanout_logged = false;
                 eprintln!("[server] session ended; pipeline idle");
             }
         }
@@ -794,6 +797,18 @@ fn run_capture(
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => bail!("capture source ended"),
+            }
+        }
+
+        // diagnostic: when the first captured scanout lands after a connect,
+        // attribute the connect -> first-frame latency
+        if session.is_some() && !first_scanout_logged && pending_scanout.is_some() {
+            first_scanout_logged = true;
+            if let Some(t) = session_connected_at {
+                eprintln!(
+                    "[session] first scanout {} ms after connect",
+                    t.elapsed().as_millis()
+                );
             }
         }
 

@@ -131,6 +131,7 @@ fn main() -> Result<()> {
         .to_socket_addrs()?
         .next()
         .with_context(|| format!("bad --server {server:?}"))?;
+    let t0 = Instant::now();
     let stream = TcpStream::connect(addr).with_context(|| format!("connect {addr}"))?;
     // control channel must not batch, and it must identify itself with the
     // routing tag before the RDMA handshake
@@ -140,7 +141,7 @@ fn main() -> Result<()> {
         (&stream).write_all(&[rdma_display_proto::TAG_CONTROL])?;
         (&stream).flush()?;
     }
-    eprintln!("connected to {server}");
+    eprintln!("connected to {server} (t={} ms)", t0.elapsed().as_millis());
 
     // video transport: auto prefers RDMA and falls back to TCP (matching the
     // server); with TCP there is no RDMA device to open at all
@@ -186,6 +187,7 @@ fn main() -> Result<()> {
         link.meta.frame_bytes,
         slots,
     );
+    eprintln!("[client] handshake done t={} ms", t0.elapsed().as_millis());
 
     // Wayland presentation: the EGL upload backend — the mirror of the
     // server's copy path. Needs a CPU view of the slots (host memory):
@@ -220,6 +222,7 @@ fn main() -> Result<()> {
         }
         other => bail!("--output must be none|egl, got {other:?}"),
     };
+    eprintln!("[client] presenter ready t={} ms", t0.elapsed().as_millis());
 
     // GPU lossless decode: when presenting through eglwin's GL context and the
     // session uses the lossless codec, decode the tiles straight into a texture
@@ -285,6 +288,7 @@ fn main() -> Result<()> {
     // (all-GPU) rather than the CPU download+upload path
     let mut lossy_gpu = false;
     let mut frames: u64 = 0;
+    let mut first_frame_logged = false;
     let mut last_seq = 0u64;
     let mut last_report = Instant::now();
     let mut dumped = false;
@@ -368,6 +372,13 @@ fn main() -> Result<()> {
                 }
             }
             if let Some((seq, slot, t3)) = newest {
+                if !first_frame_logged {
+                    first_frame_logged = true;
+                    eprintln!(
+                        "[client] first frame t={} ms (seq {seq})",
+                        t0.elapsed().as_millis()
+                    );
+                }
                 // refresh the overlay raster at the metrics cadence only;
                 // every presented frame still draws the last one (no flicker)
                 let overlay = match metrics.as_mut() {
