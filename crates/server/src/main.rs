@@ -1029,6 +1029,7 @@ fn run_capture(
         // oldest issued frame — its ~2.8 ms RDMA transfer overlaps the GPU
         // work of the frame just issued.
         if frame_dirty && session.is_some() && gate_open {
+            let t_block = std::time::Instant::now();
             // Pickup time: when the sender decided to send the frame. The
             // fps gate and event-queue wait before this point are `queue`
             // time; a wait for a staging slot after it is `slot` time.
@@ -1155,6 +1156,7 @@ fn run_capture(
                 }
             }
             if frame_dirty {
+            let t_before_tx = std::time::Instant::now();
             if pipelined {
                 if let Some(slot) = link.try_claim_slot() {
                     // slot claimed: pickup -> here is the slot-credit wait
@@ -1215,6 +1217,11 @@ fn run_capture(
                         last_send = Some(std::time::Instant::now());
                         eprintln!("[server] frame {} sent", seq);
                         if seq == 0 {
+                            eprintln!(
+                                "[session] first frame block: materialize {} ms, encode+write {} ms",
+                                t_before_tx.duration_since(t_block).as_millis(),
+                                t_before_tx.elapsed().as_millis()
+                            );
                             if let Some(t) = session_connected_at {
                                 eprintln!(
                                     "[session] first frame {} ms after connect",
