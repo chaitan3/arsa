@@ -44,7 +44,7 @@ use std::sync::mpsc::Sender;
 
 use anyhow::{bail, Context, Result};
 
-use crate::{CaptureEvent, CaptureSource, CaptureSync, DmabufScanout, FrameFormat};
+use crate::{CaptureEvent, CaptureSource, CaptureSync, DmabufScanout, FrameFormat, Running, Stop};
 
 // --- drm uapi (numbers + layouts from /usr/include/drm/drm.h, drm_mode.h) ---
 
@@ -387,17 +387,19 @@ impl CaptureSource for DrmKmsSource {
         "drm-kms"
     }
 
-    fn spawn(self: Box<Self>, tx: Sender<CaptureEvent>) -> Result<()> {
+    fn spawn(self: Box<Self>, tx: Sender<CaptureEvent>) -> Result<Running> {
         let sync = self.sync;
-        std::thread::Builder::new()
+        let stop = Stop::new();
+        let worker_stop = stop.clone();
+        let join = std::thread::Builder::new()
             .name("capture-drm".into())
             .spawn(move || {
-                if let Err(e) = run(self.card.as_deref(), sync, tx) {
+                if let Err(e) = run(self.card.as_deref(), sync, tx, worker_stop) {
                     eprintln!("[capture] source failed: {e:#}");
                 }
             })
             .context("spawn capture thread")?;
-        Ok(())
+        Ok(Running::new(stop, vec![join]))
     }
 }
 
@@ -1347,7 +1349,12 @@ fn emit_scanout(fd: &OwnedFd, id: u32, t0: u64, tx: &Sender<CaptureEvent>) -> bo
     }
 }
 
-fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> Result<()> {
+fn run(
+    card_pref: Option<&str>,
+    sync: CaptureSync,
+    tx: Sender<CaptureEvent>,
+    stop: Stop,
+) -> Result<()> {
     eprintln!(
         "[capture-drm] opening card {}",
         card_pref.unwrap_or("(probe /dev/dri/card0..8)")
@@ -1385,10 +1392,15 @@ fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> 
     // log CRTC_GET_SEQUENCE failures once (otherwise silently frozen -> 0)
     let mut vblank_err_logged = false;
     loop {
+        if stop.stopped() {
+            return Ok(());
+        }
         if card.is_none() {
             if let Some(t) = last_open_attempt {
                 if t.elapsed() < std::time::Duration::from_secs(1) {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if crate::sleep_or_stop(&stop, std::time::Duration::from_millis(100)) {
+                        return Ok(());
+                    }
                     continue;
                 }
             }
@@ -1541,7 +1553,9 @@ fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> 
                     eprintln!("[capture-drm] GETCRTC: {e}; rescanning");
                     card = None;
                     last_open_attempt = Some(std::time::Instant::now());
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if crate::sleep_or_stop(&stop, std::time::Duration::from_secs(1)) {
+                        return Ok(());
+                    }
                     continue;
                 }
             },
@@ -1551,7 +1565,9 @@ fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> 
                     eprintln!("[capture-drm] GETPLANE: {e}; rescanning");
                     card = None;
                     last_open_attempt = Some(std::time::Instant::now());
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if crate::sleep_or_stop(&stop, std::time::Duration::from_secs(1)) {
+                        return Ok(());
+                    }
                     continue;
                 }
             },
@@ -1742,7 +1758,9 @@ fn run(card_pref: Option<&str>, sync: CaptureSync, tx: Sender<CaptureEvent>) -> 
         } else {
             2
         };
-        std::thread::sleep(std::time::Duration::from_millis(poll_ms));
+        if crate::sleep_or_stop(&stop, std::time::Duration::from_millis(poll_ms)) {
+            return Ok(());
+        }
     }
 }
 

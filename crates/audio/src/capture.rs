@@ -32,7 +32,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::os::unix::io::FromRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::sync::{Arc, Mutex};
@@ -42,6 +42,8 @@ use anyhow::{bail, Context, Result};
 
 use super::pulse::{Pulse, SampleSpec};
 use super::wire::{self, AudioPacket};
+
+use rdma_display_lifecycle::{sleep_or_stop, Running, Stop};
 
 /// Bounded drop-oldest mailbox: realtime valve. While nobody consumes (no
 /// client connected, or a stalled client) newer packets eventually overwrite
@@ -103,6 +105,21 @@ impl Mailbox {
     }
 }
 
+/// A running audio capture. Holds the packet mailbox and the worker handle;
+/// `stop` (or dropping) ends capture — including killing the setuid helper
+/// child when the helper path is in use.
+pub struct AudioCapture {
+    pub mailbox: Mailbox,
+    handle: Running,
+}
+
+impl AudioCapture {
+    /// Stop capture and join the worker. Idempotent.
+    pub fn stop(&mut self) {
+        self.handle.stop();
+    }
+}
+
 /// Start the capture supervisor. Fails fast on an obviously broken setup
 /// (no XDG_RUNTIME_DIR as root, missing libpulse); a vanished device is
 /// tolerated in the background (log + reopen loop).
@@ -110,7 +127,7 @@ impl Mailbox {
 /// `dev`: a SOURCE name — a sink's monitor is "<sink-name>.monitor"
 /// ("my-sink.monitor"); "@DEFAULT_MONITOR@" is the PA ≥15 alias for the
 /// default sink's mix (pipewire-pulse honors it).
-pub fn start_capture(dev: Option<&str>) -> Result<Mailbox> {
+pub fn start_capture(dev: Option<&str>) -> Result<AudioCapture> {
     let dev = dev.unwrap_or("@DEFAULT_MONITOR@").to_string();
     let mbox = Mailbox::new();
 
@@ -138,33 +155,41 @@ pub fn start_capture(dev: Option<&str>) -> Result<Mailbox> {
     };
 
     let pulse = Pulse::dlopen()?;
-    match helper {
+    let stop = Stop::new();
+    let worker_stop = stop.clone();
+    let join = match helper {
         None => {
             let m = mbox.clone();
             std::thread::Builder::new()
                 .name("audio-capture".into())
-                .spawn(move || in_process_loop(pulse, dev, m))
-                .context("spawn audio-capture thread")?;
+                .spawn(move || in_process_loop(pulse, dev, m, worker_stop))
+                .context("spawn audio-capture thread")?
         }
         Some((uid, gid)) => {
             let exe = std::env::current_exe().context("current_exe (for the audio helper)")?;
             let m = mbox.clone();
             std::thread::Builder::new()
                 .name("audio-capture-sup".into())
-                .spawn(move || helper_loop(pulse, exe, dev, uid, gid, m))
-                .context("spawn audio-capture supervisor")?;
+                .spawn(move || helper_loop(pulse, exe, dev, uid, gid, m, worker_stop))
+                .context("spawn audio-capture supervisor")?
         }
-    }
-    Ok(mbox)
+    };
+    Ok(AudioCapture {
+        mailbox: mbox,
+        handle: Running::new(stop, vec![join]),
+    })
 }
 
 /// Normal case: this process's uid matches the session owner.
-fn in_process_loop(pulse: Pulse, dev: String, mbox: Mailbox) -> ! {
+fn in_process_loop(pulse: Pulse, dev: String, mbox: Mailbox, stop: Stop) {
     let mut seq: u32 = 0;
     let mut drops: u64 = 0;
     let mut fed: u64 = 0;
     let mut last_report = std::time::Instant::now();
     loop {
+        if stop.stopped() {
+            return;
+        }
         match open_capture_stream(&pulse, &dev) {
             Ok(stream) => {
                 eprintln!(
@@ -185,25 +210,34 @@ fn in_process_loop(pulse: Pulse, dev: String, mbox: Mailbox) -> ! {
                         eprintln!("[audio] capture feed alive: {fed} packets so far");
                         last_report = std::time::Instant::now();
                     }
-                }, &mut seq) {
+                }, &mut seq, &stop) {
                     Ok(()) => eprintln!("[audio] capture stream ended; reopening in 2 s"),
                     Err(e) => eprintln!("[audio] capture read failed: {e:#}; reopening in 2 s"),
                 }
             }
             Err(e) => eprintln!("[audio] capture open failed ({dev:?}): {e:#}; retrying in 2 s"),
         }
-        std::thread::sleep(Duration::from_secs(2));
+        if stop.stopped() {
+            return;
+        }
+        if sleep_or_stop(&stop, Duration::from_secs(2)) {
+            return;
+        }
     }
 }
 
 /// Read wire packets from a pulse record stream and hand each (freshly
-/// stamped) to `sink` until the stream dies.
+/// stamped) to `sink` until the stream dies or `stop` is set.
 fn capture_into(
     stream: &super::pulse::Simple,
     mut sink: impl FnMut(AudioPacket),
     seq: &mut u32,
+    stop: &Stop,
 ) -> Result<()> {
     loop {
+        if stop.stopped() {
+            return Ok(());
+        }
         let mut buf = vec![0u8; wire::PACKET_BYTES];
         stream.read_exact(&mut buf)?;
         sink(AudioPacket {
@@ -226,8 +260,12 @@ fn helper_loop(
     uid: u32,
     gid: u32,
     mbox: Mailbox,
-) -> ! {
+    stop: Stop,
+) {
     loop {
+        if stop.stopped() {
+            return;
+        }
         match spawn_helper(&exe, &dev, uid, gid) {
             Ok((read_fd, pid)) => {
                 let mut f = unsafe { File::from_raw_fd(read_fd) };
@@ -238,6 +276,20 @@ fn helper_loop(
                 let mut last_report = std::time::Instant::now();
                 let mut buf = vec![0u8; wire::PACKET_BYTES];
                 loop {
+                    if stop.stopped() {
+                        break;
+                    }
+                    // poll before the blocking read so a silent helper does not
+                    // delay shutdown
+                    let mut p = libc::pollfd {
+                        fd: f.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let n = unsafe { libc::poll(&mut p, 1, 50) };
+                    if n == 0 {
+                        continue;
+                    }
                     match f.read_exact(&mut buf) {
                         Ok(()) => {
                             fed += 1;
@@ -268,12 +320,21 @@ fn helper_loop(
                 drop(f);
                 unsafe {
                     let mut status = 0;
+                    if stop.stopped() {
+                        // tearing down: don't leave the helper capturing
+                        libc::kill(pid, libc::SIGKILL);
+                    }
                     libc::waitpid(pid, &mut status, 0);
+                }
+                if stop.stopped() {
+                    return;
                 }
             }
             Err(e) => eprintln!("[audio] helper spawn failed: {e:#}; retrying in 2 s"),
         }
-        std::thread::sleep(Duration::from_secs(2));
+        if sleep_or_stop(&stop, Duration::from_secs(2)) {
+            return;
+        }
     }
 }
 
@@ -343,13 +404,16 @@ pub fn run_helper(dev: &str) -> Result<()> {
     let mut out = std::mem::ManuallyDrop::new(unsafe {
         File::from_raw_fd(1) // parent's pipe, unbuffered
     });
+    // the helper is torn down by the parent (SIGKILL on stop, PDEATHSIG on
+    // parent death); it never sets its own stop token
+    let stop = Stop::new();
     loop {
         match open_capture_stream(&pulse, dev) {
             Ok(stream) => {
                 eprintln!("[audio-helper] capturing {dev:?} (f32le {} Hz, {}ch)", wire::RATE, wire::CHANNELS);
                 match capture_into(&stream, |pkt| {
                     let _ = out.write_all(&pkt.data);
-                }, &mut 0) {
+                }, &mut 0, &stop) {
                     Ok(()) => {}
                     Err(e) => eprintln!("[audio-helper] capture read failed: {e:#}"),
                 }

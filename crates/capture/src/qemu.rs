@@ -10,7 +10,7 @@ use std::sync::mpsc::Sender;
 
 use anyhow::{Context, Result};
 
-use crate::{CaptureEvent, CaptureSource, DmabufScanout, DirtyRect, FrameFormat};
+use crate::{CaptureEvent, CaptureSource, DmabufScanout, DirtyRect, FrameFormat, Running, Stop};
 
 struct Listener {
     tx: Sender<CaptureEvent>,
@@ -167,7 +167,7 @@ impl QemuDbusSource {
         Self { dbus_socket, console }
     }
 
-    async fn run(self, tx: Sender<CaptureEvent>) -> Result<()> {
+    async fn run(self, tx: Sender<CaptureEvent>, stop: Stop) -> Result<()> {
         let console = open_console(&self.dbus_socket, self.console).await?;
 
         eprintln!(
@@ -183,10 +183,16 @@ impl QemuDbusSource {
             .context("RegisterListener")?;
         eprintln!("[capture] listener registered; streaming events");
 
-        // keep the console (and its D-Bus connection) alive forever —
-        // dropping it tears down the listener
-        std::future::pending::<()>().await;
-        unreachable!()
+        // Keep the console (and its D-Bus connection) alive while the events
+        // flow; poll the stop token so the source can be torn down. Dropping
+        // `console` here unregisters the listener. (The D-Bus connection is
+        // still leaked by `open_console`; a per-session connection leak is a
+        // known follow-up.)
+        while !stop.stopped() {
+            async_std::task::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        eprintln!("[capture] qemu source stopping");
+        Ok(())
     }
 }
 
@@ -195,15 +201,17 @@ impl CaptureSource for QemuDbusSource {
         "qemu-dbus"
     }
 
-    fn spawn(self: Box<Self>, tx: Sender<CaptureEvent>) -> Result<()> {
-        std::thread::Builder::new()
+    fn spawn(self: Box<Self>, tx: Sender<CaptureEvent>) -> Result<Running> {
+        let stop = Stop::new();
+        let worker_stop = stop.clone();
+        let join = std::thread::Builder::new()
             .name("capture-qemu".into())
             .spawn(move || {
-                if let Err(e) = async_std::task::block_on(self.run(tx)) {
+                if let Err(e) = async_std::task::block_on(self.run(tx, worker_stop)) {
                     eprintln!("[capture] source failed: {e:#}");
                 }
             })
             .context("spawn capture thread")?;
-        Ok(())
+        Ok(Running::new(stop, vec![join]))
     }
 }

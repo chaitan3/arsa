@@ -64,7 +64,7 @@ fn main() -> Result<()> {
     let (input_tx, input_rx) = mpsc::channel::<rdma_display_proto::InputEvent>();
     let _input_keepalive = input_tx.clone();
     if load {
-        rdma_display_capture::InputSink::spawn(
+        let _input_sink = rdma_display_capture::InputSink::spawn(
             Box::new(rdma_display_capture::QemuDbusInput::new(dbus_socket.clone(), console)),
             input_rx,
             std::sync::Arc::new(rdma_display_capture::ScreenSize::default()),
@@ -73,7 +73,7 @@ fn main() -> Result<()> {
         .context("spawn input sink")?;
     }
 
-    rdma_display_capture::CaptureSource::spawn(
+    let _source = rdma_display_capture::CaptureSource::spawn(
         Box::new(QemuDbusSource::new(dbus_socket, console)),
         tx,
     )

@@ -11,7 +11,7 @@ use std::sync::{mpsc, Arc};
 use anyhow::{Context, Result};
 use rdma_display_proto::{self as proto, InputEvent};
 
-use crate::ScreenSize;
+use crate::{Running, ScreenSize, Stop};
 
 /// Consumes `InputEvent`s until the channel closes. `screen` carries the
 /// current captured dimensions (updated by the server on every scanout);
@@ -20,12 +20,14 @@ use crate::ScreenSize;
 /// the uinput sink uses it; every other sink drops it.
 pub trait InputSink: Send {
     fn name(&self) -> &'static str;
+    /// Start the sink's worker(s). The returned [`Running`] stops and joins
+    /// them (and stops them on drop).
     fn spawn(
         self: Box<Self>,
         rx: mpsc::Receiver<InputEvent>,
         screen: Arc<ScreenSize>,
         rumble: rdma_display_proto::gamepad::RumbleHub,
-    ) -> Result<()>;
+    ) -> Result<Running>;
 }
 
 // ---------------------------------------------------------------------------
@@ -54,8 +56,10 @@ impl InputSink for QemuDbusInput {
         rx: mpsc::Receiver<InputEvent>,
         _screen: Arc<ScreenSize>,
         _rumble: rdma_display_proto::gamepad::RumbleHub,
-    ) -> Result<()> {
-        std::thread::Builder::new()
+    ) -> Result<Running> {
+        let stop = Stop::new();
+        let worker_stop = stop.clone();
+        let join = std::thread::Builder::new()
             .name("capture-input".into())
             .spawn(move || {
                 let console = match async_std::task::block_on(async {
@@ -73,7 +77,17 @@ impl InputSink for QemuDbusInput {
                 if let Ok(abs) = async_std::task::block_on(mo.is_absolute()) {
                     eprintln!("[input] guest mouse IsAbsolute={abs}");
                 }
-                while let Ok(ev) = rx.recv() {
+                loop {
+                    let ev = match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                        Ok(ev) => ev,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if worker_stop.stopped() {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
                     let r = async_std::task::block_on(async {
                         match ev {
                             InputEvent::Key { code, down } => {
@@ -121,7 +135,7 @@ impl InputSink for QemuDbusInput {
                 eprintln!("[input] control channel closed; input forwarding stopped");
             })
             .context("spawn input forwarder")?;
-        Ok(())
+        Ok(Running::new(stop, vec![join]))
     }
 }
 
@@ -416,26 +430,29 @@ impl InputSink for UinputSink {
         rx: mpsc::Receiver<InputEvent>,
         screen: Arc<ScreenSize>,
         rumble: rdma_display_proto::gamepad::RumbleHub,
-    ) -> Result<()> {
+    ) -> Result<Running> {
         // gamepad routing: a dedicated FF-capable thread polls the virtual
         // pad's uinput fd (kernel rumble requests) alongside the eventfd
         // that wakes it when gamepad events are queued
+        let stop = Stop::new();
         let (pad_tx, pad_rx) = mpsc::channel::<InputEvent>();
         let wake = eventfd_new().context("eventfd for gamepad wake")?;
         let wake_w = wake.try_clone().context("clone eventfd")?;
-        std::thread::Builder::new()
+        let gp_stop = stop.clone();
+        let gp = std::thread::Builder::new()
             .name("input-gamepad".into())
-            .spawn(move || gamepad_loop(pad_rx, rumble, wake))
+            .spawn(move || gamepad_loop(pad_rx, rumble, wake, gp_stop))
             .context("spawn gamepad thread")?;
-        std::thread::Builder::new()
+        let in_stop = stop.clone();
+        let uin = std::thread::Builder::new()
             .name("input-uinput".into())
             .spawn(move || {
-                if let Err(e) = uinput_loop(rx, screen, pad_tx, wake_w.as_raw_fd()) {
+                if let Err(e) = uinput_loop(rx, screen, pad_tx, wake_w.as_raw_fd(), in_stop) {
                     eprintln!("[input] uinput sink failed: {e:#}");
                 }
             })
             .context("spawn uinput input thread")?;
-        Ok(())
+        Ok(Running::new(stop, vec![gp, uin]))
     }
 }
 
@@ -635,6 +652,7 @@ fn gamepad_loop(
     rx: mpsc::Receiver<InputEvent>,
     rumble: rdma_display_proto::gamepad::RumbleHub,
     wake: OwnedFd,
+    stop: Stop,
 ) {
     let mut pads: std::collections::HashMap<u32, UinputDev> = std::collections::HashMap::new();
     // slot 0 eager: the pad exists as soon as the server starts, so host-side
@@ -649,6 +667,9 @@ fn gamepad_loop(
         Err(e) => eprintln!("[input] eager uinput gamepad create failed (events will retry lazily): {e:#}"),
     }
     loop {
+        if stop.stopped() {
+            return;
+        }
         // poll set: [0] = eventfd, [1..] = one entry per live pad
         let set: Vec<(u32, i32)> = pads
             .iter()
@@ -659,7 +680,7 @@ fn gamepad_loop(
         for (_, fd) in &set {
             fds.push(libc::pollfd { fd: *fd, events: libc::POLLIN, revents: 0 });
         }
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 100) };
         if n <= 0 {
             if n < 0 {
                 let e = std::io::Error::last_os_error();
@@ -867,6 +888,7 @@ fn uinput_loop(
     screen: Arc<ScreenSize>,
     pad_tx: mpsc::Sender<InputEvent>,
     pad_wake_fd: i32,
+    stop: Stop,
 ) -> Result<()> {
     let kb = uinput_keyboard().context("create uinput keyboard")?;
     eprintln!("[input] uinput keyboard created");
@@ -895,7 +917,17 @@ fn uinput_loop(
     let mut agg_sum: (i64, i64) = (0, 0);
     let mut agg_window = std::time::Instant::now();
 
-    while let Ok(ev) = rx.recv() {
+    loop {
+        let ev = match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(ev) => ev,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if stop.stopped() {
+                    break;
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         match ev {
             InputEvent::Key { code, down } => {
                 eprintln!("[input] key {code:#04x} down={down}");

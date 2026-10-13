@@ -208,40 +208,49 @@ fn bench_drm_stream(cfg: &Cfg) {
         rdma_display_capture::CaptureSync::Auto,
     ));
     let t0 = Instant::now();
-    if let Err(e) = CaptureSource::spawn(src, tx) {
-        println!("{:<22} skip: {e:#}", "drm-stream");
-        return;
-    }
+    let handle = match CaptureSource::spawn(src, tx) {
+        Ok(h) => h,
+        Err(e) => {
+            println!("{:<22} skip: {e:#}", "drm-stream");
+            return;
+        }
+    };
     match wait_first_scanout(&rx, t0) {
         Some(us) => print_single("drm-stream", us),
         None => println!("{:<22} skip: no scanout within 8 s", "drm-stream"),
     }
+    drop(handle); // stop + join the capture thread
 }
 
 fn bench_qemu_stream(cfg: &Cfg) {
     let (tx, rx) = std::sync::mpsc::channel();
     let src = Box::new(QemuDbusSource::new(cfg.dbus_socket.clone(), cfg.console));
-    if let Err(e) = CaptureSource::spawn(src, tx) {
-        println!("{:<22} skip: {e:#}", "qemu-stream");
-        return;
-    }
+    let handle = match CaptureSource::spawn(src, tx) {
+        Ok(h) => h,
+        Err(e) => {
+            println!("{:<22} skip: {e:#}", "qemu-stream");
+            return;
+        }
+    };
     match wait_any_event(&rx, Duration::from_secs(8)) {
         Some(us) => print_single("qemu-stream", us),
         None => println!("{:<22} skip: no event within 8 s", "qemu-stream"),
     }
+    drop(handle);
 }
 
 fn bench_audio(cfg: &Cfg) {
     let t = Instant::now();
     match rdma_display_audio::capture::start_capture(cfg.audio_device.as_deref()) {
-        Ok(mbox) => {
+        Ok(mut audio) => {
             print_single("audio-start", t.elapsed().as_micros());
             let t = Instant::now();
-            if mbox.wait_first(Duration::from_secs(8)) {
+            if audio.mailbox.wait_first(Duration::from_secs(8)) {
                 print_single("audio-first-packet", t.elapsed().as_micros());
             } else {
                 println!("{:<22} skip: no packet within 8 s", "audio-first-packet");
             }
+            audio.stop();
         }
         Err(e) => {
             println!("{:<22} skip: {e:#}", "audio-start");

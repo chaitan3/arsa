@@ -20,6 +20,7 @@ pub mod materializer;
 pub mod qemu;
 
 pub use materializer::FrameMaterializer;
+pub use rdma_display_lifecycle::{sleep_or_stop, Running, Stop};
 pub use egl::{run_readback_bench, EglInitPhases, EglMaterializer, ReadBenchOpts};
 pub use input::{InputSink, QemuDbusInput, UinputSink};
 pub use drm::DrmKmsSource;
@@ -130,6 +131,48 @@ pub fn fourcc_name(fourcc: u32) -> String {
 }
 
 #[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// A source that just spins until stopped — proves `Running::stop` joins.
+    struct Spinner;
+    impl CaptureSource for Spinner {
+        fn name(&self) -> &'static str {
+            "spinner"
+        }
+        fn spawn(self: Box<Self>, _tx: mpsc::Sender<CaptureEvent>) -> Result<Running> {
+            let stop = Stop::new();
+            let worker = stop.clone();
+            let join = std::thread::spawn(move || {
+                while !worker.stopped() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+            Ok(Running::new(stop, vec![join]))
+        }
+    }
+
+    #[test]
+    fn running_stop_joins_the_worker() {
+        let (tx, _rx) = mpsc::channel();
+        let mut running = Box::new(Spinner).spawn(tx).unwrap();
+        assert!(!running.is_finished());
+        running.stop();
+        assert!(running.is_finished());
+    }
+
+    #[test]
+    fn sleep_or_stop_wakes_early() {
+        let stop = Stop::new();
+        stop.stop();
+        let t = std::time::Instant::now();
+        assert!(sleep_or_stop(&stop, std::time::Duration::from_secs(10)));
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{fourcc_name, CaptureSync, DEFAULT_SETTLE_MS};
 
@@ -218,7 +261,9 @@ pub enum CaptureEvent {
 /// console injection, `--source drm` ↔ uinput into the host compositor).
 pub trait CaptureSource: Send {
     fn name(&self) -> &'static str;
-    fn spawn(self: Box<Self>, tx: std::sync::mpsc::Sender<CaptureEvent>) -> Result<()>;
+    /// Start the source. The returned [`Running`] stops and joins the worker
+    /// (and stops it on drop), so a source never outlives its handle.
+    fn spawn(self: Box<Self>, tx: std::sync::mpsc::Sender<CaptureEvent>) -> Result<Running>;
 }
 
 /// Current captured screen dimensions (for input sinks: Abs coordinates are

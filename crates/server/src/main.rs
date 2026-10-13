@@ -440,7 +440,7 @@ fn run_capture(
         "uinput" => Box::new(rdma_display_capture::UinputSink),
         other => bail!("input sink {other:?} not implemented (qemu|uinput)"),
     };
-    InputSink::spawn(sink, input_rx, screen.clone(), rumble_hub.clone())?;
+    let _input_handle = InputSink::spawn(sink, input_rx, screen.clone(), rumble_hub.clone())?;
     eprintln!("[server] input sink: {input_name}");
 
     let (tx, rx) = mpsc::channel();
@@ -449,7 +449,7 @@ fn run_capture(
         "drm" => Box::new(DrmKmsSource::with_sync(drm_card.clone(), capture_sync)),
         other => bail!("source {other:?} not implemented (qemu|drm)"),
     };
-    CaptureSource::spawn(source, tx)?;
+    let _source_handle = CaptureSource::spawn(source, tx)?;
     eprintln!("[server] capture running; listening on {listen}");
 
     // --input-test: synthetic injector in the BACKGROUND so a client can
@@ -655,7 +655,7 @@ fn run_capture(
                             .is_ok()
                         {
                             eprintln!("[audio] client stream connected ({addr})");
-                            let mbox = mbox.clone();
+                            let mbox = mbox.mailbox.clone();
                             let busy = audio_busy.clone();
                             std::thread::spawn(move || {
                                 if let Err(e) =

@@ -1841,6 +1841,7 @@ dependencies = [
  "anyhow",
  "libc",
  "libloading",
+ "rdma-display-lifecycle",
 ]
 
 [[package]]
@@ -1854,6 +1855,7 @@ dependencies = [
  "libloading",
  "qemu-display",
  "rdma-display-egl",
+ "rdma-display-lifecycle",
  "rdma-display-proto",
  "zbus",
 ]
@@ -1901,6 +1903,10 @@ dependencies = [
  "anyhow",
  "libloading",
 ]
+
+[[package]]
+name = "rdma-display-lifecycle"
+version = "0.1.0"
 
 [[package]]
 name = "rdma-display-proto"

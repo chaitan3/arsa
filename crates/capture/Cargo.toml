@@ -8,6 +8,7 @@ publish = false
 async-trait = "0.1"
 rdma-display-proto.workspace = true
 rdma-display-egl = { path = "../egl" }
+rdma-display-lifecycle = { path = "../lifecycle" }
 qemu-display.workspace = true
 zbus = { version = "5", default-features = false, features = ["async-io"] }
 async-std.workspace = true
