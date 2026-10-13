@@ -1938,6 +1938,7 @@ dependencies = [
  "rdma-display-proto",
  "rdma-display-rdma",
  "rdma-display-vkcore",
+ "serde_json",
 ]
 
 [[package]]

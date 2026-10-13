@@ -25,8 +25,6 @@
 //! stdout with exit 0 — so `lock_range()` inspects the output, not just the exit
 //! status.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-
 use anyhow::{bail, Context, Result};
 
 /// The P5 operating point measured on the reference GPU (nvidia-smi
@@ -122,53 +120,17 @@ impl GpuPower {
     }
 }
 
-/// Reset flags shared with the signal watcher. The handler itself may only do
-/// async-signal-safe work, so it records the signal; a thread does the reset.
-static WANT_RESET_SM: AtomicBool = AtomicBool::new(false);
-static WANT_RESET_MEM: AtomicBool = AtomicBool::new(false);
-static GOT_SIGNAL: AtomicI32 = AtomicI32::new(0);
-
-extern "C" fn on_signal(sig: libc::c_int) {
-    GOT_SIGNAL.store(sig, Ordering::SeqCst);
-}
-
 /// Release the clock floors on SIGINT (ctrl-c), SIGTERM or SIGQUIT. No-op when
 /// nothing was floored, so an unpinned run keeps the default signal behavior.
 pub fn install_cleanup(applied: Applied) {
     if !applied.any() {
         return;
     }
-    WANT_RESET_SM.store(applied.sm, Ordering::SeqCst);
-    WANT_RESET_MEM.store(applied.mem, Ordering::SeqCst);
-
-    // sigaction rather than signal(): some libcs reset the handler on delivery
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        let handler: extern "C" fn(libc::c_int) = on_signal;
-        sa.sa_sigaction = handler as usize;
-        sa.sa_flags = libc::SA_RESTART;
-        libc::sigemptyset(&mut sa.sa_mask);
-        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGQUIT] {
-            libc::sigaction(sig, &sa, std::ptr::null_mut());
-        }
-    }
-
-    std::thread::spawn(|| {
-        let sig = loop {
-            let s = GOT_SIGNAL.load(Ordering::SeqCst);
-            if s != 0 {
-                break s;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        };
+    // the shared watcher runs this alongside any other cleanup (display mode)
+    crate::signals::on_signal(Box::new(move |sig| {
         eprintln!("[gpu-power] quit signal ({sig}); releasing clock floors");
-        Applied {
-            sm: WANT_RESET_SM.load(Ordering::SeqCst),
-            mem: WANT_RESET_MEM.load(Ordering::SeqCst),
-        }
-        .reset();
-        std::process::exit(128 + sig);
-    });
+        applied.reset();
+    }));
 }
 
 /// The card's boost clocks, used as the ceiling so a floor never caps boost.

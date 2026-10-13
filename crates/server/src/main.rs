@@ -33,8 +33,10 @@ use rdma_display_capture::{
     InputSink, QemuDbusInput, QemuDbusSource, ScreenSize,
 };
 
+mod display;
 mod gpu_power;
 mod lossy;
+mod signals;
 
 use gpu_power::GpuPower;
 
@@ -62,6 +64,9 @@ fn main() -> Result<()> {
     let mut lossy_chroma444 = false;
     let mut transport = rdma_display_rdma::TransportPref::Auto;
     let mut gpu_power = GpuPower::Off;
+    // compositor output control for the client's resolution request
+    let mut display_control = "auto".to_string();
+    let mut display_output: Option<String> = None;
     // log idle/session RSS+CPU every N seconds (0 = off)
     let mut idle_metrics: u64 = 0;
 
@@ -128,6 +133,12 @@ fn main() -> Result<()> {
             "--no-audio" => audio = false,
             "--audio-device" => audio_device = Some(args.next().expect("--audio-device needs a value")),
             "--audio-helper" => audio_helper = true,
+            "--display-control" => {
+                display_control = args.next().expect("--display-control needs a value")
+            }
+            "--display-output" => {
+                display_output = Some(args.next().expect("--display-output needs a value"))
+            }
             "--gpu-power" => {
                 let v = args.next().expect("--gpu-power needs a value");
                 gpu_power = GpuPower::parse(&v)?;
@@ -150,6 +161,8 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
   --gpu-power off|p5|p0|max|<sm>[,<mem>]  floor the NVIDIA GPU clocks with nvidia-smi, still allowing boost above the floor (needs root; warns and continues if unavailable). p5 = the measured fast floor (sm 435 / mem 810 MHz), p0/max = floor at the card's maximum (i.e. pinned), <sm>[,<mem>] = explicit MHz floors. Default off. GeForce cards reject the memory-clock floor.\n  \
   --transport auto|rdma|tcp  video transport (default auto: RDMA/RoCE when available, else TCP). Negotiated with the client; TCP sends length-prefixed coded frames on a TAG_VIDEO connection.\n  \
   --idle-metrics N  log RSS/CPU/threads every N seconds, labelled idle or session (default off).\n  \
+  --display-control auto|hyprctl|kscreen|none  apply the client's pre-session resolution request (--native / --set-mode) to this compositor's output before capture starts, so the scanout and the session slots match (--source drm; default auto = Hyprland via hyprctl, KDE via kscreen-doctor).\n  \
+  --display-output NAME  target this compositor output for --display-control (default: the first/primary).\n  \
   --fps N (capture): pacing cap; 0 = uncapped, consumer-paced by client credits (default 0).\n  \
   --audio | --no-audio [--audio-device my-sink.monitor]  audio side-channel (default on; --no-audio disables): capture the named source's PCM through the pipewire-pulse\n  \
   compat socket (XDG_RUNTIME_DIR must point at the user's session when running under sudo; '@DEFAULT_MONITOR@' = default sink).");
@@ -204,7 +217,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
             rdma_ref, transport, &source, input.as_deref(), &dbus_socket, console, &drm_card,
             &materialize, rendernode.as_deref(), &listen, slots, fps, input_test, &readback,
             capture_sync, audio, audio_device.as_deref(), codec, lossy_budget, lossy_chroma444,
-            idle_metrics,
+            &display_control, display_output.as_deref(), idle_metrics,
         ),
         other => bail!("mode {other:?} not implemented yet"),
     }
@@ -284,7 +297,8 @@ fn run_testcard_server(
             eprintln!("[server] input connection in testcard mode: dropped");
             continue;
         }
-        eprintln!("client connected: {}", stream.peer_addr()?);
+        let peer = stream.peer_addr()?;
+        eprintln!("client connected: {peer}");
         // testcard has no console to inject into: drain input events
         let (input_tx, input_rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -292,9 +306,26 @@ fn run_testcard_server(
         });
         // no input sink in testcard mode: nothing to relay rumble to
         let rumble_hub = rdma_display_proto::gamepad::RumbleHub::new();
-        let mut link = rdma_display_rdma::ServerLink::accept(
-            Conn::new(stream),
+        // negotiate Hello + the display-mode request, then reply (testcard has
+        // a fixed 1280x800 geometry, so a request is a no-op here)
+        let (mut conn, neg, _mode) = rdma_display_rdma::handshake_server(
+            stream,
+            rdma_display_rdma::random_nonce(),
             transport,
+            rdma.is_some(),
+        )?;
+        let _ = rdma_display_rdma::send_mode_reply(
+            &mut conn,
+            &rdma_display_proto::ModeReply::ok(
+                meta.width,
+                meta.height,
+                0,
+                "testcard: fixed 1280x800",
+            ),
+        );
+        let mut link = rdma_display_rdma::ServerLink::accept_negotiated(
+            conn,
+            neg,
             rdma,
             &meta,
             slots,
@@ -304,7 +335,6 @@ fn run_testcard_server(
             input_tx,
             None,
             &rumble_hub,
-            rdma_display_rdma::random_nonce(),
         )?;
         // TCP transport: the client opens its TAG_VIDEO socket right after the
         // codec handshake; grab it before the (blocking) testcard loop starts
@@ -529,6 +559,8 @@ fn run_capture(
     codec: rdma_display_codec::Codec,
     lossy_budget: usize,
     lossy_chroma444: bool,
+    display_control: &str,
+    display_output: Option<&str>,
     idle_metrics: u64,
 ) -> Result<()> {
     if source_name == "drm" && materialize != "egl" && codec != rdma_display_codec::Codec::Lossy {
@@ -581,12 +613,47 @@ fn run_capture(
     // startup preflight: validate/probe each element once; the heavy pipeline
     // is (re)started on demand per client (Phase 2). The probed geometry lets
     // a client connect negotiate slots before the first captured frame.
-    let geometry = preflight(source_name, input_name, drm_card, dbus_socket, console, codec, gl.as_ref());
+    let mut geometry = preflight(source_name, input_name, drm_card, dbus_socket, console, codec, gl.as_ref());
     if let Some(m) = geometry.as_ref() {
         eprintln!(
             "[preflight] geometry cached: {}x{} stride {} (sizes slots on connect)",
             m.width, m.height, m.stride
         );
+    }
+
+    // compositor output control for the client's resolution request: detect a
+    // backend once; the client's request is applied on connect, before capture
+    // starts, so the session is sized for the resulting scanout.
+    let display_ctl: Option<Arc<dyn display::DisplayControl>> = if source_name == "drm" {
+        match display::detect(display_control, display_output) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[display] {e:#}");
+                None
+            }
+        }
+    } else {
+        if display_control != "auto" && display_control != "none" {
+            eprintln!(
+                "[display] --display-control applies to --source drm (host compositor); ignoring for {source_name}"
+            );
+        }
+        None
+    };
+    // the mode the session changed away from, put back on disconnect (and on
+    // SIGINT/SIGTERM via the shared signal watcher)
+    let mut original_mode: Option<display::Mode> = None;
+    if let Some(c) = display_ctl.as_deref() {
+        match c.current() {
+            Ok(m) => eprintln!(
+                "[display] {} backend (output {}), current {}",
+                c.name(),
+                c.output().unwrap_or_else(|_| "?".into()),
+                m.label()
+            ),
+            Err(e) => eprintln!("[display] {} backend; probe failed: {e:#}", c.name()),
+        }
+        display::install_restore_watcher();
     }
 
     let mut mat: Box<dyn FrameMaterializer> = if codec == rdma_display_codec::Codec::Lossy {
@@ -726,6 +793,18 @@ fn run_capture(
                 session_connected_at = None;
                 first_scanout_logged = false;
                 eprintln!("[server] session ended; pipeline idle");
+            }
+            // put the display mode back if a session changed it (also covers a
+            // client that requested a change and then never established a
+            // session)
+            if let Some(orig) = original_mode.take() {
+                if let Some(c) = display_ctl.as_deref() {
+                    match c.set(orig) {
+                        Ok(()) => eprintln!("[display] restored {}", orig.label()),
+                        Err(e) => eprintln!("[display] restore failed: {e:#}"),
+                    }
+                }
+                display::disarm_restore();
             }
         }
         session_active.store(session.is_some(), std::sync::atomic::Ordering::Relaxed);
@@ -899,9 +978,48 @@ fn run_capture(
                     frame_dirty = true;
                 }
             } else if session.is_none() {
+                // Negotiate Hello + the display-mode request BEFORE anything
+                // heavy: the requested mode must be in effect before the
+                // capture source starts and the slots are sized, so there is
+                // no mid-session resize and no reconnect.
+                let peer = stream.peer_addr()?;
+                let nonce = rdma_display_rdma::random_nonce();
+                let (mut conn, neg, mode_req) = match rdma_display_rdma::handshake_server(
+                    stream,
+                    nonce,
+                    transport,
+                    rdma.is_some(),
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("[server] handshake failed ({peer}): {e:#}");
+                        continue;
+                    }
+                };
+                let reply = apply_mode_request(&mode_req, display_ctl.as_ref(), &mut original_mode);
+                eprintln!(
+                    "[display] mode request {:?} -> {} ({})",
+                    mode_req,
+                    reply.mode_label(),
+                    reply.message
+                );
+                if let Err(e) = rdma_display_rdma::send_mode_reply(&mut conn, &reply) {
+                    eprintln!("[server] mode reply failed ({peer}): {e:#}");
+                    continue;
+                }
+                // re-probe the DRM scanout so the slots match the mode now in
+                // effect (also catches an external change since preflight)
+                if source_name == "drm" {
+                    match rdma_display_capture::drm::probe_display(drm_card.as_deref()) {
+                        Ok(fmt) => geometry = Some(meta_linear(&fmt)),
+                        Err(e) => eprintln!(
+                            "[display] scanout re-probe failed: {e:#}; using cached geometry"
+                        ),
+                    }
+                }
                 if let Some(meta) = geometry.clone().or_else(|| pending_meta.clone()) {
                     let t_connect = std::time::Instant::now();
-                    eprintln!("client connected: {}", stream.peer_addr()?);
+                    eprintln!("client connected: {peer}");
                     // start the per-session pipeline (source, input, audio)
                     let (input_tx, input_rx) = mpsc::channel::<rdma_display_proto::InputEvent>();
                     let sink: Box<dyn InputSink> = match input_name {
@@ -936,7 +1054,6 @@ fn run_capture(
                         input,
                         input_tx: input_tx.clone(),
                     });
-                    let nonce = rdma_display_rdma::random_nonce();
                     session_nonce.store(nonce, std::sync::atomic::Ordering::SeqCst);
                     let geom = rdma_display_codec::Geometry::new(
                         meta.width,
@@ -974,9 +1091,9 @@ fn run_capture(
                     };
                     // client input events join the same channel as the
                     // synthetic --input-test injector -> capture forwarder
-                    match rdma_display_rdma::ServerLink::accept(
-                        Conn::new(stream),
-                        transport,
+                    match rdma_display_rdma::ServerLink::accept_negotiated(
+                        conn,
+                        neg,
                         rdma,
                         &meta,
                         slots,
@@ -986,7 +1103,6 @@ fn run_capture(
                         input_tx.clone(),
                         external.as_deref(),
                         &rumble_hub,
-                        nonce,
                     ) {
                         Ok(link) => {
                             eprintln!("session up: {slots} slots, {} frame bytes", link.frame_bytes());
@@ -1934,6 +2050,88 @@ fn meta_from_size(w: u32, h: u32) -> DisplayMeta {
     }
 }
 
+/// Apply the client's pre-handshake display-mode request to the server's
+/// compositor. On an actual change, remembers the previous mode in `original`
+/// (and arms the signal-restore hook) so it can be put back on disconnect.
+fn apply_mode_request(
+    req: &rdma_display_proto::ModeRequest,
+    ctl: Option<&Arc<dyn display::DisplayControl>>,
+    original: &mut Option<display::Mode>,
+) -> rdma_display_proto::ModeReply {
+    use rdma_display_proto::{ModeReply, ModeRequest};
+
+    let Some(ctl) = ctl else {
+        return match req {
+            ModeRequest::Keep => {
+                ModeReply::ok(0, 0, 0, "no display-control backend; keeping current mode")
+            }
+            _ => ModeReply::err(0, 0, 0, "no display-control backend (--display-control)"),
+        };
+    };
+
+    match req {
+        ModeRequest::Keep => match ctl.current() {
+            Ok(m) => ModeReply::ok(m.w, m.h, m.refresh_mhz, "keeping current mode"),
+            Err(e) => ModeReply::err(0, 0, 0, format!("{e:#}")),
+        },
+        ModeRequest::Reset => match *original {
+            Some(orig) => match ctl.set(orig) {
+                Ok(()) => {
+                    *original = None;
+                    display::disarm_restore();
+                    ModeReply::ok(
+                        orig.w,
+                        orig.h,
+                        orig.refresh_mhz,
+                        format!("restored {}", orig.label()),
+                    )
+                }
+                Err(e) => ModeReply::err(0, 0, 0, format!("{e:#}")),
+            },
+            None => ModeReply::err(0, 0, 0, "no saved mode to restore"),
+        },
+        ModeRequest::Set {
+            width,
+            height,
+            refresh_mhz,
+        } => {
+            let cur = match ctl.current() {
+                Ok(m) => m,
+                Err(e) => return ModeReply::err(0, 0, 0, format!("{e:#}")),
+            };
+            let modes = match ctl.modes() {
+                Ok(m) => m,
+                Err(e) => return ModeReply::err(cur.w, cur.h, cur.refresh_mhz, format!("{e:#}")),
+            };
+            let Some(chosen) = display::nearest(&modes, *width, *height, *refresh_mhz) else {
+                return ModeReply::err(cur.w, cur.h, cur.refresh_mhz, "output advertises no modes");
+            };
+            if let Err(e) = ctl.set(chosen) {
+                return ModeReply::err(cur.w, cur.h, cur.refresh_mhz, format!("{e:#}"));
+            }
+            if chosen != cur {
+                if original.is_none() {
+                    *original = Some(cur);
+                    display::arm_restore(ctl.clone(), cur);
+                }
+                ModeReply::ok(
+                    chosen.w,
+                    chosen.h,
+                    chosen.refresh_mhz,
+                    format!("applied {}", chosen.label()),
+                )
+            } else {
+                ModeReply::ok(
+                    chosen.w,
+                    chosen.h,
+                    chosen.refresh_mhz,
+                    format!("already at {}", chosen.label()),
+                )
+            }
+        }
+    }
+}
+
 /// Startup preflight: validate each element of the pipeline once and probe the
 /// display geometry, without starting the (heavy, per-session) capture. Every
 /// failure here is logged, not fatal — the pipeline still starts on connect and
@@ -2068,5 +2266,143 @@ mod codec_tests {
             let out = dec.decode(&slot[..n]).unwrap();
             assert_eq!(out, &orig[..], "frame {i} round trip");
         }
+    }
+}
+
+#[cfg(test)]
+mod display_apply_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// A backend whose mode list is fixed and whose current mode is settable,
+    /// so `apply_mode_request` can be exercised without a compositor.
+    struct Mock {
+        modes: Vec<display::Mode>,
+        cur: Mutex<display::Mode>,
+    }
+
+    impl display::DisplayControl for Mock {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+        fn output(&self) -> Result<String> {
+            Ok("MOCK-1".into())
+        }
+        fn modes(&self) -> Result<Vec<display::Mode>> {
+            Ok(self.modes.clone())
+        }
+        fn current(&self) -> Result<display::Mode> {
+            Ok(*self.cur.lock().unwrap())
+        }
+        fn set(&self, m: display::Mode) -> Result<()> {
+            *self.cur.lock().unwrap() = m;
+            Ok(())
+        }
+    }
+
+    fn m(w: u32, h: u32, r: u32) -> display::Mode {
+        display::Mode {
+            w,
+            h,
+            refresh_mhz: r,
+        }
+    }
+
+    fn backend(cur: display::Mode, modes: Vec<display::Mode>) -> Arc<dyn display::DisplayControl> {
+        Arc::new(Mock {
+            modes,
+            cur: Mutex::new(cur),
+        })
+    }
+
+    #[test]
+    fn keep_reports_current_without_changing() {
+        let ctl = backend(m(1920, 1080, 60_000), vec![m(1920, 1080, 60_000)]);
+        let mut orig = None;
+        let r = apply_mode_request(
+            &rdma_display_proto::ModeRequest::Keep,
+            Some(&ctl),
+            &mut orig,
+        );
+        assert!(r.ok);
+        assert_eq!((r.width, r.height), (1920, 1080));
+        assert!(orig.is_none());
+    }
+
+    #[test]
+    fn set_picks_nearest_and_remembers_original() {
+        let ctl = backend(
+            m(1280, 720, 60_000),
+            vec![m(1920, 1080, 60_000), m(2560, 1440, 144_000)],
+        );
+        let mut orig = None;
+        let r = apply_mode_request(
+            &rdma_display_proto::ModeRequest::Set {
+                width: 2500,
+                height: 1400,
+                refresh_mhz: 143_000,
+            },
+            Some(&ctl),
+            &mut orig,
+        );
+        assert!(r.ok, "{r:?}");
+        assert_eq!((r.width, r.height), (2560, 1440));
+        // the pre-change mode is remembered so it can be restored
+        assert_eq!(orig, Some(m(1280, 720, 60_000)));
+    }
+
+    #[test]
+    fn set_already_at_current_is_a_noop() {
+        let cur = m(1920, 1080, 60_000);
+        let ctl = backend(cur, vec![cur]);
+        let mut orig = None;
+        let r = apply_mode_request(
+            &rdma_display_proto::ModeRequest::Set {
+                width: 1920,
+                height: 1080,
+                refresh_mhz: 0,
+            },
+            Some(&ctl),
+            &mut orig,
+        );
+        assert!(r.ok);
+        assert!(orig.is_none(), "no change => nothing to restore");
+    }
+
+    #[test]
+    fn reset_restores_the_remembered_mode() {
+        let ctl = backend(m(2560, 1440, 144_000), vec![m(2560, 1440, 144_000)]);
+        let mut orig = Some(m(1920, 1080, 60_000));
+        let r = apply_mode_request(
+            &rdma_display_proto::ModeRequest::Reset,
+            Some(&ctl),
+            &mut orig,
+        );
+        assert!(r.ok, "{r:?}");
+        assert_eq!((r.width, r.height), (1920, 1080));
+        assert!(orig.is_none(), "restored => nothing left to restore");
+        // the backend really is back at the old mode
+        assert_eq!(ctl.current().unwrap(), m(1920, 1080, 60_000));
+    }
+
+    #[test]
+    fn no_backend_errors_for_set_but_not_for_keep() {
+        let mut orig = None;
+        let keep = apply_mode_request(
+            &rdma_display_proto::ModeRequest::Keep,
+            None,
+            &mut orig,
+        );
+        assert!(keep.ok);
+        let set = apply_mode_request(
+            &rdma_display_proto::ModeRequest::Set {
+                width: 1920,
+                height: 1080,
+                refresh_mhz: 0,
+            },
+            None,
+            &mut orig,
+        );
+        assert!(!set.ok);
     }
 }
