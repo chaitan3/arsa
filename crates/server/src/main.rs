@@ -62,6 +62,8 @@ fn main() -> Result<()> {
     let mut lossy_chroma444 = false;
     let mut transport = rdma_display_rdma::TransportPref::Auto;
     let mut gpu_power = GpuPower::Off;
+    // log idle/session RSS+CPU every N seconds (0 = off)
+    let mut idle_metrics: u64 = 0;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -130,6 +132,9 @@ fn main() -> Result<()> {
                 let v = args.next().expect("--gpu-power needs a value");
                 gpu_power = GpuPower::parse(&v)?;
             }
+            "--idle-metrics" => {
+                idle_metrics = args.next().expect("--idle-metrics needs a value").parse()?
+            }
             "--help" | "-h" => {
                 println!("usage: rdma-display-server [--mode capture|testcard] [--device mlx5_0] [--listen 0.0.0.0:4791] [--slots 3] [--fps N]\n  \
   defaults: --mode capture --source drm --fps 0 --codec lossless --audio on --capture-sync auto (a bare command is a root KMS capture of the host)\n  \
@@ -144,6 +149,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
   --lossy-chroma 420|444  lossy: chroma subsampling (default 420).\n  \
   --gpu-power off|p5|p0|max|<sm>[,<mem>]  floor the NVIDIA GPU clocks with nvidia-smi, still allowing boost above the floor (needs root; warns and continues if unavailable). p5 = the measured fast floor (sm 435 / mem 810 MHz), p0/max = floor at the card's maximum (i.e. pinned), <sm>[,<mem>] = explicit MHz floors. Default off. GeForce cards reject the memory-clock floor.\n  \
   --transport auto|rdma|tcp  video transport (default auto: RDMA/RoCE when available, else TCP). Negotiated with the client; TCP sends length-prefixed coded frames on a TAG_VIDEO connection.\n  \
+  --idle-metrics N  log RSS/CPU/threads every N seconds, labelled idle or session (default off).\n  \
   --fps N (capture): pacing cap; 0 = uncapped, consumer-paced by client credits (default 0).\n  \
   --audio | --no-audio [--audio-device my-sink.monitor]  audio side-channel (default on; --no-audio disables): capture the named source's PCM through the pipewire-pulse\n  \
   compat socket (XDG_RUNTIME_DIR must point at the user's session when running under sudo; '@DEFAULT_MONITOR@' = default sink).");
@@ -198,6 +204,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
             rdma_ref, transport, &source, input.as_deref(), &dbus_socket, console, &drm_card,
             &materialize, rendernode.as_deref(), &listen, slots, fps, input_test, &readback,
             capture_sync, audio, audio_device.as_deref(), codec, lossy_budget, lossy_chroma444,
+            idle_metrics,
         ),
         other => bail!("mode {other:?} not implemented yet"),
     }
@@ -436,6 +443,77 @@ fn spawn_input_test(tx: mpsc::Sender<rdma_display_proto::InputEvent>) -> Result<
     Ok(())
 }
 
+/// Idle/session resource logger: RSS, CPU%, and thread count every `secs`.
+/// Used to verify that an idle server holds little (Phase 3 measurement).
+fn spawn_resource_metrics(
+    secs: u64,
+    session_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("resource-metrics".into())
+        .spawn(move || {
+            let clk = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+            let mut last = read_cpu_ticks().unwrap_or((0, 0));
+            let mut last_t = std::time::Instant::now();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(secs.max(1)));
+                let now = std::time::Instant::now();
+                let cpu = read_cpu_ticks().unwrap_or(last);
+                let dt = now.duration_since(last_t).as_secs_f64();
+                let dticks = (cpu.0 + cpu.1).saturating_sub(last.0 + last.1);
+                let pct = if dt > 0.0 {
+                    dticks as f64 / clk as f64 / dt * 100.0
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "[metrics] {} rss={:.1} MB cpu={:.2}% threads={}",
+                    if session_active.load(std::sync::atomic::Ordering::Relaxed) {
+                        "session"
+                    } else {
+                        "idle   "
+                    },
+                    read_rss_bytes().unwrap_or(0) as f64 / 1e6,
+                    pct,
+                    read_threads().unwrap_or(0),
+                );
+                last = cpu;
+                last_t = now;
+            }
+        });
+}
+
+/// Resident set size from /proc/self/statm (pages of 4 KiB). Field 0 is the
+/// virtual size; field 1 is the resident set.
+fn read_rss_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = s.split_whitespace().nth(1)?.parse().ok()?;
+    Some(pages * 4096)
+}
+
+/// (utime, stime) in clock ticks from /proc/self/stat.
+fn read_cpu_ticks() -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // skip the comm field, which may itself contain spaces or parens
+    let after = s.rsplit(')').next()?;
+    let f: Vec<&str> = after.split_whitespace().collect();
+    // utime/stime are overall fields 14/15 => indices 11/12 after the comm
+    let utime: u64 = f.get(11)?.parse().ok()?;
+    let stime: u64 = f.get(12)?.parse().ok()?;
+    Some((utime, stime))
+}
+
+/// Thread count from /proc/self/status.
+fn read_threads() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("Threads:") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_capture(
     rdma: Option<(&ibverbs::Context, &ibverbs::ProtectionDomain)>,
@@ -458,9 +536,15 @@ fn run_capture(
     codec: rdma_display_codec::Codec,
     lossy_budget: usize,
     lossy_chroma444: bool,
+    idle_metrics: u64,
 ) -> Result<()> {
     if source_name == "drm" && materialize != "egl" && codec != rdma_display_codec::Codec::Lossy {
         bail!("--source drm requires --materialize egl (KMS capture is dmabuf-only)");
+    }
+    // idle/session resource logger (Phase 3 measurement)
+    let session_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if idle_metrics > 0 {
+        spawn_resource_metrics(idle_metrics, session_active.clone());
     }
     // audio side-channel: capture is per-session, except the setuid helper
     // path (sudo), which is kept warm across sessions because restarting it
@@ -555,6 +639,9 @@ fn run_capture(
     listener.set_nonblocking(true)?;
 
     let mut session: Option<rdma_display_rdma::ServerLink> = None;
+    // when the current session's control connection was accepted, for
+    // measuring connect -> first-frame latency
+    let mut session_connected_at: Option<std::time::Instant> = None;
     // per-session workers (capture source, input sink, audio); stopped when
     // the session ends so an idle server holds none of them
     let mut workers: Option<SessionWorkers> = None;
@@ -646,9 +733,11 @@ fn run_capture(
                 issued.clear();
                 send_pickup = None;
                 send_prep = None;
+                session_connected_at = None;
                 eprintln!("[server] session ended; pipeline idle");
             }
         }
+        session_active.store(session.is_some(), std::sync::atomic::Ordering::Relaxed);
 
         let gate_open =
             cap_period.map_or(true, |p| last_send.map_or(true, |t| t.elapsed() >= p));
@@ -791,6 +880,7 @@ fn run_capture(
                 }
             } else if session.is_none() {
                 if let Some(meta) = geometry.clone().or_else(|| pending_meta.clone()) {
+                    let t_connect = std::time::Instant::now();
                     eprintln!("client connected: {}", stream.peer_addr()?);
                     // start the per-session pipeline (source, input, audio)
                     let (input_tx, input_rx) = mpsc::channel::<rdma_display_proto::InputEvent>();
@@ -905,6 +995,11 @@ fn run_capture(
                             pipelined = pipelined_capable;
                             session_meta = Some(meta.clone());
                             session = Some(link);
+                            session_connected_at = Some(t_connect);
+                            eprintln!(
+                                "[session] setup {} ms (workers + link)",
+                                t_connect.elapsed().as_millis()
+                            );
                         }
                         Err(e) => {
                             eprintln!("[server] session setup failed: {e:#}");
@@ -1110,6 +1205,14 @@ fn run_capture(
                         frame_dirty = false;
                         last_send = Some(std::time::Instant::now());
                         eprintln!("[server] frame {} sent", seq);
+                        if seq == 1 {
+                            if let Some(t) = session_connected_at {
+                                eprintln!(
+                                    "[session] first frame {} ms after connect",
+                                    t.elapsed().as_millis()
+                                );
+                            }
+                        }
                         if seq % 60 == 0 {
                             eprintln!("[stats] frames={} uptime={:?}", seq, started.elapsed());
                         }
@@ -1179,6 +1282,14 @@ fn run_capture(
                     Ok(Some(seq)) => {
                         last_send = Some(std::time::Instant::now());
                         eprintln!("[server] frame {} sent", seq);
+                        if seq == 1 {
+                            if let Some(t) = session_connected_at {
+                                eprintln!(
+                                    "[session] first frame {} ms after connect",
+                                    t.elapsed().as_millis()
+                                );
+                            }
+                        }
                         if seq % 60 == 0 {
                             eprintln!("[stats] frames={} uptime={:?}", seq, started.elapsed());
                         }
@@ -1871,6 +1982,21 @@ fn preflight(
     }
 
     geometry
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::{read_cpu_ticks, read_rss_bytes, read_threads};
+
+    #[test]
+    fn proc_readers_return_plausible_values() {
+        let rss = read_rss_bytes().expect("rss");
+        assert!(rss > 0 && rss < (1 << 40), "implausible rss {rss}");
+        // ticks may legitimately be 0 on a virtualized /proc; just require a parse
+        let _ = read_cpu_ticks().expect("cpu ticks");
+        let t = read_threads().expect("threads");
+        assert!(t >= 1, "no threads");
+    }
 }
 
 #[cfg(test)]
