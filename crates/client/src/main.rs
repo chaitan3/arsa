@@ -23,7 +23,8 @@ mod lossy;
 const DEFAULT_PORT: u16 = 4791;
 
 fn main() -> Result<()> {
-    let mut server: String = format!("127.0.0.1:{DEFAULT_PORT}");
+    // explicit server address (flag or first positional); None => 127.0.0.1
+    let mut server: Option<String> = None;
     let mut device: Option<String> = None;
     let mut slots: usize = 3;
     let mut dump: Option<String> = None;
@@ -47,7 +48,7 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "-s" | "--server" => server = args.next().expect("--server needs a value"),
+            "-s" | "--server" => server = Some(args.next().expect("--server needs a value")),
             "--device" => device = Some(args.next().expect("--device needs a value")),
             "--slots" => slots = args.next().expect("--slots needs a value").parse()?,
             "--dump" => dump = Some(args.next().expect("--dump needs a value")),
@@ -85,8 +86,9 @@ fn main() -> Result<()> {
             }
             "--lossy-cpu" => lossy_cpu = true,
             "--help" | "-h" => {
-                println!("usage: rdma-display-client -s HOST[:PORT] [--device mlx5_0] [--slots 3] [--dump frame.ppm] [--seconds N]");
-                println!("  -s, --server HOST[:PORT]  server address (default host 127.0.0.1; :{DEFAULT_PORT} assumed when the port is omitted)");
+                println!("usage: rdma-display-client [HOST[:PORT]] [--device mlx5_0] [--slots 3] [--dump frame.ppm] [--seconds N]");
+                println!("  HOST[:PORT]           server address, given as the first positional argument (default host 127.0.0.1; :{DEFAULT_PORT} assumed when the port is omitted)");
+                println!("  -s, --server HOST[:PORT]  same as the positional HOST[:PORT] (either form may be used)");
                 println!("  --slot-mem host|cuda  receive slots: host = pinned RAM (default); cuda = dormant GPU path");
                 println!("  --cuda-device N       CUDA device ordinal for --slot-mem cuda (default 0)");
                 println!("  --output egl|none     egl = present in a Wayland window (default; needs --slot-mem host); none = headless (e.g. with --dump)");
@@ -107,7 +109,15 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             other if other.starts_with("--") => anyhow::bail!("unknown arg: {other}"),
-            _ => {}
+            // first bare argument is the server address; anything after that is
+            // not something we know how to interpret
+            other => {
+                if server.is_none() {
+                    server = Some(other.to_string());
+                } else {
+                    anyhow::bail!("unexpected argument: {other}");
+                }
+            }
         }
     }
 
@@ -115,8 +125,8 @@ fn main() -> Result<()> {
         anyhow::bail!("--slot-mem must be host|cuda, got {slot_mem:?}");
     }
 
-    // `-s host` / `--server host` without a port uses the default port
-    let server = with_default_port(&server);
+    // `HOST` (positional or `-s`/`--server`) without a port uses the default port
+    let server = with_default_port(server.as_deref().unwrap_or("127.0.0.1"));
     let addr = server
         .to_socket_addrs()?
         .next()
@@ -723,18 +733,44 @@ fn dump_ppm(path: &str, meta: &rdma_display_proto::DisplayMeta, bytes: &[u8]) ->
 }
 
 /// Append the default signaling port when the user gives only a host or IP
-/// (`-s 192.168.4.2`). An explicit port is left alone, including the bracketed
-/// IPv6 form `[::1]:4791`; a bare IPv6 literal is also left alone (it needs
-/// brackets to carry a port).
+/// (`192.168.4.2`, or `-s 192.168.4.2`). An explicit port is left alone,
+/// including the bracketed IPv6 form `[::1]:4791`; a bare IPv6 literal is also
+/// left alone (it needs brackets to carry a port).
 fn with_default_port(s: &str) -> String {
+    // Bracketed IPv6 carries a port only after "]:". Otherwise `host:port` has
+    // exactly one colon; no colon means append the default, and two or more
+    // means a bare IPv6 literal, which we must not rewrite.
     let has_port = if let Some(rest) = s.strip_prefix('[') {
         rest.contains("]:")
     } else {
-        s.matches(':').count() == 1
+        s.contains(':')
     };
     if s.is_empty() || has_port {
         s.to_string()
     } else {
         format!("{s}:{DEFAULT_PORT}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_default_port_appends_when_missing() {
+        assert_eq!(with_default_port("192.168.4.2"), format!("192.168.4.2:{DEFAULT_PORT}"));
+        assert_eq!(with_default_port("localhost"), format!("localhost:{DEFAULT_PORT}"));
+    }
+
+    #[test]
+    fn with_default_port_preserves_explicit_port() {
+        assert_eq!(with_default_port("192.168.4.2:5000"), "192.168.4.2:5000");
+        assert_eq!(with_default_port("[::1]:4791"), "[::1]:4791");
+    }
+
+    #[test]
+    fn with_default_port_leaves_bare_ipv6_and_empty_alone() {
+        assert_eq!(with_default_port("::1"), "::1");
+        assert_eq!(with_default_port(""), "");
     }
 }

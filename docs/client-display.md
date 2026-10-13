@@ -111,10 +111,10 @@ Run order on the client host:
 ./docs/c0-client-checks.sh        # paste full output
 
 # 1. baseline sanity (host slots against testcard server)
-sudo rdma-display-client --server 192.168.4.2:4791 --device rocep5s0 --seconds 10 --dump host.ppm
+sudo rdma-display-client 192.168.4.2:4791 --device rocep5s0 --seconds 10 --dump host.ppm
 
 # 2. the C0 gate itself
-sudo rdma-display-client --server 192.168.4.2:4791 --device rocep5s0 \
+sudo rdma-display-client 192.168.4.2:4791 --device rocep5s0 \
   --slot-mem gbm --rendernode /dev/dri/renderD128 --seconds 10 --dump gbm.ppm
 ```
 
