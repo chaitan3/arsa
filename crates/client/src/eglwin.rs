@@ -29,6 +29,8 @@ const EGL_RENDERABLE_TYPE: i32 = 0x3040;
 const EGL_OPENGL_ES3_BIT: i32 = 0x0040;
 const EGL_ALPHA_SIZE: i32 = 0x3021;
 const EGL_BUFFER_SIZE: i32 = 0x3020;
+const EGL_BLUE_SIZE: i32 = 0x3022;
+const EGL_GREEN_SIZE: i32 = 0x3023;
 const EGL_RED_SIZE: i32 = 0x3024;
 const EGL_NATIVE_VISUAL_ID: i32 = 0x302E;
 const EGL_CONFIG_ID: i32 = 0x3028;
@@ -472,6 +474,12 @@ impl EglWindow {
         let cfg_attribs = [
             EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
             EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+            // 8-bit color channels: without an explicit size eglChooseConfig
+            // returns the first match, which on Mesa is RGB565 (16-bit, red=5)
+            // — visible banding and a 2-byte-per-pixel buffer.
+            EGL_RED_SIZE, 8,
+            EGL_GREEN_SIZE, 8,
+            EGL_BLUE_SIZE, 8,
             // no alpha in the window buffer (XRGB): the video frame is fully
             // opaque, and an XRGB buffer + the surface's opaque region lets
             // KWin direct-scanout instead of compositing
