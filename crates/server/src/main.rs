@@ -861,6 +861,12 @@ fn run_capture(
                             && !s.has_video() =>
                     {
                         s.attach_video(stream);
+                        if let Some(t) = session_connected_at {
+                            eprintln!(
+                                "[session] video socket attached {} ms after connect",
+                                t.elapsed().as_millis()
+                            );
+                        }
                     }
                     _ => {
                         eprintln!("[server] unexpected TAG_VIDEO connection dropped ({addr})")
