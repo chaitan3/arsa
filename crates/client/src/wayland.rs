@@ -97,7 +97,7 @@ struct DmabufFeedback {
     main_device: Vec<u8>,
     cur: Tranche,
     tranches: Vec<Tranche>,
-    logged: bool,
+    last: String,
 }
 
 #[derive(Default, Clone)]
@@ -110,20 +110,20 @@ struct Tranche {
 impl DmabufFeedback {
     fn dev_str(d: &[u8]) -> String {
         if d.len() >= 8 {
-            let major = u32::from_ne_bytes([d[0], d[1], d[2], d[3]]);
-            let minor = u32::from_ne_bytes([d[4], d[5], d[6], d[7]]);
-            format!("{major}:{minor}")
+            let v = u64::from_ne_bytes([
+                d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+            ]);
+            format!("{v:#x}")
         } else {
             format!("{d:02x?}")
         }
     }
 
     fn log(&mut self) {
-        if self.logged || self.tranches.is_empty() {
+        if self.tranches.is_empty() {
             return;
         }
-        self.logged = true;
-        eprintln!(
+        let mut s = format!(
             "[wl] dmabuf feedback: main_device={} tranches={}",
             Self::dev_str(&self.main_device),
             self.tranches.len()
@@ -142,13 +142,19 @@ impl DmabufFeedback {
                 fmts.truncate(8);
                 fmts.push("...".into());
             }
-            eprintln!(
-                "[wl]   tranche {i}: target={} scanout={} sampling={} formats=[{}]",
+            s.push_str(&format!(
+                "\n[wl]   tranche {i}: target={} scanout={} sampling={} formats=[{}]",
                 Self::dev_str(&t.target),
                 t.flags & 1 != 0,
                 t.flags & 2 != 0,
                 fmts.join(", ")
-            );
+            ));
+        }
+        // KWin re-sends feedback as the surface's output/state changes (e.g.
+        // after fullscreen); log only when the set actually changes.
+        if s != self.last {
+            eprintln!("{s}");
+            self.last = s;
         }
     }
 }
@@ -1142,6 +1148,9 @@ impl Dispatch<ZwpLinuxDmabufFeedbackV1, ()> for St {
                         }
                     }
                     state.dmabuf_feedback.table = table;
+                    // a new format_table begins a new feedback set
+                    state.dmabuf_feedback.tranches.clear();
+                    state.dmabuf_feedback.cur = Tranche::default();
                 }
             }
             E::MainDevice { device } => state.dmabuf_feedback.main_device = device,
