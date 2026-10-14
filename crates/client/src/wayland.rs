@@ -222,10 +222,10 @@ struct St {
     /// grab-mode keep-alives (dropping them releases the constraint)
     rel_obj: Option<ZwpRelativePointerV1>,
     locked_obj: Option<ZwpLockedPointerV1>,
-    /// input grab (Ctrl+Alt+M): pointer locked locally (deltas forwarded as
+    /// input grab (Ctrl+Alt+G): pointer locked locally (deltas forwarded as
     /// InputEvent::Rel, local cursor hidden) AND the keyboard grabbed (the
     /// compositor's own shortcuts inhibited, so alt-f4/alt-tab/alt-f1 reach
-    /// the guest). Ctrl+Alt+M is the only way out — see `set_grab`.
+    /// the guest). Ctrl+Alt+G is the only way out — see `set_grab`.
     grabbed: bool,
     /// fractional accumulator for relative deltas (logical pixels)
     grab_acc: (f64, f64),
@@ -236,12 +236,12 @@ struct St {
     dbg_window: std::time::Instant,
     /// Ctrl+Alt both held (from wl_keyboard.modifiers) — grab hotkey chord
     mods_ctrl_alt: bool,
-    /// the M key currently down was swallowed by the grab chord (never
+    /// the G key currently down was swallowed by the grab chord (never
     /// forwarded), so its release must be swallowed too. Tracked separately
     /// from `held_keys` because the release arrives after Ctrl/Alt are
     /// usually already up — it cannot be recognised from the chord state, and
-    /// it must swallow ONLY M, never whatever key is released next.
-    hotkey_m_down: bool,
+    /// it must swallow ONLY G, never whatever key is released next.
+    hotkey_g_down: bool,
     /// output scale (120ths; 120 = 1.0) — the compositor's render scale.
     /// The buffer is always the NATIVE guest frame (no resampling, sharp
     /// pixels); the logical window size is native/scale via wp_viewporter.
@@ -414,11 +414,14 @@ impl Presenter {
     /// session's input path. `fullscreen` requests a fullscreen toplevel
     /// on the current output before mapping (the compositor answers with
     /// a configure carrying the real output size + the fullscreen state).
+    /// `grab` engages the input grab (Ctrl+Alt+G's ON state) right after the
+    /// window is mapped, instead of waiting for the chord.
     pub fn new(
         width: u32,
         height: u32,
         input_tx: Sender<InputEvent>,
         fullscreen: bool,
+        grab: bool,
     ) -> Result<Self> {
         let conn = Connection::connect_to_env().context(
             "wayland connect: needs WAYLAND_DISPLAY + XDG_RUNTIME_DIR in env \
@@ -574,7 +577,7 @@ impl Presenter {
                 dbg_sum: (0.0, 0.0),
                 dbg_window: Instant::now(),
                 mods_ctrl_alt: false,
-                hotkey_m_down: false,
+                hotkey_g_down: false,
                 decoration_mgr,
                 decoration,
                 scale120: 120,
@@ -631,6 +634,12 @@ impl Presenter {
         // configure received; frame presentation attaches + commits content
         me.state.apply_scale(&qh); // apply scale if preferred_scale already arrived
         me.pump(0)?;
+        if grab {
+            // --grab: start in the grab (Ctrl+Alt+G's ON state). Best-effort:
+            // the inhibitor/lock engage now and self-heal on focus/enter.
+            me.state.set_grab(true, &qh);
+            me.queue.flush()?;
+        }
         Ok(me)
     }
 
@@ -733,21 +742,21 @@ impl Presenter {
 }
 
 impl St {
-    /// Enter/leave input grab (Ctrl+Alt+M). ON: the local compositor keeps
+    /// Enter/leave input grab (Ctrl+Alt+G). ON: the local compositor keeps
     /// its hands off the KEYBOARD (shortcuts inhibited — every key, alt-f4,
     /// alt-tab, alt-f1 and any other desktop binding included, arrives as a
     /// plain key event and is forwarded to the guest) and off the MOUSE
     /// (pointer locked in relative mode, local cursor hidden). OFF: the
     /// compositor gets its shortcuts and the absolute cursor back.
     ///
-    /// Ctrl+Alt+M is the ONLY way out. A focus shuffle deliberately does not
+    /// Ctrl+Alt+G is the ONLY way out. A focus shuffle deliberately does not
     /// release the grab (that was the hole through which alt-tab and friends
     /// dumped the user out of the game mid-play), so the pieces self-heal
     /// instead — see the Enter (re-lock on pointer re-entry) and Unlocked
     /// (re-lock after the compositor breaks the constraint) handlers. The
     /// grab is also kept across keyboard focus loss: if the compositor yanks
     /// focus (lock screen, popup), the grab re-engages when the window is
-    /// focused again and Ctrl+Alt+M works there.
+    /// focused again and Ctrl+Alt+G works there.
     fn set_grab(&mut self, on: bool, qh: &QueueHandle<St>) {
         if on == self.grabbed {
             return;
@@ -766,7 +775,7 @@ impl St {
             self.dbg_n = 0;
             self.dbg_sum = (0.0, 0.0);
             self.dbg_window = Instant::now();
-            eprintln!("[wl] input grabbed (Ctrl+Alt+M to release)");
+            eprintln!("[wl] input grabbed (Ctrl+Alt+G to release)");
         } else {
             self.release_keys();
             self.release_pointer();
@@ -1047,7 +1056,7 @@ quiet!(ZwpPointerConstraintsV1 => ());
 quiet!(ZwpKeyboardShortcutsInhibitManagerV1 => ());
 
 /// Pointer-constraint lifecycle: the compositor may break the lock at any
-/// moment (focus change, its own UI, output churn). Ctrl+Alt+M is the only
+/// moment (focus change, its own UI, output churn). Ctrl+Alt+G is the only
 /// way OUT of the grab, so a break must not end it either — re-lock instead.
 impl Dispatch<ZwpLockedPointerV1, ()> for St {
     fn event(
@@ -1072,7 +1081,7 @@ impl Dispatch<ZwpLockedPointerV1, ()> for St {
                 }
                 eprintln!(
                     "[wl] grab: compositor broke the pointer lock — re-locking \
-                     (Ctrl+Alt+M releases)"
+                     (Ctrl+Alt+G releases)"
                 );
                 state.drop_pointer_constraint();
                 state.grab_pointer(qh);
@@ -1086,7 +1095,7 @@ impl Dispatch<ZwpLockedPointerV1, ()> for St {
 /// are off and alt-f4/alt-tab/alt-f1 reach us like any other key. `inactive`
 /// means the compositor took them back (the protocol lets it keep an escape
 /// combo of its own); there is no client-side way to force re-activation, so
-/// this only warns — the grab itself stays until Ctrl+Alt+M.
+/// this only warns — the grab itself stays until Ctrl+Alt+G.
 impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for St {
     fn event(
         _state: &mut St,
@@ -1397,7 +1406,7 @@ impl Dispatch<WlKeyboard, ()> for St {
             wl_keyboard::Event::Enter { .. } => {
                 state.kb_active = true;
                 state.held_keys.clear();
-                state.hotkey_m_down = false;
+                state.hotkey_g_down = false;
                 // modifier state is per-focus: a chord left half-pressed in
                 // the previous focus must not make the next plain M toggle
                 // the grab (the fresh Modifiers event will re-set it)
@@ -1405,7 +1414,7 @@ impl Dispatch<WlKeyboard, ()> for St {
                 if state.grabbed {
                     // the inhibitor re-engages by itself on keyboard focus
                     // (protocol: active ⇔ our surface has keyboard focus)
-                    eprintln!("[wl] kb enter (grab still on: Ctrl+Alt+M releases)");
+                    eprintln!("[wl] kb enter (grab still on: Ctrl+Alt+G releases)");
                 } else {
                     eprintln!("[wl] kb enter (kb_active=true)");
                 }
@@ -1418,15 +1427,15 @@ impl Dispatch<WlKeyboard, ()> for St {
                 for code in state.held_keys.drain() {
                     let _ = state.input_tx.send(InputEvent::Key { code, down: false });
                 }
-                state.hotkey_m_down = false;
+                state.hotkey_g_down = false;
                 state.mods_ctrl_alt = false;
                 if state.grabbed {
-                    // NOT released here on purpose: Ctrl+Alt+M is the only
+                    // NOT released here on purpose: Ctrl+Alt+G is the only
                     // exit. The compositor taking focus away (lock screen,
                     // popup) must not dump the user out of the grab — it
                     // re-engages on re-focus (see Enter above).
                     eprintln!(
-                        "[wl] kb leave (grab stays on; Ctrl+Alt+M releases once \
+                        "[wl] kb leave (grab stays on; Ctrl+Alt+G releases once \
                          the window is focused again)"
                     );
                 } else {
@@ -1454,29 +1463,29 @@ impl Dispatch<WlKeyboard, ()> for St {
                 if !state.kb_active {
                     return;
                 }
-                // grab hotkey: Ctrl+Alt+M toggles the input grab (keyboard
+                // grab hotkey: Ctrl+Alt+G toggles the input grab (keyboard
                 // shortcut inhibition + relative mouse) — client-local,
                 // never forwarded to the guest, and the ONLY way in or out.
-                // Both the press and the release of the chorded M are
+                // Both the press and the release of the chorded G are
                 // swallowed; only the INITIAL press toggles, so a key repeat
                 // (KWin sends state=2, surfaced as "down") must not re-toggle
                 // the grab.
-                if key == 0x32 {
+                if key == 0x22 {
                     if !released {
                         if state.mods_ctrl_alt {
-                            if !state.hotkey_m_down {
-                                state.hotkey_m_down = true;
+                            if !state.hotkey_g_down {
+                                state.hotkey_g_down = true;
                                 state.set_grab(!state.grabbed, qh);
                             }
                             return; // chorded press/repeat: never forwarded
                         }
-                        // plain M: fall through and forward normally
-                    } else if state.hotkey_m_down {
+                        // plain G: fall through and forward normally
+                    } else if state.hotkey_g_down {
                         // Release of a swallowed chord press. Ctrl/Alt are
                         // usually already up by now, so this is recognised
-                        // from the flag alone — and it swallows only M, so
+                        // from the flag alone — and it swallows only G, so
                         // the modifiers' own releases still reach the guest.
-                        state.hotkey_m_down = false;
+                        state.hotkey_g_down = false;
                         return;
                     }
                 }
@@ -1509,7 +1518,7 @@ impl Dispatch<WlKeyboard, ()> for St {
     }
 }
 
-/// Pointer: absolute positioning (default), grab mode (Ctrl+Alt+M) for
+/// Pointer: absolute positioning (default), grab mode (Ctrl+Alt+G) for
 /// relative motion, buttons, wheel.
 impl Dispatch<WlPointer, ()> for St {
     fn event(
@@ -1528,7 +1537,7 @@ impl Dispatch<WlPointer, ()> for St {
                     // self-heal: the lock can be missing here (grab started
                     // without hover, or the compositor broke the constraint
                     // while the pointer was away) — re-acquire it rather
-                    // than end the grab (Ctrl+Alt+M is the only exit)
+                    // than end the grab (Ctrl+Alt+G is the only exit)
                     state.grab_pointer(qh);
                     // keep the local cursor hidden while grabbed (re-enter)
                     pointer.set_cursor(serial, None, 0, 0);
@@ -1551,14 +1560,14 @@ impl Dispatch<WlPointer, ()> for St {
                     let _ = state.input_tx.send(InputEvent::Btn { button: btn, down: false });
                 }
                 if state.grabbed {
-                    // NOT released here on purpose: Ctrl+Alt+M is the only
+                    // NOT released here on purpose: Ctrl+Alt+G is the only
                     // exit (the old auto-release meant any focus churn — a
                     // desktop shortcut, an OSD, another output — dumped the
                     // user out of relative mode mid-play). The lock is
                     // re-acquired on re-enter / on the Unlocked event.
                     eprintln!(
                         "[wl] grab: pointer left the window — grab stays on \
-                         (Ctrl+Alt+M releases)"
+                         (Ctrl+Alt+G releases)"
                     );
                 }
             }

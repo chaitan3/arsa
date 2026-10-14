@@ -197,12 +197,13 @@ Acceptance: live desktop in a window at ≥50 fps with the current server,
 `--output wayland`, credits pacing naturally (no tearing if compositor does
 page flipping).
 
-## Input grab (Ctrl+Alt+M)
+## Input grab (Ctrl+Alt+G)
 
 The EGL window forwards keyboard/pointer to the guest whenever it is
 focused, but the local desktop is still in charge of its own shortcuts.
-Ctrl+Alt+M (client-local, never forwarded to the guest) toggles an input
-grab that hands *everything* to the guest — keys and mouse:
+Ctrl+Alt+G (client-local, never forwarded to the guest) toggles an input
+grab that hands *everything* to the guest — keys and mouse. `-g`/`--grab`
+starts with the grab already on (default off).
 
 - **keys** — `keyboard-shortcuts-inhibit-unstable-v1` (KWin: v1). While the
   inhibitor is up the compositor must not act on its own bindings and sends
@@ -214,12 +215,12 @@ grab that hands *everything* to the guest — keys and mouse:
   (unaccelerated deltas → `InputEvent::Rel`), local cursor hidden. A lock
   requested without hover stays dormant until the pointer enters the window.
 
-**Ctrl+Alt+M is the only way out.** A focus shuffle deliberately no longer
+**Ctrl+Alt+G is the only way out.** A focus shuffle deliberately no longer
 releases the grab (that was the hole through which alt-tab and friends
 dumped the user out of relative mode mid-play); the pieces self-heal instead:
 the pointer lock is re-acquired on pointer re-entry and whenever the
 compositor breaks it (`zwp_locked_pointer_v1.unlocked`), and the shortcut
-inhibitor re-engages by itself on keyboard focus. The chorded M press+release
+inhibitor re-engages by itself on keyboard focus. The chorded G press+release
 is swallowed entirely and only the *initial* press toggles (key repeats
 don't).
 

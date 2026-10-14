@@ -34,6 +34,7 @@ fn main() -> Result<()> {
     let mut output: String = "egl".to_string();
     let mut metrics_on = false;
     let mut fullscreen = false;
+    let mut grab = false;
     let mut audio_on = true;
     let mut audio_buffer_ms: u32 = rdma_display_audio::wire::BUFFER_MS;
     let mut controller_on = true;
@@ -62,6 +63,7 @@ fn main() -> Result<()> {
             "--output" => output = args.next().expect("--output needs a value").to_string(),
             "--metrics" => metrics_on = true,
             "-f" | "--fullscreen" => fullscreen = true,
+            "-g" | "--grab" => grab = true,
             "--audio" => audio_on = true,
             "--no-audio" => audio_on = false,
             "--audio-buffer-ms" => {
@@ -99,6 +101,7 @@ fn main() -> Result<()> {
                 println!("  --cuda-device N       CUDA device ordinal for --slot-mem cuda (default 0)");
                 println!("  --output egl|none     egl = present in a Wayland window (default; needs --slot-mem host); none = headless (e.g. with --dump)");
                 println!("  -f, --fullscreen      fullscreen on the current output; frame letterboxed/scaled to the screen with aspect kept (compositor's own fullscreen toggle also works)");
+                println!("  -g, --grab            start with the input grab on (keyboard+mouse for the guest; same as Ctrl+Alt+G); default off");
                 println!("  --audio | --no-audio  play the server's audio side-channel (default sink; server captures its own monitor source). Default on; --no-audio disables");
                 println!("  --audio-buffer-ms N   client playout buffer depth / pulse tlength (default {}; lower = less latency, less jitter headroom)", rdma_display_audio::wire::BUFFER_MS);
                 println!("  --metrics             per-stage latency overlay (capture, send, transfer, upload, present, on-screen) + clock-sync pings");
@@ -111,8 +114,8 @@ fn main() -> Result<()> {
                 println!("  --set-mode WxH[@R]    ask the server to set its output to this size/refresh before the session starts (R in Hz; omitted = any)");
                 println!("  --lossy-cpu           lossy: decode + download + upload on the CPU instead of the all-GPU Vulkan->GL dma-buf interop (default all-GPU, with an automatic fallback when the interop is unavailable)");
                 println!("  RDMA_DISPLAY_LOSSY_DEBUG=1  lossy: verbose dma-buf import diagnostics (extension strings, importable formats/modifiers, every import attempt)");
-                println!("  Ctrl+Alt+M            (--output egl) grab keyboard+mouse for the guest: the local compositor's");
-                println!("                        own shortcuts (alt-f4, alt-tab, alt-f1, ...) reach the guest too; Ctrl+Alt+M again");
+                println!("  Ctrl+Alt+G            (--output egl) grab keyboard+mouse for the guest: the local compositor's");
+                println!("                        own shortcuts (alt-f4, alt-tab, alt-f1, ...) reach the guest too; Ctrl+Alt+G again");
                 println!("                        is the ONLY way to give control back to the desktop");
                 return Ok(());
             }
@@ -215,13 +218,16 @@ fn main() -> Result<()> {
         None
     };
 
+    if grab && output != "egl" {
+        eprintln!("[client] --grab needs --output egl (no window to grab with --output {output})");
+    }
     let mut presenter = match output.as_str() {
         "none" => None,
         "egl" => {
             if slot_mem != "host" {
                 bail!("--output egl requires --slot-mem host (the upload reads the slot through a CPU pointer)");
             }
-            let p = wayland::Presenter::new(link.meta.width, link.meta.height, input_tx, fullscreen)?;
+            let p = wayland::Presenter::new(link.meta.width, link.meta.height, input_tx, fullscreen, grab)?;
             let mut win = eglwin::EglWindow::new(
                 p.wl_display_ptr(),
                 p.wl_surface_ptr(),
