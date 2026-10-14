@@ -8,8 +8,9 @@
 #
 # Note: file capabilities live on the file inode, so cargo/rustc rebuilding the
 # binary (new inode) drops them. The build is therefore skipped when the
-# binaries were already built from the current git state (see the stamp below),
-# so re-running this script just re-applies the capability.
+# binaries are already newer than the sources, so you can `cargo build` in one
+# place (e.g. a container) and run this script on another (the host) just to
+# re-apply the capability.
 set -euo pipefail
 
 cd "$(dirname "$(readlink -f "$0")")"
@@ -27,9 +28,8 @@ SERVER=target/release/rdma-display-server
 CLIENT=target/release/rdma-display-client
 LIBS=target/release/libpyrowave-shared.so
 DEST=${1:-/usr/local/bin}
-# Records the source state the binaries were built from. A repeat run at the
-# same commit (and same tracked changes) skips the rebuild.
-STAMP=target/release/.rdma-display-build-stamp
+# SKIP_BUILD=1 forces the cargo build to be skipped (e.g. the binaries were
+# built elsewhere, like a container, and this host only needs setcap/copy).
 
 # setcap/getcap live in /usr/sbin (Debian) or /sbin, which are not on a normal
 # user's PATH; resolve them explicitly rather than trusting PATH.
@@ -57,26 +57,31 @@ GETCAP=$(find_tool getcap) || {
     exit 1
 }
 
-# Source marker: HEAD plus a digest of tracked working-tree changes. Untracked
-# files (logs, pyrowave/, ...) are ignored. Non-zero when not a git checkout,
-# so the build always runs there.
-source_stamp() {
-    local head dirty
-    head=$(git rev-parse HEAD 2>/dev/null) || return 1
-    dirty=$(git status --porcelain --untracked-files=no 2>/dev/null | cksum)
-    printf '%s %s' "$head" "$dirty"
+# Newest mtime among the files that feed the binaries. If both binaries are at
+# least this new, they were built from the current sources (wherever that
+# happened) and there is nothing to rebuild.
+newest_source_mtime() {
+    find crates Cargo.toml Cargo.lock .cargo/config.toml -type f \
+        -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1
 }
 
-if want=$(source_stamp) && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$want" ] \
-    && [ -x "$SERVER" ] && [ -x "$CLIENT" ]; then
-    echo "==> up to date at $(git rev-parse --short HEAD); skipping cargo build"
-else
+build_needed=1
+if [ "${SKIP_BUILD:-0}" = "1" ]; then
+    echo "==> SKIP_BUILD=1; skipping cargo build"
+    build_needed=0
+elif [ -x "$SERVER" ] && [ -x "$CLIENT" ]; then
+    src=$(newest_source_mtime)
+    srv=$(stat -c %Y "$SERVER" 2>/dev/null || echo 0)
+    cli=$(stat -c %Y "$CLIENT" 2>/dev/null || echo 0)
+    if [ -n "$src" ] && [ "$srv" -ge "$src" ] && [ "$cli" -ge "$src" ]; then
+        echo "==> binaries are newer than the sources; skipping cargo build"
+        build_needed=0
+    fi
+fi
+
+if [ "$build_needed" = "1" ]; then
     echo "==> cargo build --release (server + client)"
     cargo build --release -p rdma-display-server -p rdma-display-client
-    # record the source state only after a successful build
-    if want=$(source_stamp); then
-        printf '%s\n' "$want" >"$STAMP"
-    fi
 fi
 
 [ -x "$SERVER" ] || { echo "error: $SERVER not built" >&2; exit 1; }
