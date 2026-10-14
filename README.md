@@ -192,7 +192,7 @@ both ends.
 | `--source drm\|qemu` | Capture the host KMS scanout (default) or a QEMU guest. |
 | `--input qemu\|uinput` | Injection sink. Default: paired with the source (`drm`→`uinput`, `qemu`→`qemu-dbus`). |
 | `--listen ADDR:PORT` | Bind address (default `0.0.0.0:4791`). May also be given as the first positional argument, e.g. `rdma-display-server 0.0.0.0:4791`; a bare host gets port 4791. |
-| `--codec auto\|raw\|lossless\|lossy` | Frame coding. `auto` (default) honours the client's requested codec (raw/lossless), else lossless; an explicit value forces it. `lossy` is server-forced only. |
+| `--codec auto\|raw\|lossless\|lossy` | Frame coding. `auto` (default) honours the client's requested codec, else lossless; an explicit value forces it. |
 | `--transport auto\|rdma\|tcp` | Video transport (default `auto`: RDMA when possible). |
 | `--fps N` | Pacing cap; `0` = consumer-paced by client credits (default). |
 | `--capture-sync MODE` | Which fb to capture: `onbehind` (default), `vblank`, `settle[:ms]`, `fence`, `zero`, `auto`. |
@@ -214,7 +214,7 @@ both ends.
 | `-f`/`--fullscreen` | Fullscreen on the current output (letterboxed, aspect kept). |
 | `-g`/`--grab` | Start with the input grab on (same as `Ctrl+Alt+G`). |
 | `--native` / `--set-mode WxH[@R]` | Ask the server to change its output resolution. |
-| `--codec auto\|raw\|lossless\|lossy` | Request a codec (raw/lossless are client-selectable; lossy is server-forced). Default `auto`: the server picks. |
+| `--codec auto\|raw\|lossless\|lossy` | Request a codec (honoured under the server's `--codec auto`). Default `auto`: the server picks. |
 | `--metrics` | Latency overlay + clock-sync pings. |
 | `--scale-filter auto\|nearest\|linear\|cubic\|area` | Letterbox sampler. |
 | `--transport auto\|rdma\|tcp` | Video transport preference. |

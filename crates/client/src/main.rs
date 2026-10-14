@@ -126,7 +126,7 @@ fn main() -> Result<()> {
                 println!("  --scale-filter auto|nearest|linear|cubic|area  sampler for the letterboxed frame (default auto: nearest at integer scale, area when downscaling, else linear)");
                 println!("  --native              ask the server to set its output to this client's monitor mode (read from wl_output) before the session starts");
                 println!("  --set-mode WxH[@R]    ask the server to set its output to this size/refresh before the session starts (R in Hz; omitted = any)");
-                println!("  --codec auto|raw|lossless|lossy  codec to request (raw/lossless are client-selectable; lossy is server-forced). Default auto: the server picks");
+                println!("  --codec auto|raw|lossless|lossy  codec to request from the server (honoured under the server's --codec auto). Default auto: the server picks");
                 println!("  --lossy-cpu           lossy: decode + download + upload on the CPU instead of the all-GPU Vulkan->GL dma-buf interop (default all-GPU, with an automatic fallback when the interop is unavailable)");
                 println!("  RDMA_DISPLAY_LOSSY_DEBUG=1  lossy: verbose dma-buf import diagnostics (extension strings, importable formats/modifiers, every import attempt)");
                 println!("  Ctrl+Alt+G            (--output egl) grab keyboard+mouse for the guest: the local compositor's");

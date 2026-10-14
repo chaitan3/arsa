@@ -31,7 +31,7 @@ DEST=${1:-/usr/local/bin}
 # SKIP_BUILD=1 forces the cargo build to be skipped (e.g. the binaries were
 # built elsewhere, like a container, and this host only needs setcap/copy).
 
-# setcap/getcap live in /usr/sbin (Debian) or /sbin, which are not on a normal
+# setcap live in /usr/sbin (Debian) or /sbin, which are not on a normal
 # user's PATH; resolve them explicitly rather than trusting PATH.
 find_tool() {
     local name=$1 path
@@ -50,10 +50,6 @@ find_tool() {
 
 SETCAP=$(find_tool setcap) || {
     echo "error: setcap not found (install libcap2-bin / libcap)" >&2
-    exit 1
-}
-GETCAP=$(find_tool getcap) || {
-    echo "error: getcap not found (install libcap2-bin / libcap)" >&2
     exit 1
 }
 
@@ -103,9 +99,4 @@ else
 fi
 
 echo "==> setcap $CAPS+ep $SERVER"
-sudo "$SETCAP" "$CAPS+ep" "$SERVER"
-
-echo "==> installed:"
-"$GETCAP" "$SERVER" "$CLIENT"
-echo
-echo "run it directly (no sudo): ./$SERVER"
+sudo "$SETCAP" "$CAPS+ep" "$DEST"/rdma-display-server

@@ -207,7 +207,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
   [--materialize egl|plain] [--rendernode /dev/dri/renderD128] [--readback pbo|direct] [--input-test]\n  \
   --materialize egl (default) imports the dmabuf and reads the frame back for raw/lossy and for the CPU/readback lossless fallback; GPU lossless bypasses the readback entirely and encodes straight from the imported dmabuf (no full-frame readback, no re-upload). --readback pbo|direct only affects that readback path.\n  \
   --capture-sync onbehind|vblank|zero|auto|settle[:ms]|fence  (drm) which fb to capture: onbehind = safe, one frame old; vblank = current frame as its vblank retires it (lowest latency; dead on this nvidia-drm stack, falls back); zero = current frame immediately, no sync (testing only, may tear); settle[:ms] = current frame ms after its commit (default 2 ms; usually complete, but frames whose render outlasts the window tear); fence = read the current frame when the compositor's per-frame completion fence signals (tracefs; ~1 ms, tear-free, needs root, falls back); auto = try fence, then vblank, then one-behind (default)\n  \
-  --codec auto|raw|lossless|lossy  frame coding for the whole session (default auto = honour the client's Hello preference, else lossless). raw = unchanged wire; lossless = v2 tile-delta against the previous frame (desktop-friendly); lossy = PyroWave intra-only GPU codec (needs libpyrowave-shared.so), server-forced only (a client request is ignored). A non-auto value forces the codec. Build server and client together (lossless v2 is a wire-format version).\n  \
+  --codec auto|raw|lossless|lossy  frame coding for the whole session (default auto = honour the client's Hello preference, else lossless). raw = unchanged wire; lossless = v2 tile-delta against the previous frame (desktop-friendly); lossy = PyroWave intra-only GPU codec (needs libpyrowave-shared.so). A non-auto value forces the codec. Build server and client together (lossless v2 is a wire-format version).\n  \
   --lossy-budget BYTES  lossy: max bitstream bytes per frame (default 1000000; slot size sent to the client).\n  \
   --lossy-chroma 420|444  lossy: chroma subsampling (default 420).\n  \
   --gpu-power off|p5|p0|max|<sm>[,<mem>]  floor the NVIDIA GPU clocks with nvidia-smi, still allowing boost above the floor (needs root; warns and continues if unavailable). p5 = the measured fast floor (sm 435 / mem 810 MHz), p0/max = floor at the card's maximum (i.e. pinned), <sm>[,<mem>] = explicit MHz floors. Default off. GeForce cards reject the memory-clock floor.\n  \
@@ -729,6 +729,9 @@ fn run_capture(
         dbus_socket,
         console,
         codec,
+        codec_auto,
+        lossy_budget,
+        lossy_chroma444,
         gl.as_ref(),
         capture_connector.as_deref(),
     );
@@ -739,18 +742,17 @@ fn run_capture(
         );
     }
 
-    let mut mat: Box<dyn FrameMaterializer> = if codec == rdma_display_codec::Codec::Lossy {
-        Box::new(lossy::LossyMaterializer::new(lossy_budget, lossy_chroma444)?)
-    } else {
-        match materialize {
-            "egl" => Box::new(match gl.as_ref() {
-                Some(gl) => rdma_display_capture::EglMaterializer::new_shared(gl)?,
-                None => rdma_display_capture::EglMaterializer::new(rendernode)?,
-            }),
-            "plain" => Box::new(rdma_display_capture::materializer::PlainMaterializer::new()),
-            other => bail!("materializer {other:?} not implemented (egl|plain)"),
-        }
-    };
+    let mut mat: Box<dyn FrameMaterializer> = build_materializer(
+        codec,
+        materialize,
+        gl.as_ref(),
+        rendernode,
+        lossy_budget,
+        lossy_chroma444,
+    )?;
+    // whether the current materializer is the lossy one; raw/lossless share the
+    // EGL/plain materializer, so the box is only rebuilt when the family changes
+    let mut mat_is_lossy = codec == rdma_display_codec::Codec::Lossy;
     log::info!("[server] capture materializer: {}", mat.name());
 
     // input: explicit --input wins, else paired default. The capture source
@@ -842,9 +844,6 @@ fn run_capture(
     // codec resolved for the active session (from --codec + the client's
     // preference); the startup `codec` is the fallback used for gl/mat/preflight
     let mut session_codec = codec;
-    // lossy chroma advertised to the client: 0 = 4:2:0, 1 = 4:4:4
-    let codec_chroma: u8 =
-        if codec == rdma_display_codec::Codec::Lossy && lossy_chroma444 { 1 } else { 0 };
 
     loop {
         // 0. reap a hung-up client: the control-reader thread signals EOF
@@ -1118,6 +1117,23 @@ fn run_capture(
                 // resolve the session codec from --codec (auto/forced) + the
                 // client's preference, before sizing slots / building the encoder
                 session_codec = resolve_codec(codec_auto, codec, client_codec_pref);
+                // the materializer must match the session codec: raw/lossless
+                // share the EGL/plain one, lossy needs its own (rebuild on change)
+                let want_lossy = session_codec == rdma_display_codec::Codec::Lossy;
+                if want_lossy != mat_is_lossy {
+                    mat = build_materializer(
+                        session_codec,
+                        materialize,
+                        gl.as_ref(),
+                        rendernode,
+                        lossy_budget,
+                        lossy_chroma444,
+                    )?;
+                    mat_is_lossy = want_lossy;
+                    log::info!("[server] materializer for this session: {}", mat.name());
+                }
+                // lossy chroma advertised to the client: 0 = 4:2:0, 1 = 4:4:4
+                let session_chroma: u8 = if want_lossy && lossy_chroma444 { 1 } else { 0 };
                 if let Some(meta) = geometry.clone().or_else(|| pending_meta.clone()) {
                     let t_connect = std::time::Instant::now();
                     log::info!("client connected: {peer}");
@@ -1206,7 +1222,7 @@ fn run_capture(
                         slots,
                         session_codec,
                         slot_len,
-                        codec_chroma,
+                        session_chroma,
                         input_tx.clone(),
                         external.as_deref(),
                         &rumble_hub,
@@ -2239,11 +2255,37 @@ fn apply_mode_request(
     }
 }
 
+/// Build the frame materializer for `codec`: the lossy (PyroWave/Vulkan) one, or
+/// the EGL/plain one shared by raw and lossless. Called at startup and again
+/// when a session's resolved codec changes the materializer family.
+fn build_materializer(
+    codec: rdma_display_codec::Codec,
+    materialize: &str,
+    gl: Option<&Arc<rdma_display_egl::SharedContext>>,
+    rendernode: Option<&str>,
+    lossy_budget: usize,
+    lossy_chroma444: bool,
+) -> Result<Box<dyn FrameMaterializer>> {
+    if codec == rdma_display_codec::Codec::Lossy {
+        return Ok(Box::new(lossy::LossyMaterializer::new(
+            lossy_budget,
+            lossy_chroma444,
+        )?));
+    }
+    Ok(match materialize {
+        "egl" => Box::new(match gl {
+            Some(gl) => rdma_display_capture::EglMaterializer::new_shared(gl)?,
+            None => rdma_display_capture::EglMaterializer::new(rendernode)?,
+        }),
+        "plain" => Box::new(rdma_display_capture::materializer::PlainMaterializer::new()),
+        other => bail!("materializer {other:?} not implemented (egl|plain)"),
+    })
+}
+
 /// Resolve the session codec from the server's `--codec` and the client's
-/// `Hello` preference. With `--codec auto` the client may pick `raw`/`lossless`;
-/// a `lossy` request is ignored (lossy is server-forced only) and an unknown id
-/// falls back. A non-auto `--codec` always wins (logged when it overrides the
-/// client's request).
+/// `Hello` preference. With `--codec auto` the client may pick any codec it can
+/// decode (raw/lossless/lossy); an unknown id falls back. A non-auto `--codec`
+/// always wins (logged when it overrides the client's request).
 fn resolve_codec(
     auto: bool,
     fallback: rdma_display_codec::Codec,
@@ -2270,22 +2312,11 @@ fn resolve_codec(
         }
         return fallback;
     }
-    match client {
-        Codec::Raw | Codec::Lossless => {
-            log::info!(
-                "[server] codec {} (client preference; --codec auto)",
-                client.name()
-            );
-            client
-        }
-        Codec::Lossy => {
-            log::warn!(
-                "[server] client requested lossy; lossy is server-forced only — using {}",
-                fallback.name()
-            );
-            fallback
-        }
-    }
+    log::info!(
+        "[server] codec {} (client preference; --codec auto)",
+        client.name()
+    );
+    client
 }
 
 /// Re-probe the DRM scanout, waiting (bounded) for a requested mode to land.
@@ -2337,6 +2368,9 @@ fn preflight(
     dbus_socket: &Option<String>,
     console: u32,
     codec: rdma_display_codec::Codec,
+    codec_auto: bool,
+    lossy_budget: usize,
+    lossy_chroma444: bool,
     gl: Option<&Arc<rdma_display_egl::SharedContext>>,
     drm_connector: Option<&str>,
 ) -> Option<DisplayMeta> {
@@ -2384,6 +2418,20 @@ fn preflight(
                     log::warn!("[preflight] lossless GPU encoder failed: {e:#} (will fall back to CPU)")
                 }
             }
+        }
+    }
+
+    // 2b. lossy encoder (PyroWave/Vulkan) — validate when lossy can be selected
+    // (a client request under --codec auto, or a server-forced --codec lossy)
+    if codec == rdma_display_codec::Codec::Lossy || codec_auto {
+        match lossy::LossyMaterializer::new(lossy_budget, lossy_chroma444) {
+            Ok(m) => {
+                drop(m);
+                log::debug!("[preflight] lossy encoder ok");
+            }
+            Err(e) => log::warn!(
+                "[preflight] lossy encoder failed: {e:#} (client lossy requests will fail)"
+            ),
         }
     }
 
@@ -2638,14 +2686,15 @@ mod codec_resolve_tests {
             resolve_codec(true, Codec::Raw, Codec::Lossless.id()),
             Codec::Lossless
         );
+        // lossy is client-selectable under auto too
+        assert_eq!(
+            resolve_codec(true, Codec::Lossless, Codec::Lossy.id()),
+            Codec::Lossy
+        );
     }
 
     #[test]
-    fn auto_ignores_lossy_any_and_unknown() {
-        assert_eq!(
-            resolve_codec(true, Codec::Lossless, Codec::Lossy.id()),
-            Codec::Lossless
-        );
+    fn auto_falls_back_on_any_and_unknown() {
         assert_eq!(
             resolve_codec(true, Codec::Lossless, rdma_display_proto::CODEC_ANY),
             Codec::Lossless
