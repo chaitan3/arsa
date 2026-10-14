@@ -152,9 +152,10 @@ impl DmabufFeedback {
             ));
         }
         // KWin re-sends feedback as the surface's output/state changes (e.g.
-        // after fullscreen); log only when the set actually changes.
+        // after fullscreen); log only when the set actually changes, and only
+        // under -v (it is not used by the EGL-upload presenter).
         if s != self.last {
-            log::info!("{s}");
+            log::debug!("{s}");
             self.last = s;
         }
     }
