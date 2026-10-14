@@ -207,7 +207,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
   --idle-metrics N  log RSS/CPU/threads every N seconds, labelled idle or session (default off).\n  \
   -v, --verbose  debug-level logging (per-frame/per-event detail; RUST_LOG overrides)\n  \
   --display-control auto|hyprctl|kscreen|none  apply the client's pre-session resolution request (--native / --set-mode) to this compositor's output before capture starts, so the scanout and the session slots match (--source drm; default auto = Hyprland via hyprctl, KDE via kscreen-doctor).\n  \
-  --display-output NAME  target this compositor output for --display-control (default: the first/primary).\n  \
+  --display-output NAME  DRM connector name (e.g. DP-1, HDMI-A-1, eDP-1) to capture and to apply the client's resolution request to (default: the compositor's primary output; with no compositor backend, the first active output).\n  \
   --fps N (capture): pacing cap; 0 = uncapped, consumer-paced by client credits (default 0).\n  \
   --audio | --no-audio [--audio-device my-sink.monitor]  audio side-channel (default on; --no-audio disables): capture the named source's PCM through the pipewire-pulse\n  \
   compat socket (XDG_RUNTIME_DIR must point at the user's session when running under sudo; '@DEFAULT_MONITOR@' = default sink).");
@@ -666,17 +666,6 @@ fn run_capture(
         bail!("--input uinput injects into the host compositor, but --source qemu captures the guest (use --input qemu)");
     }
 
-    // startup preflight: validate/probe each element once; the heavy pipeline
-    // is (re)started on demand per client (Phase 2). The probed geometry lets
-    // a client connect negotiate slots before the first captured frame.
-    let mut geometry = preflight(source_name, input_name, drm_card, dbus_socket, console, codec, gl.as_ref());
-    if let Some(m) = geometry.as_ref() {
-        log::debug!(
-            "[preflight] geometry cached: {}x{} stride {} (sizes slots on connect)",
-            m.width, m.height, m.stride
-        );
-    }
-
     // compositor output control for the client's resolution request: detect a
     // backend once; the client's request is applied on connect, before capture
     // starts, so the session is sized for the resulting scanout.
@@ -711,6 +700,35 @@ fn run_capture(
         }
         display::install_restore_watcher();
     }
+    // the DRM connector to capture: --display-output forces it, else the
+    // compositor's primary output — so capture and mode control agree on the
+    // same output when there are several
+    let capture_connector: Option<String> = display_output
+        .map(str::to_string)
+        .or_else(|| display_ctl.as_ref().and_then(|c| c.output().ok()));
+    if let Some(name) = capture_connector.as_deref() {
+        log::info!("[display] capture output: {name}");
+    }
+
+    // startup preflight: validate/probe each element once; the heavy pipeline
+    // is (re)started on demand per client (Phase 2). The probed geometry lets
+    // a client connect negotiate slots before the first captured frame.
+    let mut geometry = preflight(
+        source_name,
+        input_name,
+        drm_card,
+        dbus_socket,
+        console,
+        codec,
+        gl.as_ref(),
+        capture_connector.as_deref(),
+    );
+    if let Some(m) = geometry.as_ref() {
+        log::debug!(
+            "[preflight] geometry cached: {}x{} stride {} (sizes slots on connect)",
+            m.width, m.height, m.stride
+        );
+    }
 
     let mut mat: Box<dyn FrameMaterializer> = if codec == rdma_display_codec::Codec::Lossy {
         Box::new(lossy::LossyMaterializer::new(lossy_budget, lossy_chroma444)?)
@@ -742,7 +760,11 @@ fn run_capture(
         log::info!("[server] no preflight geometry; capturing eagerly to learn it");
         let source: Box<dyn CaptureSource> = match source_name {
             "qemu" => Box::new(QemuDbusSource::new(dbus_socket.clone(), console)),
-            "drm" => Box::new(DrmKmsSource::with_sync(drm_card.clone(), capture_sync)),
+            "drm" => Box::new(DrmKmsSource::with_sync(
+                drm_card.clone(),
+                capture_connector.clone(),
+                capture_sync,
+            )),
             other => bail!("source {other:?} not implemented (qemu|drm)"),
         };
         Some(CaptureSource::spawn(source, tx.clone())?)
@@ -1068,7 +1090,12 @@ fn run_capture(
                 // compositor commits the modeset asynchronously, so wait for it
                 // to land before sizing the session.
                 if source_name == "drm" {
-                    match reprobe_scanout(drm_card.as_deref(), reply.width, reply.height) {
+                    match reprobe_scanout(
+                        drm_card.as_deref(),
+                        capture_connector.as_deref(),
+                        reply.width,
+                        reply.height,
+                    ) {
                         Ok(fmt) => geometry = Some(meta_linear(&fmt)),
                         Err(e) => log::warn!(
                             "[display] scanout re-probe failed: {e:#}; using cached geometry"
@@ -1094,7 +1121,11 @@ fn run_capture(
                         let source: Box<dyn CaptureSource> = match source_name {
                             "qemu" => Box::new(QemuDbusSource::new(dbus_socket.clone(), console)),
                             "drm" => {
-                                Box::new(DrmKmsSource::with_sync(drm_card.clone(), capture_sync))
+                                Box::new(DrmKmsSource::with_sync(
+                                    drm_card.clone(),
+                                    capture_connector.clone(),
+                                    capture_sync,
+                                ))
                             }
                             other => bail!("source {other:?} not implemented (qemu|drm)"),
                         };
@@ -2195,13 +2226,19 @@ fn apply_mode_request(
 /// `hyprctl`/`kscreen-doctor` return before the compositor's KMS modeset is
 /// committed, so an immediate `probe_display` can still report the old size —
 /// which sizes the session's slots for the wrong geometry and drops every
-/// frame. `want_w`/`want_h` are the mode reply's dimensions; `0` means no mode
-/// was requested and the first probe is used as-is.
-fn reprobe_scanout(card: Option<&str>, want_w: u32, want_h: u32) -> Result<FrameFormat> {
+/// frame. `connector` is the captured output (None = first active); `want_w`/
+/// `want_h` are the mode reply's dimensions; `0` means no mode was requested
+/// and the first probe is used as-is.
+fn reprobe_scanout(
+    card: Option<&str>,
+    connector: Option<&str>,
+    want_w: u32,
+    want_h: u32,
+) -> Result<FrameFormat> {
     const SETTLE: std::time::Duration = std::time::Duration::from_millis(2000);
     const POLL: std::time::Duration = std::time::Duration::from_millis(20);
     let deadline = std::time::Instant::now() + SETTLE;
-    let mut fmt = rdma_display_capture::drm::probe_display(card)?;
+    let mut fmt = rdma_display_capture::drm::probe_display(card, connector)?;
     while want_w > 0 && want_h > 0 && (fmt.width, fmt.height) != (want_w, want_h) {
         if std::time::Instant::now() >= deadline {
             log::debug!(
@@ -2215,7 +2252,7 @@ fn reprobe_scanout(card: Option<&str>, want_w: u32, want_h: u32) -> Result<Frame
             break;
         }
         std::thread::sleep(POLL);
-        fmt = rdma_display_capture::drm::probe_display(card)?;
+        fmt = rdma_display_capture::drm::probe_display(card, connector)?;
     }
     Ok(fmt)
 }
@@ -2234,12 +2271,13 @@ fn preflight(
     console: u32,
     codec: rdma_display_codec::Codec,
     gl: Option<&Arc<rdma_display_egl::SharedContext>>,
+    drm_connector: Option<&str>,
 ) -> Option<DisplayMeta> {
     let mut geometry = None;
 
     // 1. display geometry (and proof the source can be opened at all)
     match source_name {
-        "drm" => match rdma_display_capture::drm::probe_display(drm_card.as_deref()) {
+        "drm" => match rdma_display_capture::drm::probe_display(drm_card.as_deref(), drm_connector) {
             Ok(fmt) => {
                 log::debug!(
                     "[preflight] drm scanout {}x{} '{}' modifier={:#x}",

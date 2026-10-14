@@ -81,7 +81,8 @@ rdma-display/
 ### 4.1 KMS/DRM source (`crates/capture/src/drm.rs`)
 
 `open_card` probes `/dev/dri/card0..8` (or `--drm-card`) and finds the active
-scanout. On nvidia-drm the framebuffer pointer lives on the **CRTC**
+scanout (or resolves a named `--display-output` connector to its CRTC — see §9).
+On nvidia-drm the framebuffer pointer lives on the **CRTC**
 (`GETCRTC.fb_id` is backfilled; planes report `crtc=0/fb=0`), so the CRTC is
 tried first, then a bound `PRIMARY` plane for atomic drivers that populate
 plane state instead. `probe_display` imports the current fb (`GETFB2` → dmabuf)
@@ -374,11 +375,27 @@ Backends shell out to the compositor's CLI:
 
 `auto` detects Hyprland from `HYPRLAND_INSTANCE_SIGNATURE` (or by scanning
 `$XDG_RUNTIME_DIR/hypr/<sig>/.socket.sock`, setting the variable if absent) and
-KDE from `XDG_CURRENT_DESKTOP`. `--display-output NAME` pins the target output.
-The requested size maps to the **nearest advertised mode** (exact W×H, else
-smallest pixel-count difference, tie-broken by refresh); if nothing suitable is
-advertised — or there is no backend — the reply is an error and the session
-runs at the current resolution.
+KDE from `XDG_CURRENT_DESKTOP`. The requested size maps to the **nearest
+advertised mode** (exact W×H, else smallest pixel-count difference, tie-broken
+by refresh); if nothing suitable is advertised — or there is no backend — the
+reply is an error and the session runs at the current resolution.
+
+### Output selection (multiple outputs)
+
+When the compositor has several outputs, one selection drives **both** capture
+and mode control, so they never disagree:
+
+- `--display-output NAME` forces a **DRM connector name** (`DP-1`, `HDMI-A-1`,
+  `eDP-1` — the same string sysfs and the compositors use). Capture resolves the
+  connector to its current CRTC (`GETCONNECTOR` → `GETENCODER` → `GETCRTC`) and
+  captures that framebuffer; the mode request targets the same output.
+- With no `--display-output`, the default is the compositor's **primary**
+  output: Hyprland's focused monitor, or KScreen's priority-1 output. With no
+  compositor backend, capture falls back to the first active CRTC (there is no
+  "primary" in KMS).
+
+Hotplug/reconfiguration is not re-resolved mid-session yet — the target is
+resolved once at startup.
 
 Because the compositor commits the KMS modeset asynchronously, the server
 re-probes the DRM scanout in a bounded wait until it matches the reply before

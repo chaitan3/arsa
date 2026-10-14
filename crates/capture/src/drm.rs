@@ -124,6 +124,37 @@ struct DrmModeGetPlane {
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
+struct DrmModeGetEncoder {
+    encoder_id: u32,
+    encoder_type: u32,
+    crtc_id: u32,
+    possible_crtcs: u32,
+    possible_clones: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmModeGetConnector {
+    encoders_ptr: u64,
+    modes_ptr: u64,
+    props_ptr: u64,
+    prop_values_ptr: u64,
+    count_modes: u32,
+    count_props: u32,
+    count_encoders: u32,
+    encoder_id: u32,
+    connector_id: u32,
+    connector_type: u32,
+    connector_type_id: u32,
+    connection: u32,
+    mm_width: u32,
+    mm_height: u32,
+    subpixel: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
 struct DrmModeObjGetProperties {
     props_ptr: u64,
     prop_values_ptr: u64,
@@ -200,6 +231,9 @@ const DRM_IOCTL_MODE_GETPLANERESOURCES: u64 =
     iowr(0xB5, std::mem::size_of::<DrmModeGetPlaneRes>());
 const DRM_IOCTL_MODE_GETCRTC: u64 = iowr(0xA1, std::mem::size_of::<DrmModeCrtc>());
 const DRM_IOCTL_MODE_GETPLANE: u64 = iowr(0xB6, std::mem::size_of::<DrmModeGetPlane>());
+const DRM_IOCTL_MODE_GETENCODER: u64 = iowr(0xA6, std::mem::size_of::<DrmModeGetEncoder>());
+const DRM_IOCTL_MODE_GETCONNECTOR: u64 =
+    iowr(0xA7, std::mem::size_of::<DrmModeGetConnector>());
 const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u64 =
     iowr(0xB9, std::mem::size_of::<DrmModeObjGetProperties>());
 const DRM_IOCTL_MODE_GETPROPERTY: u64 =
@@ -345,31 +379,39 @@ pub struct DrmKmsSource {
     /// Card node to capture on. None = probe /dev/dri/card0.. card8 for the
     /// first device with an active CRTC.
     pub card: Option<String>,
+    /// DRM connector to capture (e.g. `DP-1`). None = the first active CRTC.
+    pub connector: Option<String>,
     /// Which fb to capture relative to the compositor's flips.
     pub sync: CaptureSync,
 }
 
 impl DrmKmsSource {
-    pub fn new(card: Option<String>) -> Self {
+    pub fn new(card: Option<String>, connector: Option<String>) -> Self {
         Self {
             card,
+            connector,
             sync: CaptureSync::Auto,
         }
     }
 
     /// Pick the flip-sync policy explicitly (see [`CaptureSync`]).
-    pub fn with_sync(card: Option<String>, sync: CaptureSync) -> Self {
-        Self { card, sync }
+    pub fn with_sync(card: Option<String>, connector: Option<String>, sync: CaptureSync) -> Self {
+        Self {
+            card,
+            connector,
+            sync,
+        }
     }
 }
 
-/// Cheap preflight probe for the DRM source: open the card, find the active
-/// scanout, and read the current framebuffer's format — without starting the
-/// polling capture thread. Used at server init to validate the setup and to
-/// cache the display geometry so a client connect can negotiate slots before
-/// the first captured frame arrives. The card is closed on return.
-pub fn probe_display(card: Option<&str>) -> Result<FrameFormat> {
-    let (fd, target) = open_card(card)?;
+/// Cheap preflight probe for the DRM source: open the card, find the scanout
+/// (the named `connector`, or the first active one), and read the current
+/// framebuffer's format — without starting the polling capture thread. Used at
+/// server init to validate the setup and to cache the display geometry so a
+/// client connect can negotiate slots before the first captured frame arrives.
+/// The card is closed on return.
+pub fn probe_display(card: Option<&str>, connector: Option<&str>) -> Result<FrameFormat> {
+    let (fd, target) = open_card(card, connector)?;
     let fdi = fd.as_raw_fd();
     let fb = match target {
         Target::Crtc(id) => get_crtc(fdi, id)?.fb_id,
@@ -394,7 +436,7 @@ impl CaptureSource for DrmKmsSource {
         let join = std::thread::Builder::new()
             .name("capture-drm".into())
             .spawn(move || {
-                if let Err(e) = run(self.card.as_deref(), sync, tx, worker_stop) {
+                if let Err(e) = run(self.card.as_deref(), self.connector.as_deref(), sync, tx, worker_stop) {
                     log::warn!("[capture] source failed: {e:#}");
                 }
             })
@@ -405,7 +447,9 @@ impl CaptureSource for DrmKmsSource {
 
 /// Open a card node and return (fd, target) for the active display.
 ///
-/// Probe order (what the C probe showed live on nvidia-drm):
+/// When `connector` is given (a DRM connector name like `DP-1`), it is resolved
+/// to its current CRTC and used directly. Otherwise the target is chosen by
+/// probing (what the C probe showed live on nvidia-drm):
 ///   1. CRTCs: GETCRTC's fb_id IS populated on nvidia-drm (the atomic state
 ///      is backfilled for this ioctl), while planes report crtc=0/fb=0 —
 ///      the legacy fb pointer lives on the CRTC here.
@@ -413,14 +457,14 @@ impl CaptureSource for DrmKmsSource {
 ///      crtc.fb_id; find a bound plane of type PRIMARY.
 ///
 /// Every probe is logged — a silent skip cost us a whole round-trip.
-fn open_card(preferred: Option<&str>) -> Result<(OwnedFd, Target)> {
+fn open_card(preferred: Option<&str>, connector: Option<&str>) -> Result<(OwnedFd, Target)> {
     let candidates: Vec<String> = match preferred {
         Some(p) => vec![p.to_string()],
         None => (0..8).map(|i| format!("/dev/dri/card{i}")).collect(),
     };
     let mut last_err: Option<anyhow::Error> = None;
     for path in &candidates {
-        let r = open_card_and_find_target(path);
+        let r = open_card_and_find_target(path, connector);
         match r {
             Ok(v) => return Ok(v),
             Err(e) => last_err = Some(e),
@@ -438,7 +482,88 @@ enum Target {
     Plane(u32),
 }
 
-fn open_card_and_find_target(path: &str) -> Result<(OwnedFd, Target)> {
+/// `drm_mode_connector_type` -> the name the kernel, sysfs and Wayland
+/// compositors use. A connector's full name is `<type>-<type_id>`, e.g. `DP-1`,
+/// `HDMI-A-1`, `eDP-1`.
+fn connector_type_name(t: u32) -> &'static str {
+    match t {
+        1 => "VGA",
+        2 => "DVI-I",
+        3 => "DVI-D",
+        4 => "DVI-A",
+        5 => "Composite",
+        6 => "SVIDEO",
+        7 => "LVDS",
+        8 => "Component",
+        9 => "DIN",
+        10 => "DP",
+        11 => "HDMI-A",
+        12 => "HDMI-B",
+        13 => "TV",
+        14 => "eDP",
+        15 => "Virtual",
+        16 => "DSI",
+        17 => "DPI",
+        18 => "Writeback",
+        19 => "SPI",
+        20 => "USB",
+        _ => "Unknown",
+    }
+}
+
+/// Resolve a connector name (`DP-1`, `HDMI-A-1`, `eDP-1` — the same string
+/// sysfs and the compositors use) to the CRTC it is currently bound to.
+fn resolve_connector_crtc(fd: i32, want: &str) -> Result<u32> {
+    let mut res = DrmModeCardRes {
+        count_connectors: 0,
+        ..zeroed()
+    };
+    ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &mut res as *mut _ as *mut _)
+        .context("GETRESOURCES")?;
+    let n = res.count_connectors as usize;
+    if n == 0 {
+        bail!("no connectors");
+    }
+    let mut conns: Vec<u32> = vec![0; n];
+    let mut res = DrmModeCardRes {
+        connector_id_ptr: conns.as_mut_ptr() as u64,
+        count_connectors: n as u32,
+        ..zeroed()
+    };
+    ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &mut res as *mut _ as *mut _)
+        .context("GETRESOURCES #2")?;
+
+    let mut names: Vec<String> = Vec::new();
+    for &id in conns.iter().take(res.count_connectors as usize) {
+        let mut c: DrmModeGetConnector = zeroed();
+        c.connector_id = id;
+        ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &mut c as *mut _ as *mut _)
+            .with_context(|| format!("GETCONNECTOR {id}"))?;
+        let name = format!(
+            "{}-{}",
+            connector_type_name(c.connector_type),
+            c.connector_type_id
+        );
+        if name.eq_ignore_ascii_case(want) {
+            if c.encoder_id == 0 {
+                bail!("connector {name} is not bound to an encoder (disabled?)");
+            }
+            let mut e: DrmModeGetEncoder = zeroed();
+            e.encoder_id = c.encoder_id;
+            ioctl(fd, DRM_IOCTL_MODE_GETENCODER, &mut e as *mut _ as *mut _)
+                .with_context(|| format!("GETENCODER {}", c.encoder_id))?;
+            if e.crtc_id == 0 {
+                bail!("connector {name} is not bound to a CRTC (disabled?)");
+            }
+            log::debug!("[capture-drm] connector {name} -> crtc {}", e.crtc_id);
+            return Ok(e.crtc_id);
+        }
+        names.push(name);
+    }
+    bail!("no connector named {want:?} (have: {})", names.join(", "));
+}
+
+fn open_card_and_find_target(path: &str, connector: Option<&str>) -> Result<(OwnedFd, Target)> {
     use std::os::fd::FromRawFd;
     // SAFETY: NUL-terminated path, fd < 0 checked before wrapping
     let fd = unsafe {
@@ -452,6 +577,17 @@ fn open_card_and_find_target(path: &str) -> Result<(OwnedFd, Target)> {
     }
     let card = unsafe { OwnedFd::from_raw_fd(fd) };
     let fdr = card.as_raw_fd();
+
+    // explicit connector: resolve it to its CRTC and skip the "first active"
+    // guess entirely, so capture and mode control agree on the output
+    if let Some(name) = connector {
+        let crtc_id = resolve_connector_crtc(fdr, name)?;
+        let c = get_crtc(fdr, crtc_id).with_context(|| format!("GETCRTC {crtc_id}"))?;
+        if c.fb_id == 0 {
+            bail!("connector {name:?} (crtc {crtc_id}) has no bound framebuffer");
+        }
+        return Ok((card, Target::Crtc(crtc_id)));
+    }
 
     // 1. CRTC path: GETRESOURCES (two-call; zero counts for lists not provided)
     let mut res = DrmModeCardRes {
@@ -807,7 +943,7 @@ pub fn sync_probe(
         "[syncprobe] opening card {}",
         card_pref.unwrap_or("(probe /dev/dri/card0..8)")
     );
-    let (card, target) = open_card(card_pref)?;
+    let (card, target) = open_card(card_pref, None)?;
     eprintln!("[syncprobe] target: {target:?}");
 
     let move_on = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1351,6 +1487,7 @@ fn emit_scanout(fd: &OwnedFd, id: u32, t0: u64, tx: &Sender<CaptureEvent>) -> bo
 
 fn run(
     card_pref: Option<&str>,
+    connector: Option<&str>,
     sync: CaptureSync,
     tx: Sender<CaptureEvent>,
     stop: Stop,
@@ -1407,7 +1544,7 @@ fn run(
                 }
             }
             last_open_attempt = Some(std::time::Instant::now());
-            match open_card(card_pref) {
+            match open_card(card_pref, connector) {
                 Ok((fdr, target)) => {
                     let fdi = fdr.as_raw_fd();
                     // vblank is per-CRTC; the plane target must resolve its crtc
@@ -1759,6 +1896,8 @@ mod tests {
         assert_eq!(size_of::<DrmModeCrtc>(), 104);
         assert_eq!(size_of::<DrmModeGetPlaneRes>(), 16);
         assert_eq!(size_of::<DrmModeGetPlane>(), 32); // u64 format ptr pads
+        assert_eq!(size_of::<DrmModeGetEncoder>(), 20);
+        assert_eq!(size_of::<DrmModeGetConnector>(), 80);
         assert_eq!(size_of::<DrmModeObjGetProperties>(), 32);
         assert_eq!(size_of::<DrmModeGetProperty>(), 64);
         assert_eq!(size_of::<DrmModeFbCmd2>(), 104); // u64 modifier[] pads
@@ -1771,6 +1910,8 @@ mod tests {
         assert_eq!(DRM_IOCTL_MODE_GETCRTC, 0xC06864A1);
         assert_eq!(DRM_IOCTL_MODE_GETPLANERESOURCES, 0xC01064B5);
         assert_eq!(DRM_IOCTL_MODE_GETPLANE, 0xC02064B6);
+        assert_eq!(DRM_IOCTL_MODE_GETENCODER, 0xC01464A6);
+        assert_eq!(DRM_IOCTL_MODE_GETCONNECTOR, 0xC05064A7);
         assert_eq!(DRM_IOCTL_MODE_OBJ_GETPROPERTIES, 0xC02064B9);
         assert_eq!(DRM_IOCTL_MODE_GETPROPERTY, 0xC04064AA);
         assert_eq!(DRM_IOCTL_MODE_GETFB2, 0xC06864CE);
@@ -1785,6 +1926,15 @@ mod tests {
         assert_eq!(SYNC_IOC_FILE_INFO, 0xC0383E04);
         assert_eq!(std::mem::size_of::<SyncFileInfo>(), 56);
         assert_eq!(std::mem::size_of::<SyncFenceInfo>(), 80);
+    }
+
+    #[test]
+    fn connector_names_match_sysfs() {
+        // the `<type>-<type_id>` rendering must equal sysfs / compositor names
+        assert_eq!(format!("{}-{}", connector_type_name(10), 1), "DP-1");
+        assert_eq!(format!("{}-{}", connector_type_name(11), 1), "HDMI-A-1");
+        assert_eq!(format!("{}-{}", connector_type_name(14), 1), "eDP-1");
+        assert_eq!(format!("{}-{}", connector_type_name(0), 1), "Unknown-1");
     }
 
     #[test]

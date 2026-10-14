@@ -164,7 +164,7 @@ fn main() {
     if !skipped("drm-probe") {
         let card = cfg.drm_card.clone();
         bench_construct("drm-probe", cfg.iters, move || {
-            let _fmt = rdma_display_capture::drm::probe_display(card.as_deref())?;
+            let _fmt = rdma_display_capture::drm::probe_display(card.as_deref(), None)?;
             Ok(())
         });
     }
@@ -205,6 +205,7 @@ fn bench_drm_stream(cfg: &Cfg) {
     let (tx, rx) = std::sync::mpsc::channel();
     let src = Box::new(DrmKmsSource::with_sync(
         cfg.drm_card.clone(),
+        None,
         rdma_display_capture::CaptureSync::Auto,
     ));
     let t0 = Instant::now();

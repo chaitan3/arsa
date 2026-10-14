@@ -198,7 +198,7 @@ both ends.
 | `--capture-sync MODE` | Which fb to capture: `onbehind` (default), `vblank`, `settle[:ms]`, `fence`, `zero`, `auto`. |
 | `--drm-card /dev/dri/cardN` | Pin the KMS card (default: first card with an active scanout). |
 | `--display-control auto\|hyprctl\|kscreen\|none` | Backend for the client's resolution request (default `auto`). |
-| `--display-output NAME` | Target output for `--display-control`. |
+| `--display-output NAME` | DRM connector name to capture and to apply the resolution request to (default: the compositor's primary output). |
 | `--audio` / `--no-audio` / `--audio-device SRC` | Audio side-channel (default on; `@DEFAULT_MONITOR@` = default sink). |
 | `--gpu-power off\|p5\|p0\|max\|<sm>[,<mem>]` | Floor NVIDIA clocks (needs root). |
 | `--slots N` | Receive slots (default 3). |

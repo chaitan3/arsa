@@ -230,7 +230,11 @@ impl Hyprctl {
                 .iter()
                 .find(|m| m["name"].as_str() == Some(name.as_str()))
                 .with_context(|| format!("hyprctl: no monitor named {name:?}")),
-            None => mons.first().context("hyprctl: no monitors"),
+            None => mons
+                .iter()
+                .find(|m| m["focused"].as_bool() == Some(true))
+                .or_else(|| mons.first())
+                .context("hyprctl: no monitors"),
         }
     }
 
@@ -312,6 +316,8 @@ struct KOut {
     name: String,
     modes: Vec<Mode>,
     current: Option<Mode>,
+    /// KScreen priority (1 = primary), when the listing provides it.
+    priority: Option<u32>,
 }
 
 impl Kscreen {
@@ -326,7 +332,12 @@ impl Kscreen {
                 .iter()
                 .find(|o| &o.name == name || &o.id == name)
                 .with_context(|| format!("kscreen-doctor: no output named {name:?}")),
-            None => outs.first().context("kscreen-doctor: no outputs"),
+            None => outs
+                .iter()
+                .filter(|o| o.priority.is_some())
+                .min_by_key(|o| o.priority.unwrap())
+                .or_else(|| outs.first())
+                .context("kscreen-doctor: no outputs"),
         }
     }
 }
@@ -403,12 +414,22 @@ fn parse_kscreen(text: &str) -> Vec<KOut> {
                 name,
                 modes: Vec::new(),
                 current: None,
+                priority: None,
             });
             // fall through: the same line may carry the mode list
         }
         let Some(cur) = outs.last_mut() else {
             continue;
         };
+        // "priority 1" (single-line) / "priorities: 1" (multi-line): 1 = primary
+        if let Some(idx) = line.find("priorit") {
+            if let Some(n) = line[idx..]
+                .split(|c: char| !c.is_ascii_digit())
+                .find_map(|t| t.parse::<u32>().ok())
+            {
+                cur.priority = Some(n);
+            }
+        }
         for tok in line.split_whitespace() {
             if let Some(m) = parse_mode_token(tok) {
                 if !cur.modes.contains(&m) {
@@ -563,6 +584,7 @@ Output: 1 eDP-1 8e5f5d9c-uuid
         assert_eq!(o.name, "eDP-1");
         assert_eq!(o.modes.len(), 3);
         assert_eq!(o.current, Some(Mode { w: 2880, h: 1800, refresh_mhz: 0 }));
+        assert_eq!(o.priority, Some(1));
     }
 
     #[test]
@@ -581,6 +603,35 @@ Output: 1 eDP-1 8e5f5d9c-uuid
                 refresh_mhz: 144_000
             })
         );
+        assert_eq!(o.priority, Some(1));
+    }
+
+    #[test]
+    fn kscreen_pick_prefers_primary() {
+        let ks = Kscreen { output: None };
+        let outs = vec![
+            KOut {
+                id: "1".into(),
+                name: "DP-1".into(),
+                modes: Vec::new(),
+                current: None,
+                priority: Some(2),
+            },
+            KOut {
+                id: "2".into(),
+                name: "HDMI-A-1".into(),
+                modes: Vec::new(),
+                current: None,
+                priority: Some(1),
+            },
+        ];
+        // priority 1 (primary) wins over list order
+        assert_eq!(ks.pick(&outs).unwrap().name, "HDMI-A-1");
+        // an explicit --display-output overrides the primary
+        let ks2 = Kscreen {
+            output: Some("DP-1".into()),
+        };
+        assert_eq!(ks2.pick(&outs).unwrap().name, "DP-1");
     }
 
     #[test]
