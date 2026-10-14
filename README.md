@@ -134,6 +134,30 @@ For a QEMU guest instead of the host:
 The host is the first positional argument (`HOST` or `HOST:PORT`; port 4791 is
 assumed). `-s`/`--server` is the same thing.
 
+### Groups and permissions
+
+The server is designed to run as your normal user with `CAP_SYS_ADMIN` (set by
+`install.sh`), not as root. That covers the KMS `GETFB2` call, but several
+device nodes are still group-restricted, so add your user to the relevant
+groups and log out / back in for the change to take effect:
+
+| Group | Needed for | Device nodes |
+| --- | --- | --- |
+| `input` | server `--input uinput`; client gamepad capture | `/dev/uinput`; `/dev/input/event*` (read+write — write is for rumble) |
+| `video` | server KMS capture (`--source drm`) | `/dev/dri/card*` |
+| `render` | server EGL materializer / GPU encode (`--rendernode`) | `/dev/dri/renderD*` |
+| `rdma` | RDMA transport, on both ends (where the distribution restricts it) | `/dev/infiniband/*` |
+
+```bash
+sudo usermod -aG input,video,render "$USER"   # add rdma too if you use the RDMA transport
+# log out and back in (group membership is fixed at login)
+```
+
+Group names and node ownership vary by distribution; if a node is already
+world-accessible you can skip it. Only two features need **root** rather than a
+group: `--capture-sync fence` (tracefs writes — or widen `install.sh`'s `CAPS=`
+with `cap_dac_override`) and `--gpu-power` (nvidia-smi).
+
 ### Firewall / networking
 
 The server binds **one TCP port** (default `0.0.0.0:4791`, `--listen`). The
