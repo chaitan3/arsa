@@ -23,6 +23,19 @@
 //! Server side: `capture::start_capture` (one supervisor thread, bound to
 //! a sink monitor) + `capture::serve_connection` per audio connection.
 //! Client side: `playback::run` (connect/retry loop + playout thread).
+//!
+//! TODO(host-play-off): an opt-in server mode that routes host audio into a
+//! virtual sink (PipeWire/PulseAudio `module-null-sink`, e.g. `rdma-display`)
+//! and makes it the default while a session is active, so the host speakers
+//! stay silent and only the client hears the audio; restore the previous
+//! default sink on disconnect and on SIGINT/SIGTERM/SIGQUIT. Off by default —
+//! the default stays the `@DEFAULT_MONITOR@` tap, which keeps the host audible.
+//! Muting the physical sink is NOT a substitute: a sink's monitor is post
+//! volume/mute, so muting it silences the capture too. Plan: a new `route.rs`
+//! that shells out to `pactl` (pipewire-pulse compat) like display.rs does for
+//! hyprctl/kscreen-doctor; under root the commands must run as the session
+//! user, so reuse the setuid-down helper machinery in `capture.rs`. Switch on
+//! session start, restore on session end + via `server::signals`.
 
 pub mod capture;
 pub mod playback;
