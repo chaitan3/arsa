@@ -109,7 +109,7 @@ pub fn detect(pref: &str, output: Option<&str>) -> Result<Option<Arc<dyn Display
     let backend = match forced {
         Some(b) => b,
         None => {
-            if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
+            if hyprland_signature().is_some() {
                 Backend::Hyprctl
             } else if std::env::var("XDG_CURRENT_DESKTOP")
                 .map(|d| d.to_ascii_uppercase().contains("KDE"))
@@ -121,6 +121,16 @@ pub fn detect(pref: &str, output: Option<&str>) -> Result<Option<Arc<dyn Display
             }
         }
     };
+    // `hyprctl` locates the instance through HYPRLAND_INSTANCE_SIGNATURE; if the
+    // caller did not set it, fill it in from the runtime dir so both `auto` and
+    // an explicit `--display-control hyprctl` reach a live instance.
+    if matches!(backend, Backend::Hyprctl)
+        && std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none()
+    {
+        if let Some(sig) = infer_hyprland_signature() {
+            std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", sig);
+        }
+    }
     let ctl: Arc<dyn DisplayControl> = match backend {
         Backend::Hyprctl => Arc::new(Hyprctl {
             output: output.map(str::to_string),
@@ -130,6 +140,34 @@ pub fn detect(pref: &str, output: Option<&str>) -> Result<Option<Arc<dyn Display
         }),
     };
     Ok(Some(ctl))
+}
+
+/// The Hyprland instance signature: `HYPRLAND_INSTANCE_SIGNATURE` when set,
+/// otherwise the newest instance inferred from the runtime dir.
+fn hyprland_signature() -> Option<String> {
+    match std::env::var("HYPRLAND_INSTANCE_SIGNATURE") {
+        Ok(sig) if !sig.is_empty() => Some(sig),
+        _ => infer_hyprland_signature(),
+    }
+}
+
+/// Infer the Hyprland instance signature from `$XDG_RUNTIME_DIR/hypr/<sig>`:
+/// each live instance owns a `.socket.sock` there. Picks the newest if several.
+fn infer_hyprland_signature() -> Option<String> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
+    let hypr = std::path::Path::new(&runtime).join("hypr");
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for entry in std::fs::read_dir(&hypr).ok()?.flatten() {
+        let Ok(meta) = std::fs::metadata(entry.path().join(".socket.sock")) else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().map_or(true, |(t, _)| mtime > *t) {
+            best = Some((mtime, name));
+        }
+    }
+    best.map(|(_, name)| name)
 }
 
 #[derive(Clone, Copy)]

@@ -1008,9 +1008,11 @@ fn run_capture(
                     continue;
                 }
                 // re-probe the DRM scanout so the slots match the mode now in
-                // effect (also catches an external change since preflight)
+                // effect (also catches an external change since preflight). The
+                // compositor commits the modeset asynchronously, so wait for it
+                // to land before sizing the session.
                 if source_name == "drm" {
-                    match rdma_display_capture::drm::probe_display(drm_card.as_deref()) {
+                    match reprobe_scanout(drm_card.as_deref(), reply.width, reply.height) {
                         Ok(fmt) => geometry = Some(meta_linear(&fmt)),
                         Err(e) => eprintln!(
                             "[display] scanout re-probe failed: {e:#}; using cached geometry"
@@ -2130,6 +2132,36 @@ fn apply_mode_request(
             }
         }
     }
+}
+
+/// Re-probe the DRM scanout, waiting (bounded) for a requested mode to land.
+///
+/// `hyprctl`/`kscreen-doctor` return before the compositor's KMS modeset is
+/// committed, so an immediate `probe_display` can still report the old size —
+/// which sizes the session's slots for the wrong geometry and drops every
+/// frame. `want_w`/`want_h` are the mode reply's dimensions; `0` means no mode
+/// was requested and the first probe is used as-is.
+fn reprobe_scanout(card: Option<&str>, want_w: u32, want_h: u32) -> Result<FrameFormat> {
+    const SETTLE: std::time::Duration = std::time::Duration::from_millis(2000);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(20);
+    let deadline = std::time::Instant::now() + SETTLE;
+    let mut fmt = rdma_display_capture::drm::probe_display(card)?;
+    while want_w > 0 && want_h > 0 && (fmt.width, fmt.height) != (want_w, want_h) {
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "[display] scanout still {}x{} after {} ms (wanted {}x{}); sizing from it",
+                fmt.width,
+                fmt.height,
+                SETTLE.as_millis(),
+                want_w,
+                want_h
+            );
+            break;
+        }
+        std::thread::sleep(POLL);
+        fmt = rdma_display_capture::drm::probe_display(card)?;
+    }
+    Ok(fmt)
 }
 
 /// Startup preflight: validate each element of the pipeline once and probe the
