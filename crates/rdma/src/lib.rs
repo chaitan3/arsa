@@ -157,12 +157,14 @@ impl TransportPref {
 fn hello_client<T: std::io::Read + std::io::Write>(
     conn: &mut Conn<T>,
     caps: u8,
+    codec_pref: u8,
 ) -> Result<(u64, u8)> {
     conn.send(&Message::Hello(proto::Hello {
         magic: proto::MAGIC,
         version: proto::VERSION,
         nonce: 0,
         caps,
+        codec_pref,
     }))?;
     match conn.recv()? {
         Message::Hello(h) if h.magic == proto::MAGIC => {
@@ -182,7 +184,7 @@ fn hello_server<T: std::io::Read + std::io::Write>(
     session_nonce: u64,
     pref: TransportPref,
     server_has_rdma: bool,
-) -> Result<Transport> {
+) -> Result<(Transport, u8)> {
     let ch = match conn.recv()? {
         Message::Hello(h) if h.magic == proto::MAGIC => h,
         other => return Err(anyhow!("expected Hello, got {other:?}")),
@@ -215,8 +217,9 @@ fn hello_server<T: std::io::Read + std::io::Write>(
         version: proto::VERSION,
         nonce: session_nonce,
         caps: if transport == Transport::Rdma { proto::CAP_RDMA } else { 0 },
+        codec_pref: proto::CODEC_ANY, // ignored in the reply
     }))?;
-    Ok(transport)
+    Ok((transport, ch.codec_pref))
 }
 
 fn endpoint_exchange<T: std::io::Read + std::io::Write>(
@@ -318,7 +321,8 @@ enum Tx {
 
 /// Server side of the pre-handshake: negotiate the video transport (the
 /// `Hello` exchange) and read the client's display-mode request. Returns the
-/// still-open control connection, the negotiated transport, and the request.
+/// still-open control connection, the negotiated transport, the request, and
+/// the client's codec preference ([`proto::CODEC_ANY`] = none).
 ///
 /// The caller applies the mode (and re-probes the display) *before* calling
 /// [`ServerLink::accept_negotiated`], so the session's slots are sized for the
@@ -330,9 +334,9 @@ pub fn handshake_server(
     session_nonce: u64,
     pref: TransportPref,
     server_has_rdma: bool,
-) -> Result<(Conn<TcpStream>, Transport, proto::ModeRequest)> {
+) -> Result<(Conn<TcpStream>, Transport, proto::ModeRequest, u8)> {
     let mut conn = Conn::new(stream);
-    let transport = hello_server(&mut conn, session_nonce, pref, server_has_rdma)?;
+    let (transport, codec_pref) = hello_server(&mut conn, session_nonce, pref, server_has_rdma)?;
     log::info!(
         "[rdma] video transport: {}{}",
         match transport {
@@ -345,7 +349,7 @@ pub fn handshake_server(
         Message::SetMode(r) => r,
         other => anyhow::bail!("expected SetMode, got {other:?}"),
     };
-    Ok((conn, transport, req))
+    Ok((conn, transport, req, codec_pref))
 }
 
 /// Send the display-mode result to the client. Called after the mode has been
@@ -1229,7 +1233,16 @@ impl ClientLink {
         addr: Option<std::net::SocketAddr>,
         slots: usize,
     ) -> Result<ClientLink> {
-        Self::connect_with(conn, pref, rdma, addr, slots, SlotMem::Host, proto::ModeRequest::Keep)
+        Self::connect_with(
+            conn,
+            pref,
+            rdma,
+            addr,
+            slots,
+            SlotMem::Host,
+            proto::ModeRequest::Keep,
+            proto::CODEC_ANY,
+        )
     }
 
     /// Client half of a session; `mem` chooses host vs GPU (GBM) slots (GPU
@@ -1237,6 +1250,8 @@ impl ClientLink {
     /// server endpoint, used to open the TAG_VIDEO socket when the negotiated
     /// transport is TCP. `mode` is the pre-handshake display-mode request; the
     /// server applies it before `Meta`, so the session is sized for the result.
+    /// `codec_pref` is the codec the client would like ([`proto::CODEC_ANY`] =
+    /// no preference); the server decides and reports it in the `Codec` message.
     pub fn connect_with(
         conn: Conn<TcpStream>,
         pref: TransportPref,
@@ -1245,6 +1260,7 @@ impl ClientLink {
         slots: usize,
         mem: SlotMem,
         mode: proto::ModeRequest,
+        codec_pref: u8,
     ) -> Result<ClientLink> {
         // split the stream: the frame/metrics reader gets the receive half as
         // its own clone; the link's conn keeps doing client→server sends
@@ -1258,7 +1274,7 @@ impl ClientLink {
         } else {
             proto::CAP_RDMA
         };
-        let (session_nonce, server_caps) = hello_client(&mut conn, caps)?;
+        let (session_nonce, server_caps) = hello_client(&mut conn, caps, codec_pref)?;
         let transport = if server_caps & proto::CAP_RDMA != 0 {
             Transport::Rdma
         } else {

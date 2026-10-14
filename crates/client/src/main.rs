@@ -47,6 +47,8 @@ fn main() -> Result<()> {
     // --native asks for this client's own output mode; --set-mode names one
     let mut native = false;
     let mut set_mode: Option<String> = None;
+    // codec preference sent to the server (CODEC_ANY = let the server pick)
+    let mut codec_pref: u8 = rdma_display_proto::CODEC_ANY;
     // lossy: force the CPU download+upload path instead of the all-GPU
     // Vulkan->GL dma-buf interop (also honours RDMA_DISPLAY_LOSSY_CPU=1)
     let mut lossy_cpu = std::env::var_os("RDMA_DISPLAY_LOSSY_CPU").is_some();
@@ -95,6 +97,15 @@ fn main() -> Result<()> {
             "--lossy-cpu" => lossy_cpu = true,
             "--native" => native = true,
             "--set-mode" => set_mode = Some(args.next().expect("--set-mode needs a value")),
+            "--codec" => {
+                let v = args.next().expect("--codec needs a value");
+                codec_pref = match v.as_str() {
+                    "auto" | "any" => rdma_display_proto::CODEC_ANY,
+                    _ => rdma_display_codec::Codec::parse(&v)
+                        .with_context(|| format!("--codec must be auto|raw|lossless|lossy, got {v:?}"))?
+                        .id(),
+                };
+            }
             "--help" | "-h" => {
                 println!("usage: rdma-display-client [HOST[:PORT]] [--device mlx5_0] [--slots 3] [--dump frame.ppm] [--seconds N]");
                 println!("  HOST[:PORT]           server address, given as the first positional argument (default host 127.0.0.1; :{DEFAULT_PORT} assumed when the port is omitted)");
@@ -115,6 +126,7 @@ fn main() -> Result<()> {
                 println!("  --scale-filter auto|nearest|linear|cubic|area  sampler for the letterboxed frame (default auto: nearest at integer scale, area when downscaling, else linear)");
                 println!("  --native              ask the server to set its output to this client's monitor mode (read from wl_output) before the session starts");
                 println!("  --set-mode WxH[@R]    ask the server to set its output to this size/refresh before the session starts (R in Hz; omitted = any)");
+                println!("  --codec auto|raw|lossless|lossy  codec to request (raw/lossless are client-selectable; lossy is server-forced). Default auto: the server picks");
                 println!("  --lossy-cpu           lossy: decode + download + upload on the CPU instead of the all-GPU Vulkan->GL dma-buf interop (default all-GPU, with an automatic fallback when the interop is unavailable)");
                 println!("  RDMA_DISPLAY_LOSSY_DEBUG=1  lossy: verbose dma-buf import diagnostics (extension strings, importable formats/modifiers, every import attempt)");
                 println!("  Ctrl+Alt+G            (--output egl) grab keyboard+mouse for the guest: the local compositor's");
@@ -192,6 +204,7 @@ fn main() -> Result<()> {
         slots,
         mem,
         mode_req,
+        codec_pref,
     )?;
     if link.slots_gpu_only() {
         log::info!("[client] GPU slots without CPU mapping: content checks use the verification-only device->host copy (the render path itself stays zero-copy)");

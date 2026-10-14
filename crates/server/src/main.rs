@@ -100,6 +100,9 @@ fn main() -> Result<()> {
     let mut audio_helper = false;
     let mut capture_sync = CaptureSync::Auto;
     let mut codec = rdma_display_codec::Codec::Lossless;
+    // `--codec auto` (default): honour the client's codec preference, falling
+    // back to `codec` when the client has none. A specific `--codec` forces it.
+    let mut codec_auto = true;
     let mut lossy_budget: usize = 1_000_000;
     let mut lossy_chroma444 = false;
     let mut transport = rdma_display_rdma::TransportPref::Auto;
@@ -142,14 +145,19 @@ fn main() -> Result<()> {
             "--input-test" => input_test = true,
             "--codec" => {
                 let v = args.next().expect("--codec needs a value");
-                codec = rdma_display_codec::Codec::parse(&v).with_context(|| {
-                    format!("--codec must be raw|lossless|lossy, got {v:?}")
-                })?;
-                if !codec.implemented() {
-                    bail!(
-                        "--codec {} is a reserved selector and not implemented yet",
-                        codec.name()
-                    );
+                if v == "auto" {
+                    codec_auto = true;
+                } else {
+                    codec = rdma_display_codec::Codec::parse(&v).with_context(|| {
+                        format!("--codec must be auto|raw|lossless|lossy, got {v:?}")
+                    })?;
+                    codec_auto = false;
+                    if !codec.implemented() {
+                        bail!(
+                            "--codec {} is a reserved selector and not implemented yet",
+                            codec.name()
+                        );
+                    }
                 }
             }
             "--lossy-budget" => {
@@ -192,14 +200,14 @@ fn main() -> Result<()> {
             "--help" | "-h" => {
                 println!("usage: rdma-display-server [ADDR[:PORT]] [--mode capture|testcard] [--device mlx5_0] [--listen 0.0.0.0:4791] [--slots 3] [--fps N]\n  \
   ADDR[:PORT]  listen address, the same as --listen (default 0.0.0.0:4791; the port defaults to 4791 when omitted)\n  \
-  defaults: --mode capture --source drm --fps 0 --codec lossless --audio on --capture-sync auto (a bare command is a root KMS capture of the host)\n  \
+  defaults: --mode capture --source drm --fps 0 --codec auto --audio on --capture-sync auto (a bare command is a root KMS capture of the host)\n  \
 capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS capture, the host — requires sudo/CAP_SYS_ADMIN, kernel >= 5.8)\n  \
   --input qemu|uinput (default auto: qemu↔qemu-dbus, drm↔uinput)\n  \
   qemu: [--dbus-socket /path/dbus.sock] [--console 0]   drm: [--drm-card /dev/dri/cardN] (default: first card0..card8 with an active scanout)\n  \
   [--materialize egl|plain] [--rendernode /dev/dri/renderD128] [--readback pbo|direct] [--input-test]\n  \
   --materialize egl (default) imports the dmabuf and reads the frame back for raw/lossy and for the CPU/readback lossless fallback; GPU lossless bypasses the readback entirely and encodes straight from the imported dmabuf (no full-frame readback, no re-upload). --readback pbo|direct only affects that readback path.\n  \
   --capture-sync onbehind|vblank|zero|auto|settle[:ms]|fence  (drm) which fb to capture: onbehind = safe, one frame old; vblank = current frame as its vblank retires it (lowest latency; dead on this nvidia-drm stack, falls back); zero = current frame immediately, no sync (testing only, may tear); settle[:ms] = current frame ms after its commit (default 2 ms; usually complete, but frames whose render outlasts the window tear); fence = read the current frame when the compositor's per-frame completion fence signals (tracefs; ~1 ms, tear-free, needs root, falls back); auto = try fence, then vblank, then one-behind (default)\n  \
-  --codec raw|lossless|lossy  frame coding for the whole session (default lossless = v2 tile-delta against the previous frame, desktop-friendly; raw = unchanged wire). lossy = PyroWave intra-only GPU codec (needs libpyrowave-shared.so). The client negotiates automatically; build server and client together (lossless v2 is a wire-format version).\n  \
+  --codec auto|raw|lossless|lossy  frame coding for the whole session (default auto = honour the client's Hello preference, else lossless). raw = unchanged wire; lossless = v2 tile-delta against the previous frame (desktop-friendly); lossy = PyroWave intra-only GPU codec (needs libpyrowave-shared.so), server-forced only (a client request is ignored). A non-auto value forces the codec. Build server and client together (lossless v2 is a wire-format version).\n  \
   --lossy-budget BYTES  lossy: max bitstream bytes per frame (default 1000000; slot size sent to the client).\n  \
   --lossy-chroma 420|444  lossy: chroma subsampling (default 420).\n  \
   --gpu-power off|p5|p0|max|<sm>[,<mem>]  floor the NVIDIA GPU clocks with nvidia-smi, still allowing boost above the floor (needs root; warns and continues if unavailable). p5 = the measured fast floor (sm 435 / mem 810 MHz), p0/max = floor at the card's maximum (i.e. pinned), <sm>[,<mem>] = explicit MHz floors. Default off. GeForce cards reject the memory-clock floor.\n  \
@@ -272,8 +280,8 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
         "capture" => run_capture(
             rdma_ref, transport, &source, input.as_deref(), &dbus_socket, console, &drm_card,
             &materialize, rendernode.as_deref(), &listen, slots, fps, input_test, &readback,
-            capture_sync, audio, audio_device.as_deref(), codec, lossy_budget, lossy_chroma444,
-            &display_control, display_output.as_deref(), idle_metrics,
+            capture_sync, audio, audio_device.as_deref(), codec, codec_auto, lossy_budget,
+            lossy_chroma444, &display_control, display_output.as_deref(), idle_metrics,
         ),
         other => bail!("mode {other:?} not implemented yet"),
     }
@@ -364,7 +372,7 @@ fn run_testcard_server(
         let rumble_hub = rdma_display_proto::gamepad::RumbleHub::new();
         // negotiate Hello + the display-mode request, then reply (testcard has
         // a fixed 1280x800 geometry, so a request is a no-op here)
-        let (mut conn, neg, _mode) = rdma_display_rdma::handshake_server(
+        let (mut conn, neg, _mode, _codec_pref) = rdma_display_rdma::handshake_server(
             stream,
             rdma_display_rdma::random_nonce(),
             transport,
@@ -613,6 +621,7 @@ fn run_capture(
     audio: bool,
     audio_device: Option<&str>,
     codec: rdma_display_codec::Codec,
+    codec_auto: bool,
     lossy_budget: usize,
     lossy_chroma444: bool,
     display_control: &str,
@@ -830,6 +839,9 @@ fn run_capture(
     let mut send_prep: Option<u64> = None;
     // frame codec state (raw = pass-through); configured per session
     let mut fc = FrameCodec::new();
+    // codec resolved for the active session (from --codec + the client's
+    // preference); the startup `codec` is the fallback used for gl/mat/preflight
+    let mut session_codec = codec;
     // lossy chroma advertised to the client: 0 = 4:2:0, 1 = 4:4:4
     let codec_chroma: u8 =
         if codec == rdma_display_codec::Codec::Lossy && lossy_chroma444 { 1 } else { 0 };
@@ -1062,18 +1074,19 @@ fn run_capture(
                 // no mid-session resize and no reconnect.
                 let peer = stream.peer_addr()?;
                 let nonce = rdma_display_rdma::random_nonce();
-                let (mut conn, neg, mode_req) = match rdma_display_rdma::handshake_server(
-                    stream,
-                    nonce,
-                    transport,
-                    rdma.is_some(),
-                ) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        log::warn!("[server] handshake failed ({peer}): {e:#}");
-                        continue;
-                    }
-                };
+                let (mut conn, neg, mode_req, client_codec_pref) =
+                    match rdma_display_rdma::handshake_server(
+                        stream,
+                        nonce,
+                        transport,
+                        rdma.is_some(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log::warn!("[server] handshake failed ({peer}): {e:#}");
+                            continue;
+                        }
+                    };
                 let reply = apply_mode_request(&mode_req, display_ctl.as_ref(), &mut original_mode);
                 log::info!(
                     "[display] mode request {:?} -> {} ({})",
@@ -1102,6 +1115,9 @@ fn run_capture(
                         ),
                     }
                 }
+                // resolve the session codec from --codec (auto/forced) + the
+                // client's preference, before sizing slots / building the encoder
+                session_codec = resolve_codec(codec_auto, codec, client_codec_pref);
                 if let Some(meta) = geometry.clone().or_else(|| pending_meta.clone()) {
                     let t_connect = std::time::Instant::now();
                     log::info!("client connected: {peer}");
@@ -1149,13 +1165,15 @@ fn run_capture(
                         meta.height,
                         meta.stride,
                     );
-                    let slot_len = match codec {
+                    let slot_len = match session_codec {
                         rdma_display_codec::Codec::Lossy => lossy_budget + (1 << 20),
-                        _ => codec.slot_len(&geom).expect("implemented codec has a slot size"),
+                        _ => session_codec
+                            .slot_len(&geom)
+                            .expect("implemented codec has a slot size"),
                     };
                     log::info!(
                         "[server] codec {} → slot {} B (raw frame {} B)",
-                        codec.name(),
+                        session_codec.name(),
                         slot_len,
                         meta.frame_bytes
                     );
@@ -1164,7 +1182,7 @@ fn run_capture(
                     // back to verbs-allocated slots + direct readback
                     let external = if rdma.is_some()
                         && transport != rdma_display_rdma::TransportPref::Tcp
-                        && codec != rdma_display_codec::Codec::Lossy
+                        && session_codec != rdma_display_codec::Codec::Lossy
                         && readback == "pbo"
                         && materialize == "egl"
                     {
@@ -1186,7 +1204,7 @@ fn run_capture(
                         rdma,
                         &meta,
                         slots,
-                        codec,
+                        session_codec,
                         slot_len,
                         codec_chroma,
                         input_tx.clone(),
@@ -1204,7 +1222,7 @@ fn run_capture(
                             // frame must be full (no delta against a frame it
                             // never received)
                             fc.configure(
-                                codec,
+                                session_codec,
                                 meta.width,
                                 meta.height,
                                 meta.stride,
@@ -1267,7 +1285,7 @@ fn run_capture(
                     // the imported dmabuf into the slot (budget + 1 MiB), which
                     // is deliberately smaller than the raw frame, so the raw
                     // size is irrelevant there.
-                    if codec != rdma_display_codec::Codec::Lossy && fb > slot_bytes {
+                    if session_codec != rdma_display_codec::Codec::Lossy && fb > slot_bytes {
                         log::warn!(
                             "[server] scanout {}x{} fourcc={:#010x} '{}' ({} B) exceeds negotiated slot ({} B); dropped",
                             fmt.width,
@@ -1284,7 +1302,7 @@ fn run_capture(
                         // next frame is full)
                         if fc.geometry_stale(fmt.width, fmt.height, fmt.stride) {
                             fc.configure(
-                                codec,
+                                session_codec,
                                 fmt.width,
                                 fmt.height,
                                 fmt.stride,
@@ -1298,7 +1316,7 @@ fn run_capture(
                         // succeeds we never touch the materializer — its
                         // per-frame dmabuf re-import would dominate the frame.
                         let mut texture_ok = false;
-                        if codec == rdma_display_codec::Codec::Lossless && fc.has_gpu() {
+                        if session_codec == rdma_display_codec::Codec::Lossless && fc.has_gpu() {
                             match fc.set_scanout(&d) {
                                 Ok(()) => {
                                     texture_ok = true;
@@ -2221,6 +2239,55 @@ fn apply_mode_request(
     }
 }
 
+/// Resolve the session codec from the server's `--codec` and the client's
+/// `Hello` preference. With `--codec auto` the client may pick `raw`/`lossless`;
+/// a `lossy` request is ignored (lossy is server-forced only) and an unknown id
+/// falls back. A non-auto `--codec` always wins (logged when it overrides the
+/// client's request).
+fn resolve_codec(
+    auto: bool,
+    fallback: rdma_display_codec::Codec,
+    client_pref: u8,
+) -> rdma_display_codec::Codec {
+    use rdma_display_codec::Codec;
+    if client_pref == rdma_display_proto::CODEC_ANY {
+        return fallback;
+    }
+    let Some(client) = Codec::from_id(client_pref) else {
+        log::warn!(
+            "[server] client requested unknown codec id {client_pref}; using {}",
+            fallback.name()
+        );
+        return fallback;
+    };
+    if !auto {
+        if client != fallback {
+            log::info!(
+                "[server] --codec {} overrides the client's {} request",
+                fallback.name(),
+                client.name()
+            );
+        }
+        return fallback;
+    }
+    match client {
+        Codec::Raw | Codec::Lossless => {
+            log::info!(
+                "[server] codec {} (client preference; --codec auto)",
+                client.name()
+            );
+            client
+        }
+        Codec::Lossy => {
+            log::warn!(
+                "[server] client requested lossy; lossy is server-forced only — using {}",
+                fallback.name()
+            );
+            fallback
+        }
+    }
+}
+
 /// Re-probe the DRM scanout, waiting (bounded) for a requested mode to land.
 ///
 /// `hyprctl`/`kscreen-doctor` return before the compositor's KMS modeset is
@@ -2556,5 +2623,49 @@ mod listen_arg_tests {
     fn leaves_bare_ipv6_and_empty_alone() {
         assert_eq!(with_default_port("::1"), "::1");
         assert_eq!(with_default_port(""), "");
+    }
+}
+
+#[cfg(test)]
+mod codec_resolve_tests {
+    use super::resolve_codec;
+    use rdma_display_codec::Codec;
+
+    #[test]
+    fn auto_honours_raw_and_lossless() {
+        assert_eq!(resolve_codec(true, Codec::Lossless, Codec::Raw.id()), Codec::Raw);
+        assert_eq!(
+            resolve_codec(true, Codec::Raw, Codec::Lossless.id()),
+            Codec::Lossless
+        );
+    }
+
+    #[test]
+    fn auto_ignores_lossy_any_and_unknown() {
+        assert_eq!(
+            resolve_codec(true, Codec::Lossless, Codec::Lossy.id()),
+            Codec::Lossless
+        );
+        assert_eq!(
+            resolve_codec(true, Codec::Lossless, rdma_display_proto::CODEC_ANY),
+            Codec::Lossless
+        );
+        assert_eq!(resolve_codec(true, Codec::Lossless, 0xEE), Codec::Lossless);
+    }
+
+    #[test]
+    fn forced_codec_wins() {
+        assert_eq!(
+            resolve_codec(false, Codec::Lossless, Codec::Raw.id()),
+            Codec::Lossless
+        );
+        assert_eq!(
+            resolve_codec(false, Codec::Lossy, Codec::Raw.id()),
+            Codec::Lossy
+        );
+        assert_eq!(
+            resolve_codec(false, Codec::Lossy, rdma_display_proto::CODEC_ANY),
+            Codec::Lossy
+        );
     }
 }

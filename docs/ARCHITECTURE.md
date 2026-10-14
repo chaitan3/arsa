@@ -208,8 +208,12 @@ client-side equivalent investigation (GBM/CUDA slots) is in
 
 ## 6. Codecs (`crates/codec`, `crates/codec-gpu`)
 
-Selected with `--codec raw|lossless|lossy` (default `lossless`). The client
-negotiates automatically and sizes its slots from the `Codec` message. Ids:
+Selected with the server's `--codec auto|raw|lossless|lossy` (default `auto`).
+The client sends its preference in `Hello.codec_pref` (`CODEC_ANY` = none); the
+server makes the final choice and reports it in the `Codec` message, which the
+client uses to size its slots and build its decoder. With `auto` the client may
+pick `raw`/`lossless`; `lossy` is server-forced only, and an explicit `--codec`
+on the server overrides the client's request (logged). Ids:
 
 | id | codec | notes |
 | --- | --- | --- |

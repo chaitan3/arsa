@@ -11,7 +11,7 @@ pub mod gamepad;
 pub mod keymap;
 
 pub const MAGIC: u32 = 0x5244_4453; // "RDDS"
-pub const VERSION: u32 = 13; // v13: pre-handshake display mode request/reply (SetMode/ModeReply)
+pub const VERSION: u32 = 14; // v14: Hello carries the client's codec preference
 
 /// First byte of every connection, so the server routes by an explicit tag
 /// rather than by guessing protocol bytes. Audio uses
@@ -24,6 +24,11 @@ pub const TAG_VIDEO: u8 = 0x04;
 
 /// `Hello::caps` bit: this side can use an RDMA (ibverbs/RoCE) video transport.
 pub const CAP_RDMA: u8 = 0x01;
+
+/// `Hello::codec_pref` sentinel: the client has no codec preference (the server
+/// picks). A value in `0..=2` is a `rdma_display_codec` id (`raw`/`lossless`/
+/// `lossy`); `raw` is 0, so "any" needs its own value.
+pub const CODEC_ANY: u8 = 0xFF;
 
 /// Wall-clock microseconds since the unix epoch. Cross-host comparable
 /// (that is the point): per-frame server stamps and ping-pong clock-sync
@@ -206,6 +211,11 @@ pub struct Hello {
     /// `CAP_RDMA` if it has an RDMA device; the server's reply sets it if the
     /// chosen video transport is RDMA (clear = TCP).
     pub caps: u8,
+    /// Client → server: the codec the client would like (a `rdma_display_codec`
+    /// id, or [`CODEC_ANY`] for "server picks"). The server makes the final
+    /// choice and reports it in the `Codec` message; the field is ignored in
+    /// the server's reply.
+    pub codec_pref: u8,
 }
 
 /// Display format metadata, sent by the server for the current scanout.
@@ -477,11 +487,12 @@ pub fn send_msg<T: Write>(io: &mut T, msg: &Message) -> std::io::Result<()> {
         Message::Hello(h) => (
             MsgType::Hello as u32,
             {
-                let mut v = Vec::with_capacity(17);
+                let mut v = Vec::with_capacity(18);
                 v.extend_from_slice(&h.magic.to_le_bytes());
                 v.extend_from_slice(&h.version.to_le_bytes());
                 v.extend_from_slice(&h.nonce.to_le_bytes());
                 v.push(h.caps);
+                v.push(h.codec_pref);
                 v
             },
         ),
@@ -665,6 +676,7 @@ impl<T: Read + Write> Conn<T> {
                         .unwrap(),
                 ),
                 caps: *payload.get(16).unwrap_or(&0),
+                codec_pref: *payload.get(17).unwrap_or(&CODEC_ANY),
             }),
             t if t == MsgType::Meta as u32 => {
                 let width = u32_at(&payload, 0)?;
