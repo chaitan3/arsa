@@ -3,7 +3,7 @@
 //!
 //! This module deliberately contains NO buffer management: with the
 //! dmabuf-attach presenter removed (KWin+NVIDIA refuses foreign system
-//! dmabuf imports — see docs/client-display.md), the compositor only ever
+//! dmabuf imports — see docs/ARCHITECTURE.md), the compositor only ever
 //! sees EGL's own driver-native swapchain buffers. Credits are paced by the
 //! upload path in `main.rs`, so there is no release-to-credit machinery
 //! here either.

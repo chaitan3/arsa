@@ -17,7 +17,7 @@
 //!             --input qemu         inject into the guest console (default)
 //!     --codec lossless (default)|raw|lossy  frame coding (lossless =
 //!             tile-delta against the previous frame; raw = unchanged wire;
-//!             lossy = PyroWave; see docs/compression.md). Client negotiates.
+//!             lossy = PyroWave; see docs/ARCHITECTURE.md). Client negotiates.
 //!     --capture-sync auto (default) = fence -> vblank -> one-behind
 //!     --fps 0 (default) = uncapped, consumer-paced; --audio on by default
 //!   --mode testcard   synthetic frames (validates the transport end-to-end)

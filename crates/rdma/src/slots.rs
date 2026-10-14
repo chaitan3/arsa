@@ -11,7 +11,7 @@
 //!   path refuses peer-DMA mappings (ENOMEM).
 //! - CUDA's `cuMemGetHandleForAddressRange(DMA_BUF_FD)` export is refused
 //!   on GeForce-class GPUs (RM product gate: CUDA_ERROR_NOT_SUPPORTED).
-//! Full results in `docs/client-display.md`; resurrect on cooperative
+//! Full results in `docs/DEBUG.md`; resurrect on cooperative
 //! hardware (open-module pro/data-center GPUs or Mesa GPUs) if ever needed.
 
 use anyhow::{bail, Result};
