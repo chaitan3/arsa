@@ -167,7 +167,7 @@ both ends.
 | --- | --- |
 | `--source drm\|qemu` | Capture the host KMS scanout (default) or a QEMU guest. |
 | `--input qemu\|uinput` | Injection sink. Default: paired with the source (`drm`→`uinput`, `qemu`→`qemu-dbus`). |
-| `--listen ADDR:PORT` | Bind address (default `0.0.0.0:4791`). |
+| `--listen ADDR:PORT` | Bind address (default `0.0.0.0:4791`). May also be given as the first positional argument, e.g. `rdma-display-server 0.0.0.0:4791`; a bare host gets port 4791. |
 | `--codec raw\|lossless\|lossy` | Frame coding (default `lossless`). |
 | `--transport auto\|rdma\|tcp` | Video transport (default `auto`: RDMA when possible). |
 | `--fps N` | Pacing cap; `0` = consumer-paced by client credits (default). |

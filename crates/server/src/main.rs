@@ -40,10 +40,36 @@ mod signals;
 
 use gpu_power::GpuPower;
 
+/// Default bind address/port when the user gives only a host (or nothing).
+const DEFAULT_LISTEN: &str = "0.0.0.0:4791";
+/// The signaling port (kept in sync with the client's `DEFAULT_PORT`).
+const DEFAULT_PORT: u16 = 4791;
+
+/// Append the default signaling port when the user gives only a host or IP
+/// (`192.168.4.2`, or `--listen 192.168.4.2`). An explicit port is left alone,
+/// including the bracketed IPv6 form `[::1]:4791`; a bare IPv6 literal is also
+/// left alone (it needs brackets to carry a port).
+fn with_default_port(s: &str) -> String {
+    // Bracketed IPv6 carries a port only after "]:". Otherwise `host:port` has
+    // exactly one colon; no colon means append the default, and two or more
+    // means a bare IPv6 literal, which we must not rewrite.
+    let has_port = if let Some(rest) = s.strip_prefix('[') {
+        rest.contains("]:")
+    } else {
+        s.contains(':')
+    };
+    if s.is_empty() || has_port {
+        s.to_string()
+    } else {
+        format!("{s}:{DEFAULT_PORT}")
+    }
+}
+
 fn main() -> Result<()> {
     let mut mode = "capture".to_string();
     let mut device: Option<String> = None;
-    let mut listen: String = "0.0.0.0:4791".to_string();
+    // the listen address: `--listen ADDR:PORT` or the first positional argument
+    let mut listen: Option<String> = None;
     let mut slots: usize = 3;
     let mut fps: u64 = 0;
     let mut source = "drm".to_string();
@@ -75,7 +101,7 @@ fn main() -> Result<()> {
         match arg.as_str() {
             "--mode" => mode = args.next().expect("--mode needs a value"),
             "--device" => device = Some(args.next().expect("--device needs a value")),
-            "--listen" => listen = args.next().expect("--listen needs a value"),
+            "--listen" => listen = Some(args.next().expect("--listen needs a value")),
             "--slots" => slots = args.next().expect("--slots needs a value").parse()?,
             "--fps" => fps = args.next().expect("--fps needs a value").parse()?,
 
@@ -147,7 +173,8 @@ fn main() -> Result<()> {
                 idle_metrics = args.next().expect("--idle-metrics needs a value").parse()?
             }
             "--help" | "-h" => {
-                println!("usage: rdma-display-server [--mode capture|testcard] [--device mlx5_0] [--listen 0.0.0.0:4791] [--slots 3] [--fps N]\n  \
+                println!("usage: rdma-display-server [ADDR[:PORT]] [--mode capture|testcard] [--device mlx5_0] [--listen 0.0.0.0:4791] [--slots 3] [--fps N]\n  \
+  ADDR[:PORT]  listen address, the same as --listen (default 0.0.0.0:4791; the port defaults to 4791 when omitted)\n  \
   defaults: --mode capture --source drm --fps 0 --codec lossless --audio on --capture-sync auto (a bare command is a root KMS capture of the host)\n  \
 capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS capture, the host — requires sudo/CAP_SYS_ADMIN, kernel >= 5.8)\n  \
   --input qemu|uinput (default auto: qemu↔qemu-dbus, drm↔uinput)\n  \
@@ -168,9 +195,19 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
   compat socket (XDG_RUNTIME_DIR must point at the user's session when running under sudo; '@DEFAULT_MONITOR@' = default sink).");
                 return Ok(());
             }
-            other => anyhow::bail!("unknown arg: {other}"),
+            other if other.starts_with("--") => anyhow::bail!("unknown arg: {other}"),
+            // first bare argument is the listen address (same format as
+            // --listen); anything after that is not something we understand
+            other => {
+                if listen.is_none() {
+                    listen = Some(other.to_string());
+                } else {
+                    anyhow::bail!("unexpected argument: {other}");
+                }
+            }
         }
     }
+    let listen = with_default_port(listen.as_deref().unwrap_or(DEFAULT_LISTEN));
 
     // internal: setuid-down audio helper (spawned by run_capture; runs as
     // the session user, needs no RDMA device, must not touch ibverbs)
@@ -2436,5 +2473,31 @@ mod display_apply_tests {
             &mut orig,
         );
         assert!(!set.ok);
+    }
+}
+
+#[cfg(test)]
+mod listen_arg_tests {
+    use super::*;
+
+    #[test]
+    fn appends_default_port_when_missing() {
+        assert_eq!(
+            with_default_port("192.168.4.2"),
+            format!("192.168.4.2:{DEFAULT_PORT}")
+        );
+        assert_eq!(with_default_port("0.0.0.0"), format!("0.0.0.0:{DEFAULT_PORT}"));
+    }
+
+    #[test]
+    fn preserves_explicit_port() {
+        assert_eq!(with_default_port("192.168.4.2:5000"), "192.168.4.2:5000");
+        assert_eq!(with_default_port("[::1]:4791"), "[::1]:4791");
+    }
+
+    #[test]
+    fn leaves_bare_ipv6_and_empty_alone() {
+        assert_eq!(with_default_port("::1"), "::1");
+        assert_eq!(with_default_port(""), "");
     }
 }
