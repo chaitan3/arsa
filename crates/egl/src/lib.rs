@@ -187,7 +187,7 @@ impl SharedContext {
             if initialize(dpy, &mut major, &mut minor) == 0 {
                 bail!("eglInitialize failed (err {:#06x})", get_error());
             }
-            eprintln!(
+            log::debug!(
                 "[egl] EGL {major}.{minor} on {:?}",
                 rendernode.unwrap_or("default device")
             );
@@ -205,7 +205,7 @@ impl SharedContext {
                     "EGL_ANDROID_native_fence_sync",
                 ] {
                     let have = list.split(' ').any(|e| e == name);
-                    eprintln!("[egl]   {} {}", if have { "yes" } else { "-- " }, name);
+                    log::debug!("[egl]   {} {}", if have { "yes" } else { "-- " }, name);
                 }
             }
 
@@ -227,7 +227,7 @@ impl SharedContext {
                 bail!("eglCreateContext failed (err {:#06x})", get_error());
             }
             let pbuf = if make_current(dpy, std::ptr::null_mut(), std::ptr::null_mut(), ctx) != 0 {
-                eprintln!("[egl] using surfaceless context (EGL_KHR_surfaceless_context)");
+                log::debug!("[egl] using surfaceless context (EGL_KHR_surfaceless_context)");
                 std::ptr::null_mut()
             } else {
                 let pb = [EGL_PBUFFER_WIDTH, 1, EGL_PBUFFER_HEIGHT, 1, EGL_NONE];
@@ -241,10 +241,10 @@ impl SharedContext {
                 if make_current(dpy, surf, surf, ctx) == 0 {
                     bail!("eglMakeCurrent(pbuffer) failed (err {:#06x})", get_error());
                 }
-                eprintln!("[egl] using pbuffer context");
+                log::debug!("[egl] using pbuffer context");
                 surf
             };
-            eprintln!("[egl] GLES 3.x shared context ready");
+            log::debug!("[egl] GLES 3.x shared context ready");
 
             Ok(Self {
                 _lib: lib,

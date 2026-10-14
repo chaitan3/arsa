@@ -67,7 +67,7 @@ impl InputSink for QemuDbusInput {
                 }) {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!("[input] console proxy failed: {e:#}");
+                        log::warn!("[input] console proxy failed: {e:#}");
                         return;
                     }
                 };
@@ -75,7 +75,7 @@ impl InputSink for QemuDbusInput {
                 let mo = console.mouse.clone();
                 // probe the guest's pointing-device mode once (IsAbsolute property)
                 if let Ok(abs) = async_std::task::block_on(mo.is_absolute()) {
-                    eprintln!("[input] guest mouse IsAbsolute={abs}");
+                    log::debug!("[input] guest mouse IsAbsolute={abs}");
                 }
                 loop {
                     let ev = match rx.recv_timeout(std::time::Duration::from_millis(50)) {
@@ -109,7 +109,7 @@ impl InputSink for QemuDbusInput {
                                     5 => qemu_display::MouseButton::Side,
                                     6 => qemu_display::MouseButton::Extra,
                                     other => {
-                                        eprintln!("[input] unknown button {other}");
+                                        log::debug!("[input] unknown button {other}");
                                         return Ok(());
                                     }
                                 };
@@ -129,10 +129,10 @@ impl InputSink for QemuDbusInput {
                         }
                     });
                     if let Err(e) = r {
-                        eprintln!("[input] D-Bus call failed for {ev:?}: {e}");
+                        log::warn!("[input] D-Bus call failed for {ev:?}: {e}");
                     }
                 }
-                eprintln!("[input] control channel closed; input forwarding stopped");
+                log::debug!("[input] control channel closed; input forwarding stopped");
             })
             .context("spawn input forwarder")?;
         Ok(Running::new(stop, vec![join]))
@@ -448,7 +448,7 @@ impl InputSink for UinputSink {
             .name("input-uinput".into())
             .spawn(move || {
                 if let Err(e) = uinput_loop(rx, screen, pad_tx, wake_w.as_raw_fd(), in_stop) {
-                    eprintln!("[input] uinput sink failed: {e:#}");
+                    log::warn!("[input] uinput sink failed: {e:#}");
                 }
             })
             .context("spawn uinput input thread")?;
@@ -579,7 +579,7 @@ fn uinput_gamepad() -> Result<UinputDev> {
         // events (input core filters EV_KEY by keybit) — so failures are
         // logged, not swallowed
         if let Err(e) = d.set_keybit(b) {
-            eprintln!("[input] gamepad UI_SET_KEYBIT({b:#x}) failed: {e}");
+            log::warn!("[input] gamepad UI_SET_KEYBIT({b:#x}) failed: {e}");
         }
     }
     d.set_absinfo(proto::gamepad::ABS_X as u16, -32768, 32767, 16, 128, 0)?;
@@ -661,10 +661,10 @@ fn gamepad_loop(
     // vanished" between sessions). Higher slots stay lazy.
     match uinput_gamepad() {
         Ok(d) => {
-            eprintln!("[input] virtual gamepad slot 0 ready (eager)");
+            log::debug!("[input] virtual gamepad slot 0 ready (eager)");
             pads.insert(0, d);
         }
-        Err(e) => eprintln!("[input] eager uinput gamepad create failed (events will retry lazily): {e:#}"),
+        Err(e) => log::warn!("[input] eager uinput gamepad create failed (events will retry lazily): {e:#}"),
     }
     loop {
         if stop.stopped() {
@@ -687,7 +687,7 @@ fn gamepad_loop(
                 if errno_is(&e, libc::EINTR) {
                     continue;
                 }
-                eprintln!("[input] gamepad poll failed: {e}");
+                log::debug!("[input] gamepad poll failed: {e}");
             }
             continue;
         }
@@ -705,11 +705,11 @@ fn gamepad_loop(
                     Some(d) => d,
                     None => match uinput_gamepad() {
                         Ok(d) => {
-                            eprintln!("[input] virtual gamepad slot {slot} created");
+                            log::debug!("[input] virtual gamepad slot {slot} created");
                             pads.entry(slot).or_insert(d)
                         }
                         Err(e) => {
-                            eprintln!("[input] uinput gamepad create failed: {e:#}");
+                            log::warn!("[input] uinput gamepad create failed: {e:#}");
                             continue;
                         }
                     },
@@ -891,20 +891,20 @@ fn uinput_loop(
     stop: Stop,
 ) -> Result<()> {
     let kb = uinput_keyboard().context("create uinput keyboard")?;
-    eprintln!("[input] uinput keyboard created");
+    log::debug!("[input] uinput keyboard created");
     // both mice created up front: the ABS device uses inputtino's giant
     // fixed ranges, so nothing needs recreation when the dims change
     let rel_ptr = match uinput_pointer_rel() {
         Ok(d) => Some(d),
         Err(e) => {
-            eprintln!("[input] uinput rel mouse create failed: {e:#}");
+            log::debug!("[input] uinput rel mouse create failed: {e:#}");
             None
         }
     };
     let abs_ptr = match uinput_pointer_abs() {
         Ok(d) => Some(d),
         Err(e) => {
-            eprintln!("[input] uinput abs mouse create failed: {e:#}");
+            log::debug!("[input] uinput abs mouse create failed: {e:#}");
             None
         }
     };
@@ -930,9 +930,9 @@ fn uinput_loop(
         };
         match ev {
             InputEvent::Key { code, down } => {
-                eprintln!("[input] key {code:#04x} down={down}");
+                log::debug!("[input] key {code:#04x} down={down}");
                 let Some(k) = rdma_display_proto::keymap::qnum_to_linux(code) else {
-                    eprintln!("[input] no evdev mapping for qnum {code:#x}");
+                    log::debug!("[input] no evdev mapping for qnum {code:#x}");
                     continue;
                 };
                 let d = &kb;
@@ -979,7 +979,7 @@ fn uinput_loop(
                         active.emit(EV_REL, REL_WHEEL_HI_RES, hi);
                         active.syn();
                     }
-                    other => eprintln!("[input] unknown button {other}"),
+                    other => log::debug!("[input] unknown button {other}"),
                 }
             }
             InputEvent::Abs { x, y } => {
@@ -1003,7 +1003,7 @@ fn uinput_loop(
                 agg_sum.0 += dx as i64;
                 agg_sum.1 += dy as i64;
                 if agg_window.elapsed().as_secs_f64() >= 2.0 {
-                    eprintln!(
+                    log::debug!(
                         "[input] rel agg: {agg_n} ev Σdx={:+} Σdy={:+} counts in 2s",
                         agg_sum.0, agg_sum.1
                     );
@@ -1024,7 +1024,7 @@ fn uinput_loop(
             }
         }
     }
-    eprintln!("[input] control channel closed; uinput sink stopped");
+    log::debug!("[input] control channel closed; uinput sink stopped");
     Ok(())
 }
 

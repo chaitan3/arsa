@@ -200,9 +200,9 @@ pub fn install_restore_watcher() {
     crate::signals::on_signal(Box::new(|sig| {
         let target = RESTORE.lock().unwrap().take();
         if let Some((ctl, m)) = target {
-            eprintln!("[display] signal {sig}; restoring mode {}", m.label());
+            log::info!("[display] signal {sig}; restoring mode {}", m.label());
             if let Err(e) = ctl.set(m) {
-                eprintln!("[display] restore failed: {e:#}");
+                log::warn!("[display] restore failed: {e:#}");
             }
         }
     }));

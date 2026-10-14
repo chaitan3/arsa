@@ -65,14 +65,14 @@ impl Applied {
     fn reset(self) {
         if self.sm {
             match nvidia_smi(&["-rgc"]) {
-                Ok(_) => eprintln!("[gpu-power] graphics clock floor released"),
-                Err(e) => eprintln!("[gpu-power] releasing graphics clock floor failed: {e:#}"),
+                Ok(_) => log::info!("[gpu-power] graphics clock floor released"),
+                Err(e) => log::warn!("[gpu-power] releasing graphics clock floor failed: {e:#}"),
             }
         }
         if self.mem {
             match nvidia_smi(&["-rmc"]) {
-                Ok(_) => eprintln!("[gpu-power] memory clock floor released"),
-                Err(e) => eprintln!("[gpu-power] releasing memory clock floor failed: {e:#}"),
+                Ok(_) => log::info!("[gpu-power] memory clock floor released"),
+                Err(e) => log::warn!("[gpu-power] releasing memory clock floor failed: {e:#}"),
             }
         }
     }
@@ -128,7 +128,7 @@ pub fn install_cleanup(applied: Applied) {
     }
     // the shared watcher runs this alongside any other cleanup (display mode)
     crate::signals::on_signal(Box::new(move |sig| {
-        eprintln!("[gpu-power] quit signal ({sig}); releasing clock floors");
+        log::info!("[gpu-power] quit signal ({sig}); releasing clock floors");
         applied.reset();
     }));
 }
@@ -210,30 +210,30 @@ fn pin(sm_floor: u32, mem_floor: Option<u32>, ceil: MaxClocks, label: &str) -> R
     // persistence mode keeps the driver resident so the floors survive idle;
     // best-effort — a permission error here is not fatal on its own
     if let Err(e) = nvidia_smi(&["-pm", "1"]) {
-        eprintln!("[gpu-power] {label}: persistence mode not set ({e:#})");
+        log::info!("[gpu-power] {label}: persistence mode not set ({e:#})");
     }
 
     let mut applied = Applied::default();
     match lock_range("-lgc", sm_floor, ceil.sm) {
         Ok(()) => {
             applied.sm = true;
-            eprintln!(
+            log::info!(
                 "[gpu-power] {label}: graphics clock floored at {sm_floor} MHz (may boost to {})",
                 ceil.sm
             );
         }
-        Err(e) => eprintln!("[gpu-power] {label}: graphics clock floor failed: {e:#}"),
+        Err(e) => log::warn!("[gpu-power] {label}: graphics clock floor failed: {e:#}"),
     }
     if let Some(mem_floor) = mem_floor {
         match lock_range("-lmc", mem_floor, ceil.mem) {
             Ok(()) => {
                 applied.mem = true;
-                eprintln!(
+                log::info!(
                     "[gpu-power] {label}: memory clock floored at {mem_floor} MHz (may boost to {})",
                     ceil.mem
                 );
             }
-            Err(e) => eprintln!("[gpu-power] {label}: memory clock floor failed: {e:#}"),
+            Err(e) => log::warn!("[gpu-power] {label}: memory clock floor failed: {e:#}"),
         }
     }
     if !applied.any() {
@@ -243,9 +243,9 @@ fn pin(sm_floor: u32, mem_floor: Option<u32>, ceil: MaxClocks, label: &str) -> R
         "--query-gpu=pstate,clocks.sm,clocks.mem",
         "--format=csv,noheader",
     ]) {
-        eprintln!("[gpu-power] {label}: floored -> {state}");
+        log::info!("[gpu-power] {label}: floored -> {state}");
     }
-    eprintln!("[gpu-power] floors will be released on exit (manual: nvidia-smi -i 0 -rgc -rmc)");
+    log::info!("[gpu-power] floors will be released on exit (manual: nvidia-smi -i 0 -rgc -rmc)");
     Ok(applied)
 }
 

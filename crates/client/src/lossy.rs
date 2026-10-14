@@ -91,7 +91,7 @@ impl LossyDecoder {
         let ybuf = vk.host_buffer((w as u64) * (h as u64))?;
         let ubuf = vk.host_buffer((cw as u64) * (ch as u64))?;
         let vbuf = vk.host_buffer((cw as u64) * (ch as u64))?;
-        eprintln!(
+        log::info!(
             "[lossy] client decoder ready {}x{} chroma {} ({})",
             w,
             h,
@@ -103,7 +103,7 @@ impl LossyDecoder {
             },
         );
         if export {
-            eprintln!(
+            log::info!(
                 "[lossy] plane exports: fd {} pitch {} | fd {} pitch {} | fd {} pitch {}",
                 plane_fds[0],
                 plane_pitch[0],

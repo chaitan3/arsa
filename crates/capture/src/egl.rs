@@ -471,7 +471,7 @@ impl EglMaterializer {
             bail!("eglInitialize failed (err {:#06x})", egl.get_error());
         }
         ph.initialize = t.elapsed().as_micros();
-        eprintln!("[egl] EGL {}.{} on {:?}", major, minor, rendernode.unwrap_or("default device"));
+        log::debug!("[egl] EGL {}.{} on {:?}", major, minor, rendernode.unwrap_or("default device"));
         if unsafe { (egl.bind_api)(EGL_OPENGL_ES_API) } == 0 {
             bail!("eglBindAPI(OpenGL ES) failed");
         }
@@ -492,7 +492,7 @@ impl EglMaterializer {
                 ];
                 for name in wanted {
                     let have = list.split(' ').any(|e| e == name);
-                    eprintln!("[egl]   {} {}", if have { "yes" } else { "-- " }, name);
+                    log::debug!("[egl]   {} {}", if have { "yes" } else { "-- " }, name);
                 }
             }
         }
@@ -521,7 +521,7 @@ impl EglMaterializer {
         // to a 1x1 pbuffer if the driver doesn't support it.
         let surfaceless = unsafe { (egl.make_current)(dpy, std::ptr::null_mut(), std::ptr::null_mut(), ctx) } != 0;
         let pbuf = if surfaceless {
-            eprintln!("[egl] using surfaceless context (EGL_KHR_surfaceless_context)");
+            log::debug!("[egl] using surfaceless context (EGL_KHR_surfaceless_context)");
             std::ptr::null_mut()
         } else {
             let pb_surf = unsafe { (egl.create_pbuffer)(dpy, cfg, pb.as_ptr()) };
@@ -534,11 +534,11 @@ impl EglMaterializer {
             if unsafe { (egl.make_current)(dpy, pb_surf, pb_surf, ctx) } == 0 {
                 bail!("eglMakeCurrent(pbuffer) failed (err {:#06x})", egl.get_error());
             }
-            eprintln!("[egl] using pbuffer context");
+            log::debug!("[egl] using pbuffer context");
             pb_surf
         };
         ph.context = t.elapsed().as_micros();
-        eprintln!("[egl] GL ES 3.1 context ready");
+        log::debug!("[egl] GL ES 3.1 context ready");
 
         let t = Instant::now();
         let gl = Gl::load(&egl)?;
@@ -748,14 +748,14 @@ impl EglMaterializer {
             (self.gl.image_target_texture)(GL_TEXTURE_EXTERNAL_OES, img);
             let gl_err = (self.gl.get_error)();
             if gl_err != 0 {
-                eprintln!(
+                log::debug!(
                     "[egl] WARNING: image_target_texture(OES) glError={:#06x}",
                     gl_err
                 );
             }
             self.img = Some((img, tex));
         }
-        eprintln!(
+        log::debug!(
             "[egl] imported dmabuf {}x{} fourcc={:#010x} modifier={:#x}",
             d.format.width, d.format.height, d.format.fourcc, d.format.modifier
         );
@@ -782,7 +782,7 @@ fn device_display(egl: &Egl, rendernode: Option<&str>) -> Result<EglHandle> {
                     std::ffi::CStr::from_ptr(file as *const i8).to_string_lossy().into_owned()
                 })
                 .unwrap_or_default();
-            eprintln!("[egl] device[{i}]: {path}");
+            log::debug!("[egl] device[{i}]: {path}");
             if let Some(want) = rendernode {
                 if path != want {
                     continue;
@@ -855,7 +855,7 @@ impl crate::FrameMaterializer for EglMaterializer {
                         .collect(),
                 );
             }
-            eprintln!(
+            log::debug!(
                 "[egl] staging rebind mismatch (have {} slots of {} bytes, want {n} × {frame_bytes})",
                 s.pbos.len(),
                 s.frame_bytes
@@ -865,18 +865,18 @@ impl crate::FrameMaterializer for EglMaterializer {
         let syms = match BenchSyms::load(&self.egl) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[egl] PBO staging unavailable: {e}");
+                log::warn!("[egl] PBO staging unavailable: {e}");
                 return None;
             }
         };
         let Some(bufstorage) = syms.buffer_storage else {
-            eprintln!("[egl] PBO staging unavailable: no glBufferStorage (ARB_buffer_storage)");
+            log::warn!("[egl] PBO staging unavailable: no glBufferStorage (ARB_buffer_storage)");
             return None;
         };
         let fence = match (syms.create_sync, syms.client_wait_sync, syms.destroy_sync) {
             (Some(a), Some(b), Some(c)) => Some((a, b, c)),
             _ => {
-                eprintln!("[egl] no EGL_KHR_fence_sync — staging falls back to glFinish sync");
+                log::debug!("[egl] no EGL_KHR_fence_sync — staging falls back to glFinish sync");
                 None
             }
         };
@@ -894,7 +894,7 @@ impl crate::FrameMaterializer for EglMaterializer {
                     GL_MAP_READ_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT,
                 );
                 if (self.gl.get_error)() != 0 {
-                    eprintln!("[egl] PBO staging: glBufferStorage failed");
+                    log::debug!("[egl] PBO staging: glBufferStorage failed");
                     (self.gl.bind_buffer)(GL_PIXEL_PACK_BUFFER, 0);
                     for p in &pbos {
                         (syms.delete_buffers)(1, p);
@@ -909,7 +909,7 @@ impl crate::FrameMaterializer for EglMaterializer {
                 );
                 (self.gl.bind_buffer)(GL_PIXEL_PACK_BUFFER, 0);
                 if map.is_null() {
-                    eprintln!("[egl] PBO staging: persistent map failed");
+                    log::debug!("[egl] PBO staging: persistent map failed");
                     for p in &pbos {
                         (syms.delete_buffers)(1, p);
                     }
@@ -919,7 +919,7 @@ impl crate::FrameMaterializer for EglMaterializer {
                 maps.push(map);
             }
         }
-        eprintln!(
+        log::debug!(
             "[egl] PBO staging: {n} × {frame_bytes}B persistent-mapped (zero-copy send path)"
         );
         self.stage = Some(StageSlots {

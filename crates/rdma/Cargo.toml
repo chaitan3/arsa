@@ -13,3 +13,4 @@ rdma-display-codec.workspace = true
 ibverbs.workspace = true
 anyhow.workspace = true
 libloading = "0.8"
+log.workspace = true

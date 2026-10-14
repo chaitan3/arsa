@@ -75,7 +75,7 @@ pub fn run(addr: std::net::SocketAddr, buffer_ms: u32) {
         match session(addr, buffer_ms) {
             Ok(()) => unreachable!("audio session loop returned"),
             Err(e) => {
-                eprintln!("[audio] session ended: {e:#}; reconnecting in 2 s");
+                log::info!("[audio] session ended: {e:#}; reconnecting in 2 s");
             }
         }
         std::thread::sleep(Duration::from_secs(2));
@@ -102,7 +102,7 @@ fn reader(mut sock: TcpStream, shared: Arc<(Mutex<Ring>, Condvar)>) {
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                eprintln!("[audio] no packets for 10 s (silent capture — nothing playing into the server's sink?); still waiting");
+                log::warn!("[audio] no packets for 10 s (silent capture — nothing playing into the server's sink?); still waiting");
                 continue;
             }
             Err(e) => return close(&shared, format!("audio: read packet header: {e}")),
@@ -127,7 +127,7 @@ fn reader(mut sock: TcpStream, shared: Arc<(Mutex<Ring>, Condvar)>) {
         }
         if let Some(prev) = last_seq {
             if seq != prev.wrapping_add(1) {
-                eprintln!("[audio] seq gap {} -> {}", prev, seq);
+                log::debug!("[audio] seq gap {} -> {}", prev, seq);
             }
         }
         last_seq = Some(seq);
@@ -137,7 +137,7 @@ fn reader(mut sock: TcpStream, shared: Arc<(Mutex<Ring>, Condvar)>) {
         if g.push(payload) {
             let d = g.dropped;
             if d == 1 || d % 1000 == 0 {
-                eprintln!("[audio] playback ring overflow: dropped {d} packets");
+                log::debug!("[audio] playback ring overflow: dropped {d} packets");
             }
         }
         cv.notify_one();
@@ -178,7 +178,7 @@ fn session(addr: std::net::SocketAddr, buffer_ms: u32) -> Result<()> {
         buffer_ms,
         wire::PACKET_BYTES as u32,
     )?;
-    eprintln!(
+    log::info!(
         "[audio] playing (f32le {} Hz, {}ch, {} ms buffer via the default sink)",
         wire::RATE,
         wire::CHANNELS,
@@ -228,13 +228,13 @@ fn session(addr: std::net::SocketAddr, buffer_ms: u32) -> Result<()> {
                     // flush and resync rather than accumulating latency
                     let backlog_us = us as i64 - (buffer_ms as i64) * 1000;
                     if backlog_us > 150_000 {
-                        eprintln!("[audio] playout latency {} ms > buffer, flushing to resync (ring drops {drops})", us / 1000);
+                        log::debug!("[audio] playout latency {} ms > buffer, flushing to resync (ring drops {drops})", us / 1000);
                         stream.flush()?;
                     } else {
-                        eprintln!("[audio] playout latency ~{} ms (ring drops {drops})", us / 1000);
+                        log::debug!("[audio] playout latency ~{} ms (ring drops {drops})", us / 1000);
                     }
                 }
-                Err(e) => eprintln!("[audio] latency query failed: {e:#}"),
+                Err(e) => log::debug!("[audio] latency query failed: {e:#}"),
             }
         }
     }

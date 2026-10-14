@@ -148,7 +148,7 @@ impl CudaSlots {
             "cuDevicePrimaryCtxRetain",
         )?;
         cuda.ok(unsafe { (cuda.ctx_set_current)(ctx) }, "cuCtxSetCurrent")?;
-        eprintln!("[slots] cuda: device {ordinal} ready (primary ctx retained, DMA_BUF supported)");
+        log::info!("[slots] cuda: device {ordinal} ready (primary ctx retained, DMA_BUF supported)");
         Ok(CudaSlots { cuda, device: dev })
     }
 }
@@ -179,12 +179,12 @@ impl SlotAlloc for CudaSlots {
         // best-effort CPU view, same policy as the GBM path
         let map = mmap_read_fd(fd.as_raw_fd(), size);
         if map.is_null() {
-            eprintln!(
+            log::warn!(
                 "[slots] cuda NOTE: PRIME mmap failed — content checks use DtoH copy \
                  (registration unaffected)"
             );
         }
-        eprintln!("[slots] cuda slot: dptr={dptr:#x} size={size} fd={}", fd.as_raw_fd());
+        log::info!("[slots] cuda slot: dptr={dptr:#x} size={size} fd={}", fd.as_raw_fd());
         Ok(Box::new(CudaSlot {
             cuda: Arc::clone(&self.cuda),
             dptr,

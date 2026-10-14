@@ -467,7 +467,7 @@ impl EglWindow {
         if unsafe { (egl.initialize)(dpy, &mut major, &mut minor) } == 0 {
             bail!("eglInitialize failed (err {:#06x})", err());
         }
-        eprintln!("[eglwin] EGL {major}.{minor} display on compositor");
+        log::info!("[eglwin] EGL {major}.{minor} display on compositor");
         if unsafe { (egl.bind_api)(EGL_OPENGL_ES_API) } == 0 {
             bail!("eglBindAPI(ES) failed (err {:#06x})", err());
         }
@@ -499,7 +499,7 @@ impl EglWindow {
                 (egl.get_config_attrib)(dpy, cfg, a, &mut v);
                 v
             };
-            eprintln!(
+            log::debug!(
                 "[egl] window config: id={} buffer={} red={} alpha={} native_visual=0x{:x} (alpha=0 => XRGB/opaque, direct-scanout friendly)",
                 attrib(EGL_CONFIG_ID),
                 attrib(EGL_BUFFER_SIZE),
@@ -636,13 +636,13 @@ impl EglWindow {
                     std::ffi::CStr::from_ptr(p as *const i8).to_string_lossy().into_owned()
                 }
             };
-            eprintln!(
+            log::info!(
                 "[eglwin] window GL: {} | {}",
                 s((me.gl.get_string)(GL_VENDOR)),
                 s((me.gl.get_string)(GL_RENDERER))
             );
         }
-        eprintln!("[eglwin] window surface ready: {width}x{height}, ES 3.0");
+        log::info!("[eglwin] window surface ready: {width}x{height}, ES 3.0");
         Ok(me)
     }
 
@@ -699,7 +699,7 @@ impl EglWindow {
             (self.gl.bind_texture)(GL_TEXTURE_2D, 0);
             self.ov_tex = tex;
         }
-        eprintln!("[eglwin] metrics overlay enabled");
+        log::info!("[eglwin] metrics overlay enabled");
         Ok(())
     }
 
@@ -765,7 +765,7 @@ impl EglWindow {
         self.width = w;
         self.height = h;
         let scl = self.scale();
-        eprintln!(
+        log::info!(
             "[eglwin] buffer {}x{} (frame {}x{}, scale {scl:.3}, filter {})",
             w,
             h,
@@ -1015,7 +1015,7 @@ impl EglWindow {
             return;
         }
         let names: Vec<String> = fmts[..got as usize].iter().map(|f| fourcc_name(*f)).collect();
-        eprintln!("[eglwin] EGL dma-buf formats ({}): {}", got, names.join(" "));
+        log::info!("[eglwin] EGL dma-buf formats ({}): {}", got, names.join(" "));
 
         let q_mods: unsafe extern "system" fn(
             *mut c_void,
@@ -1039,7 +1039,7 @@ impl EglWindow {
             if q_mods(self.dpy, f, 0, std::ptr::null_mut(), std::ptr::null_mut(), &mut m) == 0
                 || m <= 0
             {
-                eprintln!("[eglwin] EGL {}: not importable", fourcc_name(f).trim());
+                log::info!("[eglwin] EGL {}: not importable", fourcc_name(f).trim());
                 continue;
             }
             let mut mods = vec![0u64; m as usize];
@@ -1055,7 +1055,7 @@ impl EglWindow {
                 .enumerate()
                 .map(|(k, mm)| format!("0x{mm:x}{}", if ext[k] != 0 { "(ext)" } else { "" }))
                 .collect();
-            eprintln!(
+            log::info!(
                 "[eglwin] EGL {} modifiers ({}): {}",
                 fourcc_name(f).trim(),
                 gm,
@@ -1097,7 +1097,7 @@ impl EglWindow {
             unsafe {
                 let e = (self.egl.query_string)(self.dpy, EGL_EXTENSIONS);
                 if !e.is_null() {
-                    eprintln!(
+                    log::info!(
                         "[eglwin] EGL extensions: {}",
                         std::ffi::CStr::from_ptr(e).to_string_lossy()
                     );
@@ -1109,7 +1109,7 @@ impl EglWindow {
                         .split_whitespace()
                         .filter(|x| x.contains("EGL_image") || x.contains("dma_buf"))
                         .collect();
-                    eprintln!("[eglwin] GL EGL-image extensions: {}", of.join(" "));
+                    log::info!("[eglwin] GL EGL-image extensions: {}", of.join(" "));
                 }
                 self.log_dmabuf_support();
             }
@@ -1158,7 +1158,7 @@ impl EglWindow {
                     self.yuv_external = external;
                     match self.build_yuv_program() {
                         Ok(()) => {
-                            eprintln!(
+                            log::info!(
                                 "[eglwin] lossy: YUV planes imported as dma-bufs ({} {what}, GPU YUV->RGB)",
                                 if external {
                                     "GL_TEXTURE_EXTERNAL_OES"
@@ -1170,7 +1170,7 @@ impl EglWindow {
                         }
                         Err(e) => {
                             if lossy_debug() {
-                                eprintln!("[eglwin] lossy: {what} shader failed: {e:#}");
+                                log::warn!("[eglwin] lossy: {what} shader failed: {e:#}");
                             }
                             unsafe { self.release_yuv_images(&destroy_image) };
                             last_err = Some(e);
@@ -1180,7 +1180,7 @@ impl EglWindow {
                 Err(e) => {
                     unsafe { self.release_yuv_images(&destroy_image) };
                     if lossy_debug() {
-                        eprintln!("[eglwin] lossy: dma-buf import ({what}) failed: {e:#}");
+                        log::warn!("[eglwin] lossy: dma-buf import ({what}) failed: {e:#}");
                     }
                     last_err = Some(e);
                 }
@@ -1214,7 +1214,7 @@ impl EglWindow {
         (self.gl.gen_textures)(3, self.yuv_tex.as_mut_ptr());
         for (i, (fd, w, h, pitch)) in planes.iter().enumerate() {
             if lossy_debug() {
-                eprintln!(
+                log::info!(
                     "[eglwin] lossy plane {i}: fd {fd} {w}x{h} pitch {pitch} target {target:#06x} {}",
                     if use_modifier { "modifier" } else { "legacy" }
                 );

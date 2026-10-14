@@ -54,6 +54,13 @@ it, so reporting them under one fixed label was misleading.
 
 ## 2. Overlays, logs, and diagnostics
 
+Both binaries log through `log` + `env_logger`. By default they print the
+user-facing lines — init, connection/disconnect, and feature-disabling failures
+(`info`/`warn`). `-v`/`--verbose` adds per-frame/per-event/setup/timing detail
+(`debug`). The `RUST_LOG` environment variable overrides either default, e.g.
+`RUST_LOG=rdma_display_capture=debug`. Output format is `[LEVEL] message` (the
+`[tag]` prefix is kept inside the message).
+
 - **`--metrics`** (client): per-stage latency overlay + clock-sync pings.
 - **`--idle-metrics N`** (server): log RSS/CPU/threads every N seconds.
 - **`--input-test`** (server): synthesize a test input sequence.

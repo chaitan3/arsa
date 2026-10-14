@@ -33,6 +33,7 @@ fn main() -> Result<()> {
     let mut cuda_device: u32 = 0;
     let mut output: String = "egl".to_string();
     let mut metrics_on = false;
+    let mut verbose = false;
     let mut fullscreen = false;
     let mut grab = false;
     let mut audio_on = true;
@@ -62,6 +63,7 @@ fn main() -> Result<()> {
             "--cuda-device" => cuda_device = args.next().expect("--cuda-device needs a value").parse()?,
             "--output" => output = args.next().expect("--output needs a value").to_string(),
             "--metrics" => metrics_on = true,
+            "-v" | "--verbose" => verbose = true,
             "-f" | "--fullscreen" => fullscreen = true,
             "-g" | "--grab" => grab = true,
             "--audio" => audio_on = true,
@@ -105,6 +107,7 @@ fn main() -> Result<()> {
                 println!("  --audio | --no-audio  play the server's audio side-channel (default sink; server captures its own monitor source). Default on; --no-audio disables");
                 println!("  --audio-buffer-ms N   client playout buffer depth / pulse tlength (default {}; lower = less latency, less jitter headroom)", rdma_display_audio::wire::BUFFER_MS);
                 println!("  --metrics             per-stage latency overlay (capture, send, transfer, upload, present, on-screen) + clock-sync pings");
+                println!("  -v, --verbose         debug-level logging (per-frame/per-event detail; RUST_LOG overrides)");
                 println!("  --no-controller       don't forward attached gamepads");
                 println!("  --no-controller-grab  leave the gamepad exclusive-grabbable by the local compositor too (default: EVIOCGRAB while streaming)");
                 println!("  --fake-gamepad        synthesize a controller (slot 0) for testing without hardware");
@@ -135,7 +138,7 @@ fn main() -> Result<()> {
     if !["host", "cuda"].contains(&slot_mem.as_str()) {
         anyhow::bail!("--slot-mem must be host|cuda, got {slot_mem:?}");
     }
-
+    init_logging(verbose);
     // `HOST` (positional or `-s`/`--server`) without a port uses the default port
     let server = with_default_port(server.as_deref().unwrap_or("127.0.0.1"));
     let addr = server
@@ -152,7 +155,7 @@ fn main() -> Result<()> {
         (&stream).write_all(&[rdma_display_proto::TAG_CONTROL])?;
         (&stream).flush()?;
     }
-    eprintln!("connected to {server} (t={} ms)", t0.elapsed().as_millis());
+    log::info!("connected to {server} (t={} ms)", t0.elapsed().as_millis());
 
     // video transport: auto prefers RDMA and falls back to TCP (matching the
     // server); with TCP there is no RDMA device to open at all
@@ -167,7 +170,7 @@ fn main() -> Result<()> {
                 if transport == rdma_display_rdma::TransportPref::Rdma {
                     return Err(e).context("--transport rdma: open RDMA device");
                 }
-                eprintln!("[client] no RDMA device ({e:#}); using TCP video transport");
+                log::warn!("[client] no RDMA device ({e:#}); using TCP video transport");
                 None
             }
         },
@@ -191,9 +194,9 @@ fn main() -> Result<()> {
         mode_req,
     )?;
     if link.slots_gpu_only() {
-        eprintln!("[client] GPU slots without CPU mapping: content checks use the verification-only device->host copy (the render path itself stays zero-copy)");
+        log::info!("[client] GPU slots without CPU mapping: content checks use the verification-only device->host copy (the render path itself stays zero-copy)");
     }
-    eprintln!(
+    log::info!(
         "session up: {}x{} fourcc=0x{:08x} modifier=0x{:x} frame_bytes={} slots={}",
         link.meta.width,
         link.meta.height,
@@ -202,7 +205,7 @@ fn main() -> Result<()> {
         link.meta.frame_bytes,
         slots,
     );
-    eprintln!("[client] handshake done t={} ms", t0.elapsed().as_millis());
+    log::info!("[client] handshake done t={} ms", t0.elapsed().as_millis());
 
     // Wayland presentation: the EGL upload backend — the mirror of the
     // server's copy path. Needs a CPU view of the slots (host memory):
@@ -219,7 +222,7 @@ fn main() -> Result<()> {
     };
 
     if grab && output != "egl" {
-        eprintln!("[client] --grab needs --output egl (no window to grab with --output {output})");
+        log::warn!("[client] --grab needs --output egl (no window to grab with --output {output})");
     }
     let mut presenter = match output.as_str() {
         "none" => None,
@@ -240,7 +243,7 @@ fn main() -> Result<()> {
         }
         other => bail!("--output must be none|egl, got {other:?}"),
     };
-    eprintln!("[client] presenter ready t={} ms", t0.elapsed().as_millis());
+    log::info!("[client] presenter ready t={} ms", t0.elapsed().as_millis());
 
     // GPU lossless decode: when presenting through eglwin's GL context and the
     // session uses the lossless codec, decode the tiles straight into a texture
@@ -256,14 +259,14 @@ fn main() -> Result<()> {
         match rdma_display_codec_gpu::GpuVideoDecoder::attach_current(geom) {
             Ok(dec) => match dec.create_texture(link.meta.width, link.meta.height) {
                 Ok(tex) => {
-                    eprintln!("[client] lossless decode: GPU -> texture (no full-frame upload)");
+                    log::info!("[client] lossless decode: GPU -> texture (no full-frame upload)");
                     gl_lossless = Some((dec, tex));
                 }
                 Err(e) => {
-                    eprintln!("[client] lossless decode: GPU texture failed ({e:#}); using CPU")
+                    log::warn!("[client] lossless decode: GPU texture failed ({e:#}); using CPU")
                 }
             },
-            Err(e) => eprintln!("[client] lossless decode: GPU unavailable ({e:#}); using CPU"),
+            Err(e) => log::warn!("[client] lossless decode: GPU unavailable ({e:#}); using CPU"),
         }
     }
 
@@ -299,7 +302,7 @@ fn main() -> Result<()> {
             .name("audio".into())
             .spawn(move || rdma_display_audio::playback::run(addr, audio_buffer_ms))
             .context("spawn audio thread")?;
-        eprintln!("[audio] client stream connecting ({addr})");
+        log::info!("[audio] client stream connecting ({addr})");
     }
 
     let started = Instant::now();
@@ -371,13 +374,13 @@ fn main() -> Result<()> {
                                     dec.upload(&coded[..n])?;
                                     dec.decode_to_image(*tex, h.count as usize)?;
                                 } else {
-                                    eprintln!(
+                                    log::debug!(
                                         "[client] lossless: coded {n} > slot {}",
                                         coded.len()
                                     );
                                 }
                             }
-                            Err(e) => eprintln!("[client] lossless: header parse failed: {e:#}"),
+                            Err(e) => log::debug!("[client] lossless: header parse failed: {e:#}"),
                         }
                     } else {
                         // geometry changed (Meta resize): the server resets the
@@ -395,7 +398,7 @@ fn main() -> Result<()> {
             if let Some((seq, slot, t3)) = newest {
                 if !first_frame_logged {
                     first_frame_logged = true;
-                    eprintln!(
+                    log::info!(
                         "[client] first frame t={} ms (seq {seq})",
                         t0.elapsed().as_millis()
                     );
@@ -455,7 +458,7 @@ fn main() -> Result<()> {
                                     lossy_dec = Some(dec);
                                 }
                                 Err(e) => {
-                                    eprintln!(
+                                    log::warn!(
                                         "[lossy] GPU YUV interop unavailable ({e:#}); \
                                          falling back to the CPU upload path"
                                     );
@@ -497,7 +500,7 @@ fn main() -> Result<()> {
                 last_seq = seq;
                 frames += 1;
                 if seq % 60 == 0 || seq == 0 {
-                    eprintln!("[client] presented seq={seq} slot={slot}");
+                    log::debug!("[client] presented seq={seq} slot={slot}");
                 }
             }
             // metrics: drain control events (stamps/pongs) + keep the clock
@@ -529,7 +532,7 @@ fn main() -> Result<()> {
             // forward queued user-input events to the server
             // (input has its own thread + connection now — see input_thread)
             if p.closed() {
-                eprintln!("[client] window closed, ending");
+                log::info!("[client] window closed, ending");
                 break;
             }
         } else {
@@ -563,7 +566,7 @@ fn main() -> Result<()> {
                     if want_stats {
                         let sum: u32 = dec.iter().map(|b| *b as u32).sum();
                         let nonzero = dec.iter().filter(|b| **b != 0).count();
-                        eprintln!(
+                        log::debug!(
                             "[client-check] seq={} slot={} sum={} nonzero={}/{}",
                             seq, slot, sum, nonzero, dec.len()
                         );
@@ -578,7 +581,7 @@ fn main() -> Result<()> {
                 let bytes = link.frame(slot)?;
                 let sum: u32 = bytes.iter().map(|b| *b as u32).sum();
                 let nonzero = bytes.iter().filter(|b| **b != 0).count();
-                eprintln!(
+                log::debug!(
                     "[client-check] seq={} slot={} sum={} nonzero={}/{}",
                     seq, slot, sum, nonzero, bytes.len()
                 );
@@ -596,7 +599,7 @@ fn main() -> Result<()> {
         }
         if last_report.elapsed() >= std::time::Duration::from_secs(5) {
             let elapsed = started.elapsed().as_secs_f64();
-            eprintln!(
+            log::debug!(
                 "[stats] frames={} fps={:.1} seq={}",
                 frames,
                 frames as f64 / elapsed,
@@ -620,7 +623,7 @@ fn main() -> Result<()> {
             last_report = Instant::now();
         }
     }
-    eprintln!("done: {} frames in {:?}", frames, started.elapsed());
+    log::info!("done: {} frames in {:?}", frames, started.elapsed());
     Ok(())
 }
 
@@ -639,7 +642,7 @@ fn input_thread(
         let sock = match TcpStream::connect(addr) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[input] connect {addr} failed: {e}");
+                log::warn!("[input] connect {addr} failed: {e}");
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
                 continue;
@@ -653,14 +656,14 @@ fn input_thread(
             backoff = (backoff * 2).min(std::time::Duration::from_secs(2));
             continue;
         }
-        eprintln!("[input] connected ({addr})");
+        log::info!("[input] connected ({addr})");
         backoff = std::time::Duration::from_millis(200);
         let mut conn = Conn::new(sock);
         loop {
             match rx.recv() {
                 Ok(ev) => {
                     if conn.send(&rdma_display_proto::Message::Input(ev)).is_err() {
-                        eprintln!("[input] send failed; reconnecting");
+                        log::warn!("[input] send failed; reconnecting");
                         break;
                     }
                 }
@@ -687,7 +690,7 @@ fn route_control(
         // the presenter applies the new meta to the link/window
         rdma_display_rdma::ControlEvent::Meta(m) => Some(m),
         rdma_display_rdma::ControlEvent::ModeReply(r) => {
-            eprintln!(
+            log::info!(
                 "[client] display mode: {} ({}{})",
                 r.mode_label(),
                 if r.ok { "ok" } else { "failed" },
@@ -742,12 +745,12 @@ fn wire_bytes(link: &rdma_display_rdma::ClientLink, slot: usize) -> usize {
 /// applied (slots are sized at handshake); the wire format is always XR24, so
 /// a fourcc/stride change at the same frame size does not affect the upload.
 fn apply_meta(link: &mut rdma_display_rdma::ClientLink, meta: &rdma_display_proto::DisplayMeta) {
-    eprintln!(
+    log::debug!(
         "[client] display meta gen {} ({}x{} stride {} fourcc {:#010x})",
         meta.gen, meta.width, meta.height, meta.stride, meta.fourcc
     );
     if meta.frame_bytes != link.meta.frame_bytes {
-        eprintln!(
+        log::warn!(
             "[client] WARNING: frame size changed mid-session ({} -> {} bytes); reconnect to apply",
             link.meta.frame_bytes, meta.frame_bytes
         );
@@ -773,7 +776,7 @@ fn dump_ppm(path: &str, meta: &rdma_display_proto::DisplayMeta, bytes: &[u8]) ->
         }
     }
     std::fs::write(path, &ppm).with_context(|| format!("write {path}"))?;
-    eprintln!("dumped {path}");
+    log::info!("dumped {path}");
     Ok(())
 }
 
@@ -796,12 +799,12 @@ fn resolve_mode_request(
     }
     if native {
         if output == "none" {
-            eprintln!("[client] --native ignored with --output none (no output to query)");
+            log::info!("[client] --native ignored with --output none (no output to query)");
             return Ok(ModeRequest::Keep);
         }
         match wayland::query_output_mode() {
             Ok((w, h, r)) => {
-                eprintln!("[client] --native: output mode {w}x{h}@{r} mHz");
+                log::info!("[client] --native: output mode {w}x{h}@{r} mHz");
                 return Ok(ModeRequest::Set {
                     width: w,
                     height: h,
@@ -809,7 +812,7 @@ fn resolve_mode_request(
                 });
             }
             Err(e) => {
-                eprintln!(
+                log::warn!(
                     "[client] --native: could not read the output mode ({e:#}); \
                      not requesting a change"
                 );
@@ -842,6 +845,20 @@ fn parse_mode_spec(s: &str) -> Result<(u32, u32, u32)> {
         None => 0,
     };
     Ok((w, h, refresh_mhz))
+}
+
+/// Initialize the logger. `-v`/`--verbose` enables debug for our crates; the
+/// `RUST_LOG` environment variable overrides either default.
+fn init_logging(verbose: bool) {
+    use std::io::Write as _;
+    let default = if verbose {
+        "warn,rdma_display=debug"
+    } else {
+        "warn,rdma_display=info"
+    };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default))
+        .format(|buf, record| writeln!(buf, "[{}] {}", record.level(), record.args()))
+        .init();
 }
 
 /// Append the default signaling port when the user gives only a host or IP

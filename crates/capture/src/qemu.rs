@@ -30,7 +30,7 @@ impl qemu_display::ConsoleListenerHandler for Listener {
             y0_top: true,
             num_planes: 1,
         };
-        eprintln!(
+        log::info!(
             "[capture] plain Scanout {}x{} stride={} pixman={:#010x} bytes={} (treating as XR24)",
             s.width,
             s.height,
@@ -46,7 +46,7 @@ impl qemu_display::ConsoleListenerHandler for Listener {
     }
 
     async fn update(&mut self, u: qemu_display::Update) {
-        eprintln!(
+        log::info!(
             "[capture] plain Update rect=({},{}) {}x{} stride={} format={:#010x} bytes={}",
             u.x, u.y, u.w, u.h, u.stride, u.format, u.data.len()
         );
@@ -65,7 +65,7 @@ impl qemu_display::ConsoleListenerHandler for Listener {
     }
 
     async fn scanout_dmabuf(&mut self, s: qemu_display::ScanoutDMABUF) {
-        eprintln!(
+        log::info!(
             "[capture] ScanoutDMABUF {}x{} planes={} fourcc={:#010x} modifier={:#x} y0_top={}",
             s.width, s.height, s.num_planes, s.fourcc, s.modifier, s.y0_top
         );
@@ -99,7 +99,7 @@ impl qemu_display::ConsoleListenerHandler for Listener {
     }
 
     async fn update_dmabuf(&mut self, u: qemu_display::UpdateDMABUF) {
-        eprintln!(
+        log::info!(
             "[capture] UpdateDMABUF rect=({},{}) {}x{}",
             u.x, u.y, u.w, u.h
         );
@@ -121,7 +121,7 @@ impl qemu_display::ConsoleListenerHandler for Listener {
     async fn mouse_set(&mut self, _m: qemu_display::MouseSet) {}
     async fn cursor_define(&mut self, _c: qemu_display::Cursor) {}
     fn disconnected(&mut self) {
-        eprintln!("[capture] disconnected from QEMU");
+        log::info!("[capture] disconnected from QEMU");
     }
     fn interfaces(&self) -> Vec<String> {
         vec!["org.qemu.Display1.Listener".to_string()]
@@ -136,7 +136,7 @@ pub async fn open_console(
     console: u32,
 ) -> Result<qemu_display::Console> {
     let conn: zbus::Connection = if let Some(path) = dbus_socket {
-        eprintln!("[capture] connecting to dbus at {path}");
+        log::info!("[capture] connecting to dbus at {path}");
         let stream = std::os::unix::net::UnixStream::connect(path)
             .with_context(|| format!("connect {path}"))?;
         zbus::connection::Builder::async_io_unix_stream(stream)
@@ -144,7 +144,7 @@ pub async fn open_console(
             .await
             .context("dbus connect")?
     } else {
-        eprintln!("[capture] connecting to session bus");
+        log::info!("[capture] connecting to session bus");
         zbus::Connection::session().await.context("session bus")?
     };
     let _display =
@@ -186,7 +186,7 @@ impl QemuDbusSource {
     async fn run(self, tx: Sender<CaptureEvent>, stop: Stop) -> Result<()> {
         let console = open_console(&self.dbus_socket, self.console).await?;
 
-        eprintln!(
+        log::info!(
             "[capture] console {}: {:?} ({}x{})",
             self.console,
             console.label().await.unwrap_or_default(),
@@ -197,7 +197,7 @@ impl QemuDbusSource {
             .register_listener(Listener { tx })
             .await
             .context("RegisterListener")?;
-        eprintln!("[capture] listener registered; streaming events");
+        log::info!("[capture] listener registered; streaming events");
 
         // Keep the console (and its D-Bus connection) alive while the events
         // flow; poll the stop token so the source can be torn down. Dropping
@@ -207,7 +207,7 @@ impl QemuDbusSource {
         while !stop.stopped() {
             async_std::task::sleep(std::time::Duration::from_millis(100)).await;
         }
-        eprintln!("[capture] qemu source stopping");
+        log::info!("[capture] qemu source stopping");
         Ok(())
     }
 }
@@ -224,7 +224,7 @@ impl CaptureSource for QemuDbusSource {
             .name("capture-qemu".into())
             .spawn(move || {
                 if let Err(e) = async_std::task::block_on(self.run(tx, worker_stop)) {
-                    eprintln!("[capture] source failed: {e:#}");
+                    log::warn!("[capture] source failed: {e:#}");
                 }
             })
             .context("spawn capture thread")?;

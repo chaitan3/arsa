@@ -65,6 +65,20 @@ fn with_default_port(s: &str) -> String {
     }
 }
 
+/// Initialize the logger. `-v`/`--verbose` enables debug for our crates; the
+/// `RUST_LOG` environment variable overrides either default.
+fn init_logging(verbose: bool) {
+    use std::io::Write as _;
+    let default = if verbose {
+        "warn,rdma_display=debug"
+    } else {
+        "warn,rdma_display=info"
+    };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default))
+        .format(|buf, record| writeln!(buf, "[{}] {}", record.level(), record.args()))
+        .init();
+}
+
 fn main() -> Result<()> {
     let mut mode = "capture".to_string();
     let mut device: Option<String> = None;
@@ -95,6 +109,8 @@ fn main() -> Result<()> {
     let mut display_output: Option<String> = None;
     // log idle/session RSS+CPU every N seconds (0 = off)
     let mut idle_metrics: u64 = 0;
+    // -v/--verbose: debug-level logging for our crates
+    let mut verbose = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -172,6 +188,7 @@ fn main() -> Result<()> {
             "--idle-metrics" => {
                 idle_metrics = args.next().expect("--idle-metrics needs a value").parse()?
             }
+            "-v" | "--verbose" => verbose = true,
             "--help" | "-h" => {
                 println!("usage: rdma-display-server [ADDR[:PORT]] [--mode capture|testcard] [--device mlx5_0] [--listen 0.0.0.0:4791] [--slots 3] [--fps N]\n  \
   ADDR[:PORT]  listen address, the same as --listen (default 0.0.0.0:4791; the port defaults to 4791 when omitted)\n  \
@@ -188,6 +205,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
   --gpu-power off|p5|p0|max|<sm>[,<mem>]  floor the NVIDIA GPU clocks with nvidia-smi, still allowing boost above the floor (needs root; warns and continues if unavailable). p5 = the measured fast floor (sm 435 / mem 810 MHz), p0/max = floor at the card's maximum (i.e. pinned), <sm>[,<mem>] = explicit MHz floors. Default off. GeForce cards reject the memory-clock floor.\n  \
   --transport auto|rdma|tcp  video transport (default auto: RDMA/RoCE when available, else TCP). Negotiated with the client; TCP sends length-prefixed coded frames on a TAG_VIDEO connection.\n  \
   --idle-metrics N  log RSS/CPU/threads every N seconds, labelled idle or session (default off).\n  \
+  -v, --verbose  debug-level logging (per-frame/per-event detail; RUST_LOG overrides)\n  \
   --display-control auto|hyprctl|kscreen|none  apply the client's pre-session resolution request (--native / --set-mode) to this compositor's output before capture starts, so the scanout and the session slots match (--source drm; default auto = Hyprland via hyprctl, KDE via kscreen-doctor).\n  \
   --display-output NAME  target this compositor output for --display-control (default: the first/primary).\n  \
   --fps N (capture): pacing cap; 0 = uncapped, consumer-paced by client credits (default 0).\n  \
@@ -208,6 +226,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
         }
     }
     let listen = with_default_port(listen.as_deref().unwrap_or(DEFAULT_LISTEN));
+    init_logging(verbose);
 
     // internal: setuid-down audio helper (spawned by run_capture; runs as
     // the session user, needs no RDMA device, must not touch ibverbs)
@@ -223,8 +242,8 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
     match gpu_power.apply() {
         Ok(applied) => gpu_power::install_cleanup(applied),
         Err(e) => {
-            eprintln!("[gpu-power] {e:#}");
-            eprintln!("[gpu-power] continuing with the driver's default power management");
+            log::info!("[gpu-power] {e:#}");
+            log::info!("[gpu-power] continuing with the driver's default power management");
         }
     }
 
@@ -241,7 +260,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
                 if transport == rdma_display_rdma::TransportPref::Rdma {
                     return Err(e).context("--transport rdma: open RDMA device");
                 }
-                eprintln!("[server] no RDMA device ({e:#}); falling back to TCP video transport");
+                log::warn!("[server] no RDMA device ({e:#}); falling back to TCP video transport");
                 None
             }
         },
@@ -313,7 +332,7 @@ fn run_testcard_server(
         gen: 0,
     };
     let listener = TcpListener::bind(listen)?;
-    eprintln!("listening on {listen}, mode=testcard");
+    log::info!("listening on {listen}, mode=testcard");
     loop {
         let (mut stream, _) = listener.accept()?;
         let _ = stream.set_nodelay(true);
@@ -327,15 +346,15 @@ fn run_testcard_server(
             continue;
         }
         if tag[0] == rdma_display_audio::wire::TAG_AUDIO {
-            eprintln!("[server] audio connection in testcard mode: dropped");
+            log::warn!("[server] audio connection in testcard mode: dropped");
             continue;
         }
         if tag[0] == rdma_display_proto::TAG_INPUT {
-            eprintln!("[server] input connection in testcard mode: dropped");
+            log::warn!("[server] input connection in testcard mode: dropped");
             continue;
         }
         let peer = stream.peer_addr()?;
-        eprintln!("client connected: {peer}");
+        log::info!("client connected: {peer}");
         // testcard has no console to inject into: drain input events
         let (input_tx, input_rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -378,7 +397,7 @@ fn run_testcard_server(
         if link.transport() == rdma_display_rdma::Transport::Tcp {
             wait_for_video(&mut link, &listener)?;
         }
-        eprintln!("session up: {slots} slots, {} frame bytes", link.frame_bytes());
+        log::info!("session up: {slots} slots, {} frame bytes", link.frame_bytes());
         run_testcard(&mut link, fps)?;
     }
 }
@@ -395,7 +414,7 @@ fn run_testcard(link: &mut rdma_display_rdma::ServerLink, fps: u64) -> Result<()
         frame += 1;
         sent += 1;
         if last_report.elapsed().as_secs() >= 10 {
-            eprintln!("[stats] sent {} frames in {:?}", sent, started.elapsed());
+            log::debug!("[stats] sent {} frames in {:?}", sent, started.elapsed());
             last_report = std::time::Instant::now();
         }
         std::thread::sleep(period);
@@ -453,7 +472,7 @@ fn start_audio(
     match rdma_display_audio::capture::start_capture(dev) {
         Ok(a) => Some(a),
         Err(e) => {
-            eprintln!(
+            log::warn!(
                 "[audio] capture unavailable ({e:#}); streaming video without audio \
                  (pass --no-audio to silence this)"
             );
@@ -468,7 +487,7 @@ fn spawn_input_test(tx: mpsc::Sender<rdma_display_proto::InputEvent>) -> Result<
     std::thread::Builder::new()
         .name("input-test".into())
         .spawn(move || {
-            eprintln!("[server] --input-test: injecting synthetic input");
+            log::info!("[server] --input-test: injecting synthetic input");
             let mut n = 0u32;
             loop {
                 // key 'a' (qnum 0x1e) press+release
@@ -495,7 +514,7 @@ fn spawn_input_test(tx: mpsc::Sender<rdma_display_proto::InputEvent>) -> Result<
                     });
                 }
                 n += 1;
-                eprintln!("[server] input-test #{n}: key 'a' + mouse abs ({x},{y})");
+                log::info!("[server] input-test #{n}: key 'a' + mouse abs ({x},{y})");
                 std::thread::sleep(std::time::Duration::from_secs(2));
             }
         })
@@ -614,9 +633,9 @@ fn run_capture(
     // Best-effort: a missing pipewire/pulse warns rather than blocking video.
     if let Some(mut a) = start_audio(audio, audio_device) {
         if a.mailbox.wait_first(std::time::Duration::from_secs(3)) {
-            eprintln!("[preflight] audio capture ok");
+            log::debug!("[preflight] audio capture ok");
         } else {
-            eprintln!("[preflight] audio: no packet within 3 s (continuing)");
+            log::warn!("[preflight] audio: no packet within 3 s (continuing)");
         }
         a.stop(); // preflight probe only
     }
@@ -652,7 +671,7 @@ fn run_capture(
     // a client connect negotiate slots before the first captured frame.
     let mut geometry = preflight(source_name, input_name, drm_card, dbus_socket, console, codec, gl.as_ref());
     if let Some(m) = geometry.as_ref() {
-        eprintln!(
+        log::debug!(
             "[preflight] geometry cached: {}x{} stride {} (sizes slots on connect)",
             m.width, m.height, m.stride
         );
@@ -665,13 +684,13 @@ fn run_capture(
         match display::detect(display_control, display_output) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("[display] {e:#}");
+                log::info!("[display] {e:#}");
                 None
             }
         }
     } else {
         if display_control != "auto" && display_control != "none" {
-            eprintln!(
+            log::info!(
                 "[display] --display-control applies to --source drm (host compositor); ignoring for {source_name}"
             );
         }
@@ -682,13 +701,13 @@ fn run_capture(
     let mut original_mode: Option<display::Mode> = None;
     if let Some(c) = display_ctl.as_deref() {
         match c.current() {
-            Ok(m) => eprintln!(
+            Ok(m) => log::info!(
                 "[display] {} backend (output {}), current {}",
                 c.name(),
                 c.output().unwrap_or_else(|_| "?".into()),
                 m.label()
             ),
-            Err(e) => eprintln!("[display] {} backend; probe failed: {e:#}", c.name()),
+            Err(e) => log::warn!("[display] {} backend; probe failed: {e:#}", c.name()),
         }
         display::install_restore_watcher();
     }
@@ -705,7 +724,7 @@ fn run_capture(
             other => bail!("materializer {other:?} not implemented (egl|plain)"),
         }
     };
-    eprintln!("[server] capture materializer: {}", mat.name());
+    log::info!("[server] capture materializer: {}", mat.name());
 
     // input: explicit --input wins, else paired default. The capture source
     // and input sink are started per session (on control connect) and stopped
@@ -720,7 +739,7 @@ fn run_capture(
     // running so the first frame can size the slots on connect; otherwise the
     // source is started lazily per session.
     let eager_source: Option<rdma_display_capture::Running> = if geometry.is_none() {
-        eprintln!("[server] no preflight geometry; capturing eagerly to learn it");
+        log::info!("[server] no preflight geometry; capturing eagerly to learn it");
         let source: Box<dyn CaptureSource> = match source_name {
             "qemu" => Box::new(QemuDbusSource::new(dbus_socket.clone(), console)),
             "drm" => Box::new(DrmKmsSource::with_sync(drm_card.clone(), capture_sync)),
@@ -730,7 +749,7 @@ fn run_capture(
     } else {
         None
     };
-    eprintln!("[server] listening on {listen} (pipeline starts on connect)");
+    log::info!("[server] listening on {listen} (pipeline starts on connect)");
 
     let listener = TcpListener::bind(listen)?;
     listener.set_nonblocking(true)?;
@@ -801,7 +820,7 @@ fn run_capture(
         if session.is_some() {
             let gone = session.as_mut().unwrap().client_gone();
             if gone {
-                eprintln!("[server] client disconnected");
+                log::info!("[server] client disconnected");
                 session = None;
             }
         }
@@ -829,7 +848,7 @@ fn run_capture(
                 send_prep = None;
                 session_connected_at = None;
                 first_scanout_logged = false;
-                eprintln!("[server] session ended; pipeline idle");
+                log::info!("[server] session ended; pipeline idle");
             }
             // put the display mode back if a session changed it (also covers a
             // client that requested a change and then never established a
@@ -837,8 +856,8 @@ fn run_capture(
             if let Some(orig) = original_mode.take() {
                 if let Some(c) = display_ctl.as_deref() {
                     match c.set(orig) {
-                        Ok(()) => eprintln!("[display] restored {}", orig.label()),
-                        Err(e) => eprintln!("[display] restore failed: {e:#}"),
+                        Ok(()) => log::info!("[display] restored {}", orig.label()),
+                        Err(e) => log::warn!("[display] restore failed: {e:#}"),
                     }
                 }
                 display::disarm_restore();
@@ -921,7 +940,7 @@ fn run_capture(
         if session.is_some() && !first_scanout_logged && pending_scanout.is_some() {
             first_scanout_logged = true;
             if let Some(t) = session_connected_at {
-                eprintln!(
+                log::info!(
                     "[session] first scanout {} ms after connect",
                     t.elapsed().as_millis()
                 );
@@ -940,7 +959,7 @@ fn run_capture(
             let tag_ok = std::io::Read::read_exact(&mut stream, &mut tag).is_ok();
             let _ = stream.set_read_timeout(None);
             if !tag_ok {
-                eprintln!("[server] connection with no routing tag dropped ({addr})");
+                log::warn!("[server] connection with no routing tag dropped ({addr})");
             } else if tag[0] == rdma_display_audio::wire::TAG_AUDIO {
                 match audio_capture.as_ref() {
                     Some(mbox) => {
@@ -948,23 +967,23 @@ fn run_capture(
                             .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
                             .is_ok()
                         {
-                            eprintln!("[audio] client stream connected ({addr})");
+                            log::info!("[audio] client stream connected ({addr})");
                             let mbox = mbox.mailbox.clone();
                             let busy = audio_busy.clone();
                             std::thread::spawn(move || {
                                 if let Err(e) =
                                     rdma_display_audio::capture::serve_connection(stream, &mbox)
                                 {
-                                    eprintln!("[audio] stream ended: {e:#}");
+                                    log::info!("[audio] stream ended: {e:#}");
                                 }
                                 busy.store(false, std::sync::atomic::Ordering::SeqCst);
                             });
                         } else {
-                            eprintln!("[audio] second audio connection refused ({addr})");
+                            log::warn!("[audio] second audio connection refused ({addr})");
                         }
                     }
                     None => {
-                        eprintln!(
+                        log::warn!(
                             "[server] audio connection but audio capture is unavailable: dropped ({addr})"
                         );
                     }
@@ -980,7 +999,7 @@ fn run_capture(
                             .name("input-reader".into())
                             .spawn(move || serve_input(stream, nonce_cell, input_tx, addr));
                     }
-                    None => eprintln!(
+                    None => log::warn!(
                         "[input] input connection with no active session: dropped ({addr})"
                     ),
                 }
@@ -995,14 +1014,14 @@ fn run_capture(
                         s.attach_video(stream);
                         video_attached = true;
                         if let Some(t) = session_connected_at {
-                            eprintln!(
+                            log::info!(
                                 "[session] video socket attached {} ms after connect",
                                 t.elapsed().as_millis()
                             );
                         }
                     }
                     _ => {
-                        eprintln!("[server] unexpected TAG_VIDEO connection dropped ({addr})")
+                        log::warn!("[server] unexpected TAG_VIDEO connection dropped ({addr})")
                     }
                 }
                 if video_attached {
@@ -1029,19 +1048,19 @@ fn run_capture(
                 ) {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("[server] handshake failed ({peer}): {e:#}");
+                        log::warn!("[server] handshake failed ({peer}): {e:#}");
                         continue;
                     }
                 };
                 let reply = apply_mode_request(&mode_req, display_ctl.as_ref(), &mut original_mode);
-                eprintln!(
+                log::info!(
                     "[display] mode request {:?} -> {} ({})",
                     mode_req,
                     reply.mode_label(),
                     reply.message
                 );
                 if let Err(e) = rdma_display_rdma::send_mode_reply(&mut conn, &reply) {
-                    eprintln!("[server] mode reply failed ({peer}): {e:#}");
+                    log::warn!("[server] mode reply failed ({peer}): {e:#}");
                     continue;
                 }
                 // re-probe the DRM scanout so the slots match the mode now in
@@ -1051,14 +1070,14 @@ fn run_capture(
                 if source_name == "drm" {
                     match reprobe_scanout(drm_card.as_deref(), reply.width, reply.height) {
                         Ok(fmt) => geometry = Some(meta_linear(&fmt)),
-                        Err(e) => eprintln!(
+                        Err(e) => log::warn!(
                             "[display] scanout re-probe failed: {e:#}; using cached geometry"
                         ),
                     }
                 }
                 if let Some(meta) = geometry.clone().or_else(|| pending_meta.clone()) {
                     let t_connect = std::time::Instant::now();
-                    eprintln!("client connected: {peer}");
+                    log::info!("client connected: {peer}");
                     // start the per-session pipeline (source, input, audio)
                     let (input_tx, input_rx) = mpsc::channel::<rdma_display_proto::InputEvent>();
                     let sink: Box<dyn InputSink> = match input_name {
@@ -1068,7 +1087,7 @@ fn run_capture(
                     };
                     let input =
                         InputSink::spawn(sink, input_rx, screen.clone(), rumble_hub.clone())?;
-                    eprintln!("[server] input sink: {input_name}");
+                    log::info!("[server] input sink: {input_name}");
                     let source = if eager_source.is_some() {
                         None
                     } else {
@@ -1081,7 +1100,7 @@ fn run_capture(
                         };
                         Some(CaptureSource::spawn(source, tx.clone())?)
                     };
-                    eprintln!("[server] capture running");
+                    log::info!("[server] capture running");
                     if input_test {
                         spawn_input_test(input_tx.clone())?;
                     }
@@ -1103,7 +1122,7 @@ fn run_capture(
                         rdma_display_codec::Codec::Lossy => lossy_budget + (1 << 20),
                         _ => codec.slot_len(&geom).expect("implemented codec has a slot size"),
                     };
-                    eprintln!(
+                    log::info!(
                         "[server] codec {} → slot {} B (raw frame {} B)",
                         codec.name(),
                         slot_len,
@@ -1121,7 +1140,7 @@ fn run_capture(
                         match mat.bind_staging(slots, slot_len) {
                             Some(v) => Some(v),
                             None => {
-                                eprintln!("[server] PBO staging unavailable — direct readback slots");
+                                log::warn!("[server] PBO staging unavailable — direct readback slots");
                                 None
                             }
                         }
@@ -1144,7 +1163,7 @@ fn run_capture(
                         &rumble_hub,
                     ) {
                         Ok(link) => {
-                            eprintln!("session up: {slots} slots, {} frame bytes", link.frame_bytes());
+                            log::info!("session up: {slots} slots, {} frame bytes", link.frame_bytes());
                             // the new client starts with zeroed slots: make
                             // the current scanout content sendable even
                             // though the guest hasn't repainted since the
@@ -1171,19 +1190,19 @@ fn run_capture(
                             session_meta = Some(meta.clone());
                             session = Some(link);
                             session_connected_at = Some(t_connect);
-                            eprintln!(
+                            log::info!(
                                 "[session] setup {} ms (workers + link)",
                                 t_connect.elapsed().as_millis()
                             );
                         }
                         Err(e) => {
-                            eprintln!("[server] session setup failed: {e:#}");
+                            log::warn!("[server] session setup failed: {e:#}");
                             session_nonce.store(0, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
                 }
             } else {
-                eprintln!(
+                log::warn!(
                     "[server] control connection while a session is active: dropped ({addr})"
                 );
             }
@@ -1218,7 +1237,7 @@ fn run_capture(
                     // is deliberately smaller than the raw frame, so the raw
                     // size is irrelevant there.
                     if codec != rdma_display_codec::Codec::Lossy && fb > slot_bytes {
-                        eprintln!(
+                        log::warn!(
                             "[server] scanout {}x{} fourcc={:#010x} '{}' ({} B) exceeds negotiated slot ({} B); dropped",
                             fmt.width,
                             fmt.height,
@@ -1257,7 +1276,7 @@ fn run_capture(
                                 }
                                 Err(e) => {
                                     if !fc.scanout_warned {
-                                        eprintln!(
+                                        log::warn!(
                                             "[server] lossless texture-direct unavailable ({e:#}); using readback+encode"
                                         );
                                         fc.scanout_warned = true;
@@ -1283,7 +1302,7 @@ fn run_capture(
                                     // never tear down a session over a bad
                                     // capture: hold the last frame and resume
                                     // when the format returns
-                                    eprintln!(
+                                    log::warn!(
                                         "[server] prepare scanout failed: {e:#}; holding last frame"
                                     );
                                     frame_dirty = false;
@@ -1310,7 +1329,7 @@ fn run_capture(
                             let mut m = nm.clone();
                             m.gen = session_meta.as_ref().map(|o| o.gen + 1).unwrap_or(1);
                             let _ = link.send_meta(&m);
-                            eprintln!(
+                            log::debug!(
                                 "[server] display meta gen {} ({}x{} stride {} fourcc {:#010x})",
                                 m.gen, m.width, m.height, m.stride, m.fourcc
                             );
@@ -1338,7 +1357,7 @@ fn run_capture(
                             link.release_slot(slot);
                         }
                         Err(e) => {
-                            eprintln!("[server] issue failed: {e:#}");
+                            log::warn!("[server] issue failed: {e:#}");
                             link.release_slot(slot);
                             session = None;
                             mat.drop_frames();
@@ -1381,27 +1400,27 @@ fn run_capture(
                     Ok(Some(seq)) => {
                         frame_dirty = false;
                         last_send = Some(std::time::Instant::now());
-                        eprintln!("[server] frame {} sent", seq);
+                        log::debug!("[server] frame {} sent", seq);
                         if seq == 0 {
-                            eprintln!(
+                            log::debug!(
                                 "[session] first frame block: materialize {} ms, encode+write {} ms",
                                 t_before_tx.duration_since(t_block).as_millis(),
                                 t_before_tx.elapsed().as_millis()
                             );
                             if let Some(t) = session_connected_at {
-                                eprintln!(
+                                log::info!(
                                     "[session] first frame {} ms after connect",
                                     t.elapsed().as_millis()
                                 );
                             }
                         }
                         if seq % 60 == 0 {
-                            eprintln!("[stats] frames={} uptime={:?}", seq, started.elapsed());
+                            log::debug!("[stats] frames={} uptime={:?}", seq, started.elapsed());
                         }
                     }
                     Ok(None) => frame_dirty = false,
                     Err(e) => {
-                        eprintln!("[server] send failed: {e:#}");
+                        log::warn!("[server] send failed: {e:#}");
                         session = None;
                     }
                 }
@@ -1424,7 +1443,7 @@ fn run_capture(
                 let (changed, mat_times) = match mat.finish_frame(slot, out) {
                     Ok(x) => x,
                     Err(e) => {
-                        eprintln!("[server] finish failed: {e:#}");
+                        log::warn!("[server] finish failed: {e:#}");
                         session = None;
                         mat.drop_frames();
                         issued.clear();
@@ -1444,7 +1463,7 @@ fn run_capture(
                         n
                     }
                     Err(e) => {
-                        eprintln!("[server] encode failed: {e:#}");
+                        log::warn!("[server] encode failed: {e:#}");
                         session = None;
                         mat.drop_frames();
                         issued.clear();
@@ -1463,22 +1482,22 @@ fn run_capture(
                 ) {
                     Ok(Some(seq)) => {
                         last_send = Some(std::time::Instant::now());
-                        eprintln!("[server] frame {} sent", seq);
+                        log::debug!("[server] frame {} sent", seq);
                         if seq == 0 {
                             if let Some(t) = session_connected_at {
-                                eprintln!(
+                                log::info!(
                                     "[session] first frame {} ms after connect",
                                     t.elapsed().as_millis()
                                 );
                             }
                         }
                         if seq % 60 == 0 {
-                            eprintln!("[stats] frames={} uptime={:?}", seq, started.elapsed());
+                            log::debug!("[stats] frames={} uptime={:?}", seq, started.elapsed());
                         }
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        eprintln!("[server] send failed: {e:#}");
+                        log::warn!("[server] send failed: {e:#}");
                         session = None;
                         mat.drop_frames();
                         issued.clear();
@@ -1597,11 +1616,11 @@ impl FrameCodec {
                 };
                 match gpu {
                     Ok(g) => {
-                        eprintln!("[server] lossless encoder: GPU (GLES compute)");
+                        log::info!("[server] lossless encoder: GPU (GLES compute)");
                         self.gpu = Some(g);
                     }
                     Err(e) => {
-                        eprintln!(
+                        log::warn!(
                             "[server] lossless encoder: GPU unavailable ({e:#}); falling back to CPU"
                         );
                         let mut e = rdma_display_codec::Encoder::new(geom)?;
@@ -1704,7 +1723,7 @@ impl FrameCodec {
         self.import_hits = h;
         self.import_misses = m;
         if !self.scanout {
-            eprintln!(
+            log::debug!(
                 "[server] lossless texture-direct: {} scanout (modifier={:#x}) — no readback/re-upload",
                 if gpu.has_fetch_encode() {
                     "linear → texelFetch"
@@ -1806,7 +1825,7 @@ impl FrameCodec {
                 mx[c] = v[v.len() - 1];
             }
             let sum: u64 = med.iter().sum();
-            eprintln!(
+            log::debug!(
                 "[server] lossless texture p50/xmax us: activate={}/{} blit={}/{} encode={}/{} ref={}/{} copy={}/{} mat_restore={}/{} | p50 sum={} | import hit={} miss={} | tiles={} coded={} B",
                 med[0], mx[0], med[1], mx[1], med[2], mx[2], med[3], mx[3],
                 med[4], mx[4], med[5], mx[5], sum,
@@ -1869,7 +1888,7 @@ impl FrameCodec {
             us.push(t.elapsed().as_micros() as u64);
         }
         us.sort_unstable();
-        eprintln!(
+        log::debug!(
             "[server] real-scanout read bench (path={path}, n={n}): p50={}us min={}us max={}us",
             us[us.len() / 2],
             us[0],
@@ -1910,10 +1929,10 @@ fn serve_input(
     let nonce = u64::from_le_bytes(nb);
     let expect = nonce_cell.load(std::sync::atomic::Ordering::SeqCst);
     if expect == 0 || nonce != expect {
-        eprintln!("[input] rejected input connection with stale/invalid nonce ({addr})");
+        log::warn!("[input] rejected input connection with stale/invalid nonce ({addr})");
         return;
     }
-    eprintln!("[input] client input stream connected ({addr})");
+    log::info!("[input] client input stream connected ({addr})");
     let mut conn = Conn::new(stream);
     let mut keys: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut btns: std::collections::HashSet<u32> = std::collections::HashSet::new();
@@ -1955,7 +1974,7 @@ fn serve_input(
                 }
             }
             Ok(rdma_display_proto::Message::Bye(_)) => break,
-            Ok(other) => eprintln!("[input] unexpected message {other:?}"),
+            Ok(other) => log::warn!("[input] unexpected message {other:?}"),
             Err(_) => break,
         }
     }
@@ -1972,7 +1991,7 @@ fn serve_input(
     for (slot, code) in gp_axes {
         let _ = input_tx.send(I::GamepadAxis { slot, code, value: 0 });
     }
-    eprintln!("[input] client input stream ended ({addr}); released held input");
+    log::info!("[input] client input stream ended ({addr}); released held input");
 }
 
 /// Latch one capture event into materializer/session state. Shared by the
@@ -2038,7 +2057,7 @@ fn handle_capture_event(
             }
         }
         CaptureEvent::Disabled => {
-            eprintln!("[server] console scanout disabled");
+            log::warn!("[server] console scanout disabled");
             *session = None; // reconnect on next scanout
             *frame_dirty = false;
         }
@@ -2185,7 +2204,7 @@ fn reprobe_scanout(card: Option<&str>, want_w: u32, want_h: u32) -> Result<Frame
     let mut fmt = rdma_display_capture::drm::probe_display(card)?;
     while want_w > 0 && want_h > 0 && (fmt.width, fmt.height) != (want_w, want_h) {
         if std::time::Instant::now() >= deadline {
-            eprintln!(
+            log::debug!(
                 "[display] scanout still {}x{} after {} ms (wanted {}x{}); sizing from it",
                 fmt.width,
                 fmt.height,
@@ -2222,7 +2241,7 @@ fn preflight(
     match source_name {
         "drm" => match rdma_display_capture::drm::probe_display(drm_card.as_deref()) {
             Ok(fmt) => {
-                eprintln!(
+                log::debug!(
                     "[preflight] drm scanout {}x{} '{}' modifier={:#x}",
                     fmt.width,
                     fmt.height,
@@ -2231,14 +2250,14 @@ fn preflight(
                 );
                 geometry = Some(meta_linear(&fmt));
             }
-            Err(e) => eprintln!("[preflight] drm probe failed: {e:#}"),
+            Err(e) => log::warn!("[preflight] drm probe failed: {e:#}"),
         },
         "qemu" => match rdma_display_capture::qemu::probe_console(dbus_socket, console) {
             Ok((w, h)) => {
-                eprintln!("[preflight] qemu console {w}x{h}");
+                log::debug!("[preflight] qemu console {w}x{h}");
                 geometry = Some(meta_from_size(w, h));
             }
-            Err(e) => eprintln!("[preflight] qemu probe failed: {e:#}"),
+            Err(e) => log::warn!("[preflight] qemu probe failed: {e:#}"),
         },
         _ => {}
     }
@@ -2254,10 +2273,10 @@ fn preflight(
                 Ok(c) => {
                     c.sync();
                     drop(c);
-                    eprintln!("[preflight] lossless GPU encoder ok ({}x{})", g.width, g.height);
+                    log::debug!("[preflight] lossless GPU encoder ok ({}x{})", g.width, g.height);
                 }
                 Err(e) => {
-                    eprintln!("[preflight] lossless GPU encoder failed: {e:#} (will fall back to CPU)")
+                    log::warn!("[preflight] lossless GPU encoder failed: {e:#} (will fall back to CPU)")
                 }
             }
         }
@@ -2269,9 +2288,9 @@ fn preflight(
         match rdma_display_capture::input::UinputMouse::open() {
             Ok(m) => {
                 drop(m);
-                eprintln!("[preflight] uinput ok");
+                log::debug!("[preflight] uinput ok");
             }
-            Err(e) => eprintln!("[preflight] uinput failed: {e:#}"),
+            Err(e) => log::warn!("[preflight] uinput failed: {e:#}"),
         }
     }
 

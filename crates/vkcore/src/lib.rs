@@ -92,14 +92,14 @@ impl VkCore {
                 }
                 let props = instance.get_physical_device_properties(*pd);
                 let name = std::ffi::CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy();
-                eprintln!("[vkcore] skip {name}: missing {missing:?}");
+                log::info!("[vkcore] skip {name}: missing {missing:?}");
             }
             let physical_device = chosen.context("no device with the required interop extensions")?;
 
             let props = instance.get_physical_device_properties(physical_device);
             let api_version = props.api_version;
             let dev_name = std::ffi::CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy();
-            eprintln!(
+            log::info!(
                 "[vkcore] device: {dev_name} (api {}.{}.{})",
                 vk::api_version_major(api_version),
                 vk::api_version_minor(api_version),
@@ -145,7 +145,7 @@ impl VkCore {
             probe.p_next = &mut probe13 as *mut _ as *mut c_void;
             probe13.p_next = &mut probe12 as *mut _ as *mut c_void;
             instance.get_physical_device_features2(physical_device, &mut probe);
-            eprintln!(
+            log::info!(
                 "[vkcore] features: shaderInt16={} subgroupSizeControl={} storageBuffer8BitAccess={} shaderFloat16={}",
                 probe.features.shader_int16 == vk::TRUE,
                 probe13.subgroup_size_control == vk::TRUE,
@@ -222,7 +222,7 @@ impl VkCore {
                 None,
             )?;
 
-            eprintln!(
+            log::info!(
                 "[vkcore] queue family {queue_family}; {} interop extensions enabled",
                 ext_ptrs.len()
             );

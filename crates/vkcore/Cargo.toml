@@ -14,3 +14,4 @@ anyhow.workspace = true
 ash = "0.38"
 libc = "0.2"
 libloading = "0.8"
+log.workspace = true

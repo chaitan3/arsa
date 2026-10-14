@@ -80,7 +80,7 @@ pub fn open_device(name: Option<&str>) -> Result<ibverbs::Context> {
 
 fn routable_gid_index(ctx: &ibverbs::Context) -> Result<u32> {
     if let Some(gid) = ctx.routable_gid(1).context("routable_gid failed")? {
-        eprintln!(
+        log::info!(
             "[rdma] sgid: index={} type={:?} gid={:?} ndev_ifindex={}",
             gid.gid_index, gid.gid_type, gid.gid, gid.ndev_ifindex
         );
@@ -230,7 +230,7 @@ fn endpoint_exchange<T: std::io::Read + std::io::Write>(
     match conn.recv()? {
         Message::QpEndpoint(bytes) => {
             let remote = QueuePairEndpoint::from_bytes(&bytes).map_err(|e| anyhow!("{e}"))?;
-            eprintln!(
+            log::debug!(
                 "[rdma] endpoints: local qpn={} psn={:#010x} gid={:?} | remote qpn={} psn={:#010x} gid={:?}",
                 local.qp_num,
                 local.psn,
@@ -333,7 +333,7 @@ pub fn handshake_server(
 ) -> Result<(Conn<TcpStream>, Transport, proto::ModeRequest)> {
     let mut conn = Conn::new(stream);
     let transport = hello_server(&mut conn, session_nonce, pref, server_has_rdma)?;
-    eprintln!(
+    log::info!(
         "[rdma] video transport: {}{}",
         match transport {
             Transport::Rdma => "RDMA",
@@ -428,7 +428,7 @@ impl ServerLink {
                             .context("register external staging slot (PBO)")?;
                             stage.push(StagingSlot::Ext(mr));
                         }
-                        eprintln!(
+                        log::info!(
                             "[rdma] external staging: {slots} slots from materializer PBOs (zero-copy)"
                         );
                     }
@@ -538,7 +538,7 @@ impl ServerLink {
                             if let Err(e) =
                                 conn.send(&proto::Message::Pong(c0, proto::unix_now_us()))
                             {
-                                eprintln!("[rdma] pong failed: {e}");
+                                log::debug!("[rdma] pong failed: {e}");
                             }
                         }
                         Ok(proto::Message::Bye(_)) => {
@@ -546,13 +546,13 @@ impl ServerLink {
                             break;
                         }
                         Ok(other) => {
-                            eprintln!("[rdma] unexpected control message {other:?}");
+                            log::debug!("[rdma] unexpected control message {other:?}");
                         }
                         Err(e) => {
                             if e.kind() != std::io::ErrorKind::UnexpectedEof
                                 && e.kind() != std::io::ErrorKind::ConnectionReset
                             {
-                                eprintln!("[rdma] control channel error: {e}");
+                                log::debug!("[rdma] control channel error: {e}");
                             }
                             let _ = credit_tx.send(None);
                             break;
@@ -586,7 +586,7 @@ impl ServerLink {
     /// called, `send_frame*` returns `Ok(None)` (nothing is sent).
     pub fn attach_video(&mut self, stream: TcpStream) {
         let _ = stream.set_nodelay(true);
-        eprintln!("[rdma] TCP video socket attached (fd {})", stream.as_raw_fd());
+        log::debug!("[rdma] TCP video socket attached (fd {})", stream.as_raw_fd());
         self.video = Some(stream);
     }
 
@@ -736,7 +736,7 @@ impl ServerLink {
         let t1s = proto::unix_now_us(); // staging slot available
         let slot_wait_us = t1s.saturating_sub(t0d);
         if slot_wait_us > 5_000 {
-            eprintln!(
+            log::info!(
                 "[rdma] slot wait {} ms (client credits lagging)",
                 slot_wait_us / 1000
             );
@@ -752,7 +752,7 @@ impl ServerLink {
                 let out = slots[slot].as_mut_bytes(frame_bytes);
                 let sum: u32 = out.iter().map(|b| *b as u32).sum();
                 let nonzero = out.iter().filter(|b| **b != 0).count();
-                eprintln!(
+                log::info!(
                     "[rdma] staging slot {} checksum sum={} nonzero={}/{}",
                     slot, sum, nonzero, frame_bytes
                 );
@@ -842,7 +842,7 @@ impl ServerLink {
             };
             let w = self.video.as_mut().expect("video attached");
             if let Err(e) = w.peer_addr() {
-                eprintln!(
+                log::info!(
                     "[rdma] video socket fd {} is not a socket before write ({e}); an fd was closed and reused",
                     w.as_raw_fd()
                 );
@@ -901,7 +901,7 @@ impl ServerLink {
             meta_gen: self.meta_gen,
         };
         if let Err(e) = proto::send_msg(w, &Message::Stamp(s)) {
-            eprintln!("[rdma] stamp send failed: {e}");
+            log::debug!("[rdma] stamp send failed: {e}");
             self.stamp_w = None;
         }
     }
@@ -990,7 +990,7 @@ impl ServerLink {
                     );
                     let w = self.video.as_mut().expect("video attached");
                     if let Err(e) = w.peer_addr() {
-                        eprintln!(
+                        log::info!(
                             "[rdma] video socket fd {} is not a socket before write ({e}); an fd was closed and reused",
                             w.as_raw_fd()
                         );
@@ -1020,7 +1020,7 @@ impl ServerLink {
         match self.stamp_w.as_mut() {
             Some(w) => {
                 if let Err(e) = proto::send_msg(w, &Message::Meta(meta.clone())) {
-                    eprintln!("[rdma] meta send failed: {e}");
+                    log::debug!("[rdma] meta send failed: {e}");
                     self.stamp_w = None;
                     return false;
                 }
@@ -1089,13 +1089,13 @@ fn spawn_control_reader(stream: TcpStream) -> mpsc::Receiver<ControlEvent> {
                         }
                     }
                     Ok(other) => {
-                        eprintln!("[rdma] unexpected client control message {other:?}");
+                        log::warn!("[rdma] unexpected client control message {other:?}");
                     }
                     Err(e) => {
                         if e.kind() != std::io::ErrorKind::UnexpectedEof
                             && e.kind() != std::io::ErrorKind::ConnectionReset
                         {
-                            eprintln!("[rdma] client control channel error: {e}");
+                            log::debug!("[rdma] client control channel error: {e}");
                         }
                         break;
                     }
@@ -1204,7 +1204,7 @@ fn spawn_video_reader(
                 let len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
                 let seq = u64::from_le_bytes(hdr[4..12].try_into().unwrap());
                 if len > slot_len {
-                    eprintln!("[tcp] video frame {len} > slot {slot_len}");
+                    log::debug!("[tcp] video frame {len} > slot {slot_len}");
                     break;
                 }
                 buf.clear();
@@ -1264,7 +1264,7 @@ impl ClientLink {
         } else {
             Transport::Tcp
         };
-        eprintln!(
+        log::info!(
             "[rdma] video transport: {}{}",
             match transport {
                 Transport::Rdma => "RDMA",
@@ -1280,7 +1280,7 @@ impl ClientLink {
             Message::ModeReply(r) => r,
             other => anyhow::bail!("expected ModeReply, got {other:?}"),
         };
-        eprintln!(
+        log::info!(
             "[rdma] display mode: {} ({}{})",
             mode_reply.mode_label(),
             if mode_reply.ok { "ok" } else { "failed" },
@@ -1342,7 +1342,7 @@ impl ClientLink {
             rdma_display_codec::Codec::Lossless => Some(rdma_display_codec::Decoder::new(geom)?),
             _ => None,
         };
-        eprintln!(
+        log::info!(
             "[rdma] codec={} slot_len={} (frame_bytes={})",
             codec.name(),
             slot_len,
@@ -1378,7 +1378,7 @@ impl ClientLink {
                                 .with_context(|| {
                                     format!("ibv_reg_dmabuf_mr slot {i} (C0 gate #3)")
                                 })?;
-                            eprintln!(
+                            log::info!(
                                 "[slots] gpu slot {i}: iova={:#x} rkey={:#x}",
                                 mr.remote().addr,
                                 mr.remote().rkey

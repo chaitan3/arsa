@@ -197,7 +197,7 @@ fn in_process_loop(pulse: Pulse, dev: String, mbox: Mailbox, stop: Stop) {
         }
         match open_capture_stream(&pulse, &dev) {
             Ok(stream) => {
-                eprintln!(
+                log::info!(
                     "[audio] capturing {dev:?} (f32le {} Hz, {}ch, {:.1} ms packets)",
                     wire::RATE,
                     wire::CHANNELS,
@@ -208,19 +208,19 @@ fn in_process_loop(pulse: Pulse, dev: String, mbox: Mailbox, stop: Stop) {
                     if mbox.put_overwrites(pkt) {
                         drops += 1;
                         if drops == 1 || drops % 10000 == 0 {
-                            eprintln!("[audio] capture dropped {drops} packets (no consumer or stalled client)");
+                            log::debug!("[audio] capture dropped {drops} packets (no consumer or stalled client)");
                         }
                     }
                     if last_report.elapsed() >= Duration::from_secs(10) {
-                        eprintln!("[audio] capture feed alive: {fed} packets so far");
+                        log::debug!("[audio] capture feed alive: {fed} packets so far");
                         last_report = std::time::Instant::now();
                     }
                 }, &mut seq, &stop) {
-                    Ok(()) => eprintln!("[audio] capture stream ended; reopening in 2 s"),
-                    Err(e) => eprintln!("[audio] capture read failed: {e:#}; reopening in 2 s"),
+                    Ok(()) => log::debug!("[audio] capture stream ended; reopening in 2 s"),
+                    Err(e) => log::debug!("[audio] capture read failed: {e:#}; reopening in 2 s"),
                 }
             }
-            Err(e) => eprintln!("[audio] capture open failed ({dev:?}): {e:#}; retrying in 2 s"),
+            Err(e) => log::debug!("[audio] capture open failed ({dev:?}): {e:#}; retrying in 2 s"),
         }
         if stop.stopped() {
             return;
@@ -274,7 +274,7 @@ fn helper_loop(
         match spawn_helper(&exe, &dev, uid, gid) {
             Ok((read_fd, pid)) => {
                 let mut f = unsafe { File::from_raw_fd(read_fd) };
-                eprintln!("[audio] helper process running (uid {uid}) capturing {dev:?}");
+                log::debug!("[audio] helper process running (uid {uid}) capturing {dev:?}");
                 let mut seq: u32 = 0;
                 let mut drops: u64 = 0;
                 let mut fed: u64 = 0;
@@ -308,16 +308,16 @@ fn helper_loop(
                             if mbox.put_overwrites(pkt) {
                                 drops += 1;
                                 if drops == 1 || drops % 10000 == 0 {
-                                    eprintln!("[audio] capture dropped {drops} packets (no consumer or stalled client)");
+                                    log::debug!("[audio] capture dropped {drops} packets (no consumer or stalled client)");
                                 }
                             }
                             if last_report.elapsed() >= Duration::from_secs(10) {
-                                eprintln!("[audio] capture feed alive: {fed} packets so far");
+                                log::debug!("[audio] capture feed alive: {fed} packets so far");
                                 last_report = std::time::Instant::now();
                             }
                         }
                         Err(e) => {
-                            eprintln!("[audio] helper pipe ended: {e:#}; respawning in 2 s");
+                            log::debug!("[audio] helper pipe ended: {e:#}; respawning in 2 s");
                             break;
                         }
                     }
@@ -335,7 +335,7 @@ fn helper_loop(
                     return;
                 }
             }
-            Err(e) => eprintln!("[audio] helper spawn failed: {e:#}; retrying in 2 s"),
+            Err(e) => log::debug!("[audio] helper spawn failed: {e:#}; retrying in 2 s"),
         }
         if sleep_or_stop(&stop, Duration::from_secs(2)) {
             return;
@@ -393,7 +393,7 @@ fn spawn_helper(exe: &std::path::Path, dev: &str, uid: u32, gid: u32) -> Result<
                 std::ptr::null(),
             ];
             libc::execv(exe_c.as_ptr(), argv.as_ptr());
-            eprintln!("[audio] helper exec failed");
+            log::debug!("[audio] helper exec failed");
             libc::_exit(4);
         }
     }
@@ -415,16 +415,16 @@ pub fn run_helper(dev: &str) -> Result<()> {
     loop {
         match open_capture_stream(&pulse, dev) {
             Ok(stream) => {
-                eprintln!("[audio-helper] capturing {dev:?} (f32le {} Hz, {}ch)", wire::RATE, wire::CHANNELS);
+                log::info!("[audio-helper] capturing {dev:?} (f32le {} Hz, {}ch)", wire::RATE, wire::CHANNELS);
                 match capture_into(&stream, |pkt| {
                     let _ = out.write_all(&pkt.data);
                 }, &mut 0, &stop) {
                     Ok(()) => {}
-                    Err(e) => eprintln!("[audio-helper] capture read failed: {e:#}"),
+                    Err(e) => log::debug!("[audio-helper] capture read failed: {e:#}"),
                 }
             }
             Err(e) => {
-                eprintln!("[audio-helper] capture open failed ({dev:?}): {e:#}");
+                log::debug!("[audio-helper] capture open failed ({dev:?}): {e:#}");
                 std::process::exit(1); // parent will respawn after backoff
             }
         }
@@ -449,7 +449,7 @@ fn open_capture_stream(pulse: &Pulse, dev: &str) -> Result<super::pulse::Simple>
                 let alt = format!("{dev}.monitor");
                 match pulse.open_record(None, &alt, spec, wire::PACKET_BYTES as u32) {
                     Ok(s) => {
-                        eprintln!(
+                        log::info!(
                             "[audio] {dev:?} is a sink name (sinks can't be recorded directly); capturing its monitor source {alt:?} instead"
                         );
                         return Ok(s);
@@ -487,7 +487,7 @@ pub fn serve_connection(mut stream: TcpStream, mbox: &Mailbox) -> Result<()> {
             }
             None => {
                 if !warned {
-                    eprintln!(
+                    log::info!(
                         "[audio] no capture data for 10 s (silent monitor? is anything playing into the sink?); keeping the stream open"
                     );
                     warned = true;

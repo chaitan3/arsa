@@ -91,7 +91,7 @@ impl LossyMaterializer {
         let pw = Pyrowave::load(std::env::var("PYROWAVE_LIB").ok().as_deref())?;
         let dev = pw.create_shared_device(&vk)?;
         let chroma = if chroma444 { Chroma::Subsampling444 } else { Chroma::Subsampling420 };
-        eprintln!(
+        log::info!(
             "[lossy] PyroWave encoder ready (budget {} KiB, chroma {})",
             budget / 1024,
             if chroma444 { "4:4:4" } else { "4:2:0" }

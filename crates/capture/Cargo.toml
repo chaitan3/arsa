@@ -15,3 +15,4 @@ async-std.workspace = true
 anyhow.workspace = true
 libc = "0.2"
 libloading = "0.8"
+log.workspace = true

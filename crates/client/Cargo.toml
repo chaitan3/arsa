@@ -20,3 +20,5 @@ wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 wayland-backend = { version = "0.3", features = ["client_system"] }
 libc = "0.2"
+log.workspace = true
+env_logger.workspace = true

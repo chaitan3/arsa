@@ -395,7 +395,7 @@ impl CaptureSource for DrmKmsSource {
             .name("capture-drm".into())
             .spawn(move || {
                 if let Err(e) = run(self.card.as_deref(), sync, tx, worker_stop) {
-                    eprintln!("[capture] source failed: {e:#}");
+                    log::warn!("[capture] source failed: {e:#}");
                 }
             })
             .context("spawn capture thread")?;
@@ -473,7 +473,7 @@ fn open_card_and_find_target(path: &str) -> Result<(OwnedFd, Target)> {
         for &crtc_id in crtcs.iter().take(res.count_crtcs as usize) {
             match get_crtc(fdr, crtc_id) {
                 Ok(c) => {
-                    eprintln!(
+                    log::debug!(
                         "[capture-drm] CRTC {}: fb_id={} active={} mode={}x{}",
                         crtc_id, c.fb_id, c.mode_valid, c.mode.hdisplay, c.mode.vdisplay
                     );
@@ -481,7 +481,7 @@ fn open_card_and_find_target(path: &str) -> Result<(OwnedFd, Target)> {
                         return Ok((card, Target::Crtc(crtc_id)));
                     }
                 }
-                Err(e) => eprintln!("[capture-drm] CRTC {crtc_id}: GETCRTC: {e}"),
+                Err(e) => log::debug!("[capture-drm] CRTC {crtc_id}: GETCRTC: {e}"),
             }
         }
     }
@@ -504,19 +504,19 @@ fn open_card_and_find_target(path: &str) -> Result<(OwnedFd, Target)> {
             let p = match get_plane(fdr, plane_id) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("[capture-drm] plane {plane_id}: GETPLANE: {e}");
+                    log::debug!("[capture-drm] plane {plane_id}: GETPLANE: {e}");
                     continue;
                 }
             };
             if p.fb_id == 0 || p.crtc_id == 0 {
-                eprintln!(
+                log::debug!(
                     "[capture-drm] plane {plane_id}: unbound (crtc={} fb={})",
                     p.crtc_id, p.fb_id
                 );
                 continue;
             }
             let ty = plane_type(fdr, plane_id).unwrap_or(u64::MAX);
-            eprintln!("[capture-drm] plane {plane_id}: crtc={} fb={} type={ty}", p.crtc_id, p.fb_id);
+            log::debug!("[capture-drm] plane {plane_id}: crtc={} fb={} type={ty}", p.crtc_id, p.fb_id);
             if ty == DRM_PLANE_TYPE_PRIMARY {
                 return Ok((card, Target::Plane(plane_id)));
             }
@@ -1260,7 +1260,7 @@ impl VblankTracker {
                 // means `fb` stayed put AND the sequence did not advance: the
                 // kernel's vblank counter is not running (nvidia-drm can
                 // return a frozen `sequence_ns` even though the ioctl succeeds).
-                eprintln!(
+                log::debug!(
                     "[capture-drm] vblank timeout: fb {w_fb} (seen {}) waiting for seq {w_target}, \
                      now seq {seq} ns {ns} after {} ms — sequence not advancing",
                     self.seen,
@@ -1330,7 +1330,7 @@ enum ActiveSync {
 fn emit_scanout(fd: &OwnedFd, id: u32, t0: u64, tx: &Sender<CaptureEvent>) -> bool {
     match import_fb(fd, id) {
         Ok(dmabuf) => {
-            eprintln!(
+            log::debug!(
                 "[capture-drm] fb {id} {}x{} fourcc={:#010x} '{}' modifier={:#x} stride={}",
                 dmabuf.format.width,
                 dmabuf.format.height,
@@ -1343,7 +1343,7 @@ fn emit_scanout(fd: &OwnedFd, id: u32, t0: u64, tx: &Sender<CaptureEvent>) -> bo
             true
         }
         Err(e) => {
-            eprintln!("[capture-drm] fb {id} import failed: {e:#}");
+            log::debug!("[capture-drm] fb {id} import failed: {e:#}");
             false
         }
     }
@@ -1355,7 +1355,7 @@ fn run(
     tx: Sender<CaptureEvent>,
     stop: Stop,
 ) -> Result<()> {
-    eprintln!(
+    log::debug!(
         "[capture-drm] opening card {}",
         card_pref.unwrap_or("(probe /dev/dri/card0..8)")
     );
@@ -1437,12 +1437,12 @@ fn run(
                             }
                             Err(e) => {
                                 if matches!(sync, CaptureSync::Auto) {
-                                    eprintln!(
+                                    log::warn!(
                                         "[capture-drm] fence watch unavailable: {e:#}; \
                                          trying vblank"
                                     );
                                 } else {
-                                    eprintln!(
+                                    log::warn!(
                                         "[capture-drm] fence watch unavailable: {e:#}; \
                                          using one-behind"
                                     );
@@ -1470,7 +1470,7 @@ fn run(
                             }
                         }
                     };
-                    eprintln!(
+                    log::debug!(
                         "[capture-drm] target: {target:?} (crtc {crtc_id:?}); flip sync: {} (requested {sync:?})",
                         match active {
                             ActiveSync::Vblank => "vblank-synced current frame",
@@ -1483,7 +1483,7 @@ fn run(
                     if matches!(sync, CaptureSync::Vblank | CaptureSync::Auto) && !vblank_ok {
                         match &vblank_probe {
                             Some(Err(e)) => {
-                                eprintln!(
+                                log::warn!(
                                     "[capture-drm] vblank unavailable: CRTC_GET_SEQUENCE failed: \
                                      {e:#}; using one-behind"
                                 );
@@ -1492,7 +1492,7 @@ fn run(
                                     .and_then(|io| io.raw_os_error())
                                     == Some(libc::EOPNOTSUPP);
                                 if unsupported {
-                                    eprintln!(
+                                    log::debug!(
                                         "[capture-drm] hint: this driver has no DRM vblank support \
                                          (nvidia-drm disables it by default) — \
                                          `options nvidia_drm vblank=1` in modprobe.d + initramfs \
@@ -1500,13 +1500,13 @@ fn run(
                                     );
                                 }
                             }
-                            Some(Ok((s1, s2, ns))) => eprintln!(
+                            Some(Ok((s1, s2, ns))) => log::warn!(
                                 "[capture-drm] vblank unavailable: CRTC_GET_SEQUENCE returned Ok but \
                                  the sequence did not advance ({s1} -> {s2} over 40 ms, ns {ns}) — \
                                  the kernel's vblank counter is not running; using one-behind. \
                                  One-behind costs up to one refresh of capture latency."
                             ),
-                            None => eprintln!(
+                            None => log::warn!(
                                 "[capture-drm] vblank unavailable (no CRTC for the selected \
                                  target); using one-behind"
                             ),
@@ -1523,7 +1523,7 @@ fn run(
                     disabled_reported = false;
                 }
                 Err(e) => {
-                    eprintln!("[capture-drm] {e:#}; retrying…");
+                    log::debug!("[capture-drm] {e:#}; retrying…");
                     continue;
                 }
             }
@@ -1538,7 +1538,7 @@ fn run(
                 Some(Ok(v)) => Some(v),
                 Some(Err(e)) => {
                     if !vblank_err_logged {
-                        eprintln!("[capture-drm] vblank: CRTC_GET_SEQUENCE failed: {e:#}");
+                        log::debug!("[capture-drm] vblank: CRTC_GET_SEQUENCE failed: {e:#}");
                         vblank_err_logged = true;
                     }
                     None
@@ -1552,7 +1552,7 @@ fn run(
             Target::Crtc(crtc_id) => match get_crtc(fdi, crtc_id) {
                 Ok(c) => c.fb_id,
                 Err(e) => {
-                    eprintln!("[capture-drm] GETCRTC: {e}; rescanning");
+                    log::debug!("[capture-drm] GETCRTC: {e}; rescanning");
                     card = None;
                     last_open_attempt = Some(std::time::Instant::now());
                     if crate::sleep_or_stop(&stop, std::time::Duration::from_secs(1)) {
@@ -1564,7 +1564,7 @@ fn run(
             Target::Plane(plane_id) => match get_plane(fdi, plane_id) {
                 Ok(p) => p.fb_id,
                 Err(e) => {
-                    eprintln!("[capture-drm] GETPLANE: {e}; rescanning");
+                    log::debug!("[capture-drm] GETPLANE: {e}; rescanning");
                     card = None;
                     last_open_attempt = Some(std::time::Instant::now());
                     if crate::sleep_or_stop(&stop, std::time::Duration::from_secs(1)) {
@@ -1708,7 +1708,7 @@ fn run(
                             } else {
                                 vints[vints.len() / 2]
                             };
-                            eprintln!(
+                            log::debug!(
                                 "[capture-drm] vblank: emit-t0 p50 {lag} us | vblank interval p50 {iv} us ({} samples)",
                                 vlag.len(),
                             );
@@ -1723,7 +1723,7 @@ fn run(
                     }
                 }
                 if vtracker.give_up() && active == ActiveSync::Vblank {
-                    eprintln!(
+                    log::debug!(
                         "[capture-drm] vblank never advanced within {VBLANK_TIMEOUT_MS} ms \
                          ({VBLANK_FAILS_TO_GIVEUP}× in a row) — switching to one-behind"
                     );

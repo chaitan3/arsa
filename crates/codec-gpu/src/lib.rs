@@ -369,7 +369,7 @@ impl GpuCodec {
 
             let ver = (gl.get_string)(GL_VERSION);
             let ren = (gl.get_string)(GL_RENDERER);
-            eprintln!(
+            log::debug!(
                 "[gpu] {} | {}",
                 CStr::from_ptr(ver as *const i8).to_string_lossy(),
                 CStr::from_ptr(ren as *const i8).to_string_lossy()
@@ -392,16 +392,16 @@ impl GpuCodec {
                 .map(|v| v == "2d")
                 .unwrap_or(false);
             let enc_ext_prog = if force_blit {
-                eprintln!("[gpu] RDMA_LOSSLESS_SRC=blit: forcing the blit + image encode path");
+                log::debug!("[gpu] RDMA_LOSSLESS_SRC=blit: forcing the blit + image encode path");
                 0
             } else {
                 match build_program(&gl, &enc_ext_src()) {
                     Ok(p) => {
-                        eprintln!("[gpu] external-texture compute encode available (no blit)");
+                        log::debug!("[gpu] external-texture compute encode available (no blit)");
                         p
                     }
                     Err(e) => {
-                        eprintln!("[gpu] external-texture compute encode unavailable ({e:#}); using blit path");
+                        log::warn!("[gpu] external-texture compute encode unavailable ({e:#}); using blit path");
                         0
                     }
                 }
@@ -710,7 +710,7 @@ impl GpuCodec {
             // usually can, but not always; tiled ones only under =2d), fall
             // back to the external sampler.
             if err != 0 && target == GL_TEXTURE_2D {
-                eprintln!(
+                log::debug!(
                     "[gpu] EGLImage -> GL_TEXTURE_2D bind failed (glError {err:#06x}, modifier {:#x}); using the external sampler",
                     d.modifier
                 );
@@ -1449,7 +1449,7 @@ impl GpuVideoDecoder {
             match build_program(&gl, &dec_tex_src()) {
                 Ok(p) => (p, 0, false),
                 Err(e) => {
-                    eprintln!(
+                    log::warn!(
                         "[gpu-dec] read-write decode shader rejected ({e:#}); \
                          using the portable readonly/writeonly decode"
                     );
@@ -1493,7 +1493,7 @@ impl GpuVideoDecoder {
                 bail!("persistent map of the gpu decoder buffer failed");
             }
             (gl.bind_buffer_base)(GL_SHADER_STORAGE_BUFFER, 4, coded);
-            eprintln!(
+            log::info!(
                 "[gpu-dec] attached ({}x{}){}",
                 geom.width,
                 geom.height,
@@ -1740,7 +1740,7 @@ fn build_program(gl: &Gl, src: &str) -> Result<u32> {
             (gl.get_shader_info_log)(sh, 4096, &mut n, log.as_mut_ptr());
             if std::env::var("RDMA_SHADER_DUMP").is_ok() {
                 for (i, l) in src.lines().enumerate() {
-                    eprintln!("{:>4}: {l}", i + 1);
+                    log::info!("{:>4}: {l}", i + 1);
                 }
             }
             bail!(

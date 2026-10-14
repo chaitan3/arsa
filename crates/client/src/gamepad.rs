@@ -147,7 +147,7 @@ fn try_attach(
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EACCES) {
             EACCES_HINT.call_once(|| {
-                eprintln!(
+                log::warn!(
                     "[gamepad] cannot open {path:?} ({rw_err}) — the client user needs read+write access to /dev/input/event* (add to the `input` group); capture disabled for it",
                     rw_err = rw_err
                 );
@@ -175,13 +175,13 @@ fn try_attach(
 
     let name = device_name(fd.as_raw_fd()).unwrap_or_else(|| "gamepad".to_string());
     if !can_rumble {
-        eprintln!("[gamepad] {path:?} opened read-only (rumble unavailable; write access to /dev/input/event* needs the `input` group)");
+        log::warn!("[gamepad] {path:?} opened read-only (rumble unavailable; write access to /dev/input/event* needs the `input` group)");
     }
 
     if grab {
         let r = unsafe { libc::ioctl(fd.as_raw_fd(), EVIOCGRAB as libc::c_ulong, 1i32) };
         if r < 0 {
-            eprintln!(
+            log::warn!(
                 "[gamepad] EVIOCGRAB failed on {path:?} ({}) — the local compositor will also see this pad",
                 std::io::Error::last_os_error()
             );
@@ -194,7 +194,7 @@ fn try_attach(
         let rumble_fd = fd.try_clone().expect("clone evdev fd for rumble");
         pads.lock().unwrap().insert(slot, rumble_fd);
     }
-    eprintln!("[gamepad] slot {slot}: {name:?} at {path:?}");
+    log::info!("[gamepad] slot {slot}: {name:?} at {path:?}");
 
     let input_tx = input_tx.clone();
     let slot_name = name;
@@ -221,7 +221,7 @@ fn manager_loop(
     let watch = inotify_start();
     if watch.is_none() {
         // no inotify: fall back to a 1s rescan (cheap; ~10 open/close per s)
-        eprintln!("[gamepad] inotify unavailable; scanning /dev/input every 1s");
+        log::warn!("[gamepad] inotify unavailable; scanning /dev/input every 1s");
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
             scan_once(&input_tx, grab, &pads, &mut next_slot, &mut attached);
@@ -359,7 +359,7 @@ fn reader_loop(
             ranges.insert(code, (ai.minimum, ai.maximum));
         }
     }
-    eprintln!("[gamepad] slot {slot}: forwarding ({name:?}, {} axes)", ranges.len());
+    log::info!("[gamepad] slot {slot}: forwarding ({name:?}, {} axes)", ranges.len());
 
     let mut btn_down: HashSet<u32> = HashSet::new();
     let mut axis_last: HashMap<u32, i32> = HashMap::new();
@@ -374,7 +374,7 @@ fn reader_loop(
                     continue;
                 }
             }
-            eprintln!("[gamepad] slot {slot}: pad gone");
+            log::info!("[gamepad] slot {slot}: pad gone");
             return;
         }
         for ev in buf[..n as usize].chunks_exact(24) {
@@ -455,7 +455,7 @@ fn rumble_loop(
         let fd = pads.lock().unwrap().get(&r.slot).map(|f| f.as_raw_fd());
         let Some(fd) = fd else {
             if warned.insert(r.slot) {
-                eprintln!("[gamepad] rumble for slot {} dropped: pad has no write access", r.slot);
+                log::warn!("[gamepad] rumble for slot {} dropped: pad has no write access", r.slot);
             }
             continue;
         };
@@ -478,7 +478,7 @@ fn rumble_loop(
                     0 => {
                         effects.insert((r.slot, r.id), eff.id);
                     }
-                    _ => eprintln!("[gamepad] EVIOCSFF failed: {}", std::io::Error::last_os_error()),
+                    _ => log::warn!("[gamepad] EVIOCSFF failed: {}", std::io::Error::last_os_error()),
                 }
             }
             proto::gamepad::RUMBLE_PLAY | proto::gamepad::RUMBLE_STOP => {
@@ -507,7 +507,7 @@ fn write_ev(fd: i32, e: &Ev) {
 /// sweeps the left trigger, so the full path (evdev-free) can be verified
 /// with `evtest` on the host watching the virtual pad.
 fn spawn_fake(input_tx: mpsc::Sender<rdma_display_proto::InputEvent>) {
-    eprintln!("[gamepad] --fake-gamepad: synthesizing a controller on slot 0");
+    log::info!("[gamepad] --fake-gamepad: synthesizing a controller on slot 0");
     std::thread::Builder::new()
         .name("gamepad-fake".into())
         .spawn(move || fake_loop(input_tx))

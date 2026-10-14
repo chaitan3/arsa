@@ -336,7 +336,7 @@ impl Pyrowave {
         if major != PYROWAVE_API_VERSION_MAJOR {
             bail!("pyrowave ABI major {major} != expected {PYROWAVE_API_VERSION_MAJOR}");
         }
-        eprintln!("[pyrowave] API {major}.{minor}.{patch}");
+        log::info!("[pyrowave] API {major}.{minor}.{patch}");
         Ok(Pyrowave {
             create_device: sym(&lib, "pyrowave_create_device")?,
             create_default_device: sym(&lib, "pyrowave_create_default_device")?,

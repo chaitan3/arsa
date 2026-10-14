@@ -203,6 +203,7 @@ both ends.
 | `--gpu-power off\|p5\|p0\|max\|<sm>[,<mem>]` | Floor NVIDIA clocks (needs root). |
 | `--slots N` | Receive slots (default 3). |
 | `--idle-metrics N` | Log RSS/CPU every N seconds. |
+| `-v`, `--verbose` | Debug-level logging for the project's crates (per-frame/per-event detail). `RUST_LOG` overrides. |
 
 ### Client
 
@@ -220,6 +221,7 @@ both ends.
 | `--audio` / `--no-audio` / `--audio-buffer-ms N` | Audio playback (default on). |
 | `--no-controller` / `--no-controller-grab` / `--fake-gamepad` | Gamepad forwarding. |
 | `--seconds N` / `--dump FILE` | Headless capture to a PPM for debugging. |
+| `-v`, `--verbose` | Debug-level logging for the project's crates (per-frame/per-event detail). `RUST_LOG` overrides. |
 
 **Shortcut:** `Ctrl+Alt+G` (or `-g` at startup) grabs keyboard+mouse for the
 remote side — the local compositor's own shortcuts (Alt+F4, Alt+Tab, …) are

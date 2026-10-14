@@ -154,7 +154,7 @@ impl DmabufFeedback {
         // KWin re-sends feedback as the surface's output/state changes (e.g.
         // after fullscreen); log only when the set actually changes.
         if s != self.last {
-            eprintln!("{s}");
+            log::info!("{s}");
             self.last = s;
         }
     }
@@ -472,7 +472,7 @@ impl Presenter {
         // request KWin maps the toplevel with no titlebar at all
         let decoration_mgr: Option<ZxdgDecorationManagerV1> =
             globals.bind(&qh, 1..=1, ()).ok();
-        eprintln!(
+        log::debug!(
             "[wl] bound compositor v{} wm_base v{} seat v{} cursor-shape {} fractional-scale {} shortcuts-inhibit {} presentation {}",
             compositor.version(),
             wmbase.version(),
@@ -504,7 +504,7 @@ impl Presenter {
                 .map(|g| format!("{} v{}", g.interface, g.version))
                 .collect();
             caps.sort();
-            eprintln!("[wl] scanout-related globals: {}", caps.join(", "));
+            log::debug!("[wl] scanout-related globals: {}", caps.join(", "));
         }
 
         let surface = compositor.create_surface(&qh, ());
@@ -525,7 +525,7 @@ impl Presenter {
         xdg_surface.set_window_geometry(0, 0, width as i32, height as i32);
         if fullscreen {
             toplevel.set_fullscreen(None);
-            eprintln!("[wl] fullscreen requested (current output)");
+            log::debug!("[wl] fullscreen requested (current output)");
         } else {
             toplevel.set_min_size(width as i32, height as i32);
             toplevel.set_max_size(width as i32, height as i32);
@@ -537,7 +537,7 @@ impl Presenter {
         if let Some(d) = decoration.as_ref() {
             d.set_mode(Mode::ServerSide);
         }
-        eprintln!(
+        log::debug!(
             "[wl] decorations: {}",
             match decoration.as_ref() {
                 Some(_) => "server-side requested",
@@ -618,7 +618,7 @@ impl Presenter {
         // commit deadlocks forever — compositor processes every request and
         // emits nothing (verified by the roundtrip bisect).
         me.state.surface.commit();
-        eprintln!("[wl] early empty commit sent (pre-configure map)");
+        log::debug!("[wl] early empty commit sent (pre-configure map)");
         me.queue.flush()?;
 
         let start = Instant::now();
@@ -765,7 +765,7 @@ impl St {
             let kb_ok = self.grab_keys(qh);
             let ptr_ok = self.grab_pointer(qh);
             if !kb_ok && !ptr_ok {
-                eprintln!(
+                log::warn!(
                     "[wl] grab unavailable: compositor supports neither \
                      keyboard-shortcuts-inhibit nor relative-pointer/pointer-constraints"
                 );
@@ -775,17 +775,17 @@ impl St {
             self.dbg_n = 0;
             self.dbg_sum = (0.0, 0.0);
             self.dbg_window = Instant::now();
-            eprintln!("[wl] input grabbed (Ctrl+Alt+G to release)");
+            log::debug!("[wl] input grabbed (Ctrl+Alt+G to release)");
         } else {
             self.release_keys();
             self.release_pointer();
             self.grabbed = false;
             self.grab_acc = (0.0, 0.0);
-            eprintln!(
+            log::debug!(
                 "[wl] grab session: {} relative events, Σx={:+.1} Σy={:+.1}",
                 self.dbg_n, self.dbg_sum.0, self.dbg_sum.1
             );
-            eprintln!("[wl] input released (compositor back in control)");
+            log::debug!("[wl] input released (compositor back in control)");
         }
     }
 
@@ -799,7 +799,7 @@ impl St {
             return true;
         }
         let Some(mgr) = self.inhibit_mgr.clone() else {
-            eprintln!(
+            log::warn!(
                 "[wl] keyboard grab UNAVAILABLE: no keyboard-shortcuts-inhibit \
                  global — desktop shortcuts (alt-f4/alt-tab/...) still hit the \
                  local desktop"
@@ -807,7 +807,7 @@ impl St {
             return false;
         };
         self.inhibitor = Some(mgr.inhibit_shortcuts(&self.surface, &self.seat, qh, ()));
-        eprintln!("[wl] keyboard grabbed (compositor shortcuts inhibited)");
+        log::debug!("[wl] keyboard grabbed (compositor shortcuts inhibited)");
         true
     }
 
@@ -817,7 +817,7 @@ impl St {
     fn release_keys(&mut self) {
         if let Some(inh) = self.inhibitor.take() {
             inh.destroy();
-            eprintln!("[wl] keyboard released (compositor shortcuts restored)");
+            log::debug!("[wl] keyboard released (compositor shortcuts restored)");
         }
     }
 
@@ -836,7 +836,7 @@ impl St {
             self.constraints.clone(),
             self.pointer.clone(),
         ) else {
-            eprintln!(
+            log::warn!(
                 "[wl] mouse grab UNAVAILABLE: compositor lacks \
                  relative-pointer/pointer-constraints"
             );
@@ -852,9 +852,9 @@ impl St {
             // hide the local cursor (guest games draw their own; desktop
             // users get the guest cursor back on release)
             pointer.set_cursor(self.pointer_serial, None, 0, 0);
-            eprintln!("[wl] mouse grabbed (relative mode)");
+            log::debug!("[wl] mouse grabbed (relative mode)");
         } else {
-            eprintln!("[wl] mouse not over the window: it locks when it enters");
+            log::debug!("[wl] mouse not over the window: it locks when it enters");
         }
         true
     }
@@ -884,7 +884,7 @@ impl St {
             }
         }
         if had_lock {
-            eprintln!("[wl] mouse released (absolute mode)");
+            log::debug!("[wl] mouse released (absolute mode)");
         }
     }
 
@@ -921,7 +921,7 @@ impl St {
         region.add(0, 0, w.max(1) as i32, h.max(1) as i32);
         self.surface.set_opaque_region(Some(&region));
         region.destroy();
-        eprintln!(
+        log::debug!(
             "[wl] opaque region {w}x{h} (direct scanout eligible when fullscreen)"
         );
     }
@@ -947,7 +947,7 @@ impl St {
             self.toplevel.set_max_size(lw as i32, lh as i32);
         }
         self.queue_egl_resize();
-        eprintln!(
+        log::debug!(
             "[wl] mode: {}scale {}/120, window {}x{} logical, buffer {}x{} device (frame {}x{})",
             if self.fullscreened { "fullscreen, " } else { "" },
             self.scale120,
@@ -958,7 +958,7 @@ impl St {
             self.width,
             self.height
         );
-        eprintln!(
+        log::debug!(
             "[wl] scanout-check: fullscreen={} buffer={}x{} scale={}/120 viewport_dest={}x{} opaque={}x{} frame={}x{}",
             self.fullscreened,
             self.dev_w,
@@ -1069,7 +1069,7 @@ impl Dispatch<ZwpLockedPointerV1, ()> for St {
     ) {
         match ev {
             zwp_locked_pointer_v1::Event::Locked => {
-                eprintln!("[wl] pointer lock active (relative mode)");
+                log::debug!("[wl] pointer lock active (relative mode)");
             }
             zwp_locked_pointer_v1::Event::Unlocked => {
                 if !state.grabbed {
@@ -1079,7 +1079,7 @@ impl Dispatch<ZwpLockedPointerV1, ()> for St {
                 if state.locked_obj.as_ref().map(|p| p.id()) != Some(obj.id()) {
                     return;
                 }
-                eprintln!(
+                log::debug!(
                     "[wl] grab: compositor broke the pointer lock — re-locking \
                      (Ctrl+Alt+G releases)"
                 );
@@ -1107,10 +1107,10 @@ impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for St {
     ) {
         match ev {
             zwp_keyboard_shortcuts_inhibitor_v1::Event::Active => {
-                eprintln!("[wl] keyboard grab active (compositor shortcuts inhibited)");
+                log::debug!("[wl] keyboard grab active (compositor shortcuts inhibited)");
             }
             zwp_keyboard_shortcuts_inhibitor_v1::Event::Inactive => {
-                eprintln!(
+                log::warn!(
                     "[wl] keyboard grab INACTIVE: the compositor took its shortcuts \
                      back (reserved escape combo?) — desktop keys may hit the local \
                      desktop again"
@@ -1294,7 +1294,7 @@ impl Dispatch<ZwpRelativePointerV1, ()> for St {
             state.dbg_sum.0 += dx_unaccel;
             state.dbg_sum.1 += dy_unaccel;
             if state.dbg_window.elapsed().as_secs_f64() >= 2.0 {
-                eprintln!(
+                log::debug!(
                     "[wl] rel agg: {} ev Σx={:+.1} Σy={:+.1} in 2s",
                     state.dbg_n, state.dbg_sum.0, state.dbg_sum.1
                 );
@@ -1325,10 +1325,10 @@ impl Dispatch<ZxdgToplevelDecorationV1, ()> for St {
         if let zxdg_toplevel_decoration_v1::Event::Configure { mode } = ev {
             match mode {
                 WEnum::Value(Mode::ServerSide) => {
-                    eprintln!("[wl] decoration mode: server-side (titlebar active)")
+                    log::debug!("[wl] decoration mode: server-side (titlebar active)")
                 }
                 other => {
-                    eprintln!("[wl] decoration configure said {other:?}; re-asserting server-side");
+                    log::debug!("[wl] decoration configure said {other:?}; re-asserting server-side");
                     obj.set_mode(Mode::ServerSide);
                     state.surface.commit();
                 }
@@ -1414,9 +1414,9 @@ impl Dispatch<WlKeyboard, ()> for St {
                 if state.grabbed {
                     // the inhibitor re-engages by itself on keyboard focus
                     // (protocol: active ⇔ our surface has keyboard focus)
-                    eprintln!("[wl] kb enter (grab still on: Ctrl+Alt+G releases)");
+                    log::debug!("[wl] kb enter (grab still on: Ctrl+Alt+G releases)");
                 } else {
-                    eprintln!("[wl] kb enter (kb_active=true)");
+                    log::debug!("[wl] kb enter (kb_active=true)");
                 }
             }
             wl_keyboard::Event::Leave { .. } => {
@@ -1434,12 +1434,12 @@ impl Dispatch<WlKeyboard, ()> for St {
                     // exit. The compositor taking focus away (lock screen,
                     // popup) must not dump the user out of the grab — it
                     // re-engages on re-focus (see Enter above).
-                    eprintln!(
+                    log::debug!(
                         "[wl] kb leave (grab stays on; Ctrl+Alt+G releases once \
                          the window is focused again)"
                     );
                 } else {
-                    eprintln!("[wl] kb leave (kb_active=false, held keys flushed)");
+                    log::debug!("[wl] kb leave (kb_active=false, held keys flushed)");
                 }
             }
             wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
@@ -1455,7 +1455,7 @@ impl Dispatch<WlKeyboard, ()> for St {
                 // stops the guest game mid-walk (verified by the up-flood in
                 // the grab logs), and repeat presses add nothing over uinput.
                 let released = matches!(st, WEnum::Value(KeyState::Released));
-                eprintln!(
+                log::debug!(
                     "[wl] key {key:#04x} {} kb_active={}",
                     if released { "up  " } else { "down" },
                     state.kb_active
@@ -1493,7 +1493,7 @@ impl Dispatch<WlKeyboard, ()> for St {
                 // because we never interpret the keymap)
                 let Some(code) = keymap::linux_to_qnum(key) else {
                     if state.grabbed {
-                        eprintln!(
+                        log::debug!(
                             "[wl] key {key:#04x} has no qnum mapping — dropped \
                              (while grabbed, neither the guest nor the desktop sees it)"
                         );
@@ -1565,7 +1565,7 @@ impl Dispatch<WlPointer, ()> for St {
                     // desktop shortcut, an OSD, another output — dumped the
                     // user out of relative mode mid-play). The lock is
                     // re-acquired on re-enter / on the Unlocked event.
-                    eprintln!(
+                    log::debug!(
                         "[wl] grab: pointer left the window — grab stays on \
                          (Ctrl+Alt+G releases)"
                     );
@@ -1612,7 +1612,7 @@ impl Dispatch<WlPointer, ()> for St {
                     0x113 => 5, // Side
                     0x114 => 6, // Extra
                     other => {
-                        eprintln!("[wl] unmapped pointer button {other:#x}");
+                        log::debug!("[wl] unmapped pointer button {other:#x}");
                         return;
                     }
                 };
@@ -1702,7 +1702,7 @@ impl Dispatch<XdgToplevel, ()> for St {
                 });
                 if fs != state.fullscreened {
                     state.fullscreened = fs;
-                    eprintln!(
+                    log::debug!(
                         "[wl] toplevel {} (compositor configure)",
                         if fs { "FULLSCREEN" } else { "windowed" }
                     );

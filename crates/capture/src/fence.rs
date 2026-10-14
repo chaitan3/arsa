@@ -190,7 +190,7 @@ fn calibrate(tracefs: &str, calib: Duration) -> Result<u32> {
         }
     }
     let (ctx, n) = best.context("no fence context tracked the commits")?;
-    eprintln!(
+    log::debug!(
         "[capture-drm] fence watch: completion context {ctx} \
          ({n} fence inits vs {handovers} commits in {:?})",
         calib
@@ -249,7 +249,7 @@ fn worker_loop(tracefs: &str, calib: Duration, shared: Arc<FenceShared>) {
                 if let Err(e) = configure_signal(tracefs, ctx) {
                     attempts += 1;
                     if attempts <= 3 {
-                        eprintln!(
+                        log::debug!(
                             "[capture-drm] fence watch: configure signalled failed: {e:#}; \
                              retrying"
                         );
@@ -257,21 +257,21 @@ fn worker_loop(tracefs: &str, calib: Duration, shared: Arc<FenceShared>) {
                     std::thread::sleep(Duration::from_millis(1000));
                     continue;
                 }
-                eprintln!(
+                log::debug!(
                     "[capture-drm] fence watch: switching to fence-triggered capture \
                      (context {ctx})"
                 );
                 shared.ready.store(true, Ordering::Relaxed);
                 read_signals(tracefs, &shared);
                 shared.ready.store(false, Ordering::Relaxed);
-                eprintln!("[capture-drm] fence watch: signal stream ended; recalibrating");
+                log::debug!("[capture-drm] fence watch: signal stream ended; recalibrating");
             }
             Err(e) => {
                 attempts += 1;
                 // the usual cause is an idle screen at boot: no commits to
                 // calibrate against. One-behind is used until activity appears.
                 if attempts <= 2 || attempts % 20 == 0 {
-                    eprintln!(
+                    log::debug!(
                         "[capture-drm] fence watch: no activity to calibrate yet ({e:#}); \
                          using one-behind until the screen changes"
                     );

@@ -16,6 +16,8 @@ rdma-display-codec = { path = "crates/codec" }
 qemu-display = { git = "https://gitlab.com/marcandre.lureau/qemu-display", default-features = false, features = ["qmp"] }
 async-std = "1"
 anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
 
 [profile.release]
 debug = true
