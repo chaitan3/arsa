@@ -12,6 +12,7 @@
 //! channel is a plain blocking TCP connection. All verbs resources are
 //! Arc-backed, so link structs can move to threads freely.
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::net::TcpStream;
 use std::os::fd::AsRawFd;
@@ -359,6 +360,16 @@ pub fn send_mode_reply(conn: &mut Conn<TcpStream>, reply: &proto::ModeReply) -> 
     Ok(())
 }
 
+/// Exponential moving average (1/8 step), seeded by the first sample. Used for
+/// the link-measurement EMAs so one slow frame doesn't move the window.
+fn ema(prev: u64, x: u64) -> u64 {
+    if prev == 0 {
+        x
+    } else {
+        (prev * 7 + x) / 8
+    }
+}
+
 pub struct ServerLink {
     /// credits arrive from the control-reader thread; None = client gone
     credit_rx: mpsc::Receiver<Option<u32>>,
@@ -373,6 +384,27 @@ pub struct ServerLink {
     transport: Transport,
     /// TCP video socket; None until the client's TAG_VIDEO connection arrives
     video: Option<TcpStream>,
+    /// Flow-control window: the most frames that may be sent-but-uncredited.
+    /// The client credits one per frame it consumes (presented or superseded),
+    /// so this bounds how far the server may run ahead of the client's
+    /// display. Both transports use it — on RDMA a credit also frees the
+    /// staging slot. The caller sizes it from the measured link (see
+    /// [`ServerLink::turnaround_us`] / [`ServerLink::send_interval_us`]).
+    window: usize,
+    /// Hard upper bound for `window`: RDMA cannot have more frames in flight
+    /// than it has staging slots to hold them.
+    max_window: usize,
+    /// frames sent and not yet credited
+    inflight: usize,
+    /// send time (unix µs) of each un-credited frame, FIFO-paired with credits
+    send_times: VecDeque<u64>,
+    /// EMA of the send -> credit turnaround (µs): how long the client takes to
+    /// consume a frame and release it (link + decode + present + link)
+    turnaround_us: u64,
+    /// EMA of the interval between sends (µs): the source frame period
+    send_interval_us: u64,
+    /// last send time (unix µs), for `send_interval_us`
+    last_send_us: u64,
 }
 
 impl ServerLink {
@@ -578,6 +610,15 @@ impl ServerLink {
             stamp_w: Some(stamp_w),
             transport,
             video: None,
+            // start at the physical maximum (the staging-slot count); the
+            // caller narrows it from the measured link via `set_window`
+            window: slots.max(1),
+            max_window: slots.max(1),
+            inflight: 0,
+            send_times: VecDeque::new(),
+            turnaround_us: 0,
+            send_interval_us: 0,
+            last_send_us: 0,
         })
     }
 
@@ -598,6 +639,96 @@ impl ServerLink {
         self.video.is_some()
     }
 
+    /// Whether one more frame may be sent without exceeding the flow-control
+    /// window (see [`ServerLink::set_window`]).
+    pub fn window_open(&self) -> bool {
+        self.inflight < self.window
+    }
+
+    /// Current flow-control window (max frames sent-but-uncredited).
+    pub fn window(&self) -> usize {
+        self.window
+    }
+
+    /// Upper bound for the window (the staging-slot count).
+    pub fn max_window(&self) -> usize {
+        self.max_window
+    }
+
+    /// Narrow (or widen) the flow-control window; clamped to `[1, max_window]`.
+    /// The caller derives the value from [`ServerLink::turnaround_us`] and
+    /// [`ServerLink::send_interval_us`].
+    pub fn set_window(&mut self, n: usize) -> usize {
+        self.window = n.clamp(1, self.max_window.max(1));
+        self.window
+    }
+
+    /// EMA of the send -> credit turnaround (µs); 0 until measured. That is how
+    /// long the client takes to consume a frame and release it, so it already
+    /// contains the client's decode and its wait for the next present.
+    pub fn turnaround_us(&self) -> u64 {
+        self.turnaround_us
+    }
+
+    /// EMA of the interval between sends (µs); 0 until measured. The source
+    /// frame period, used to express the turnaround as a frame count.
+    pub fn send_interval_us(&self) -> u64 {
+        self.send_interval_us
+    }
+
+    /// Block until the window has room (a client credit arrives) or the client
+    /// goes away. The caller waits *before* taking/materializing a frame, so a
+    /// frame that cannot be sent yet is never encoded and the latest-wins
+    /// mailbox can collapse to the freshest capture while we wait.
+    pub fn wait_for_window(&mut self) -> Result<()> {
+        while !self.window_open() {
+            match self.credit_rx.recv() {
+                Ok(Some(slot)) => self.apply_credit(slot),
+                Ok(None) => anyhow::bail!("client hung up"),
+                Err(_) => anyhow::bail!("client disconnected"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply one client credit: free the staging slot (RDMA) and release one
+    /// in-flight frame, folding its turnaround into the EMA.
+    fn apply_credit(&mut self, slot: u32) {
+        if let Tx::Rdma { slot_free, .. } = &mut self.tx {
+            if let Some(f) = slot_free.get_mut(slot as usize) {
+                *f = true;
+            }
+        }
+        self.inflight = self.inflight.saturating_sub(1);
+        if let Some(t0) = self.send_times.pop_front() {
+            self.turnaround_us = ema(self.turnaround_us, proto::unix_now_us().saturating_sub(t0));
+        }
+    }
+
+    /// Record a sent frame: bump the in-flight count and stamp its send time.
+    fn note_send(&mut self) {
+        let now = proto::unix_now_us();
+        if self.last_send_us != 0 {
+            let dt = now.saturating_sub(self.last_send_us);
+            if dt > 0 {
+                self.send_interval_us = ema(self.send_interval_us, dt);
+            }
+        }
+        self.last_send_us = now;
+        self.send_times.push_back(now);
+        if self.send_times.len() > 256 {
+            self.send_times.pop_front();
+        }
+        self.inflight = self.inflight.saturating_add(1);
+    }
+
+    /// Undo [`note_send`](Self::note_send) for a claimed frame that turned out
+    /// unchanged and is therefore not sent.
+    fn note_unsend(&mut self) {
+        self.inflight = self.inflight.saturating_sub(1);
+        self.send_times.pop_back();
+    }
+
     /// Non-blocking hangup/credit check: drains the credit channel (applying
     /// credits) and returns true when the control-reader thread signaled the
     /// client hung up (EOF/Bye). Call each loop iteration — an idle capture
@@ -605,13 +736,7 @@ impl ServerLink {
     pub fn client_gone(&mut self) -> bool {
         loop {
             match self.credit_rx.try_recv() {
-                Ok(Some(slot)) => {
-                    if let Tx::Rdma { slot_free, .. } = &mut self.tx {
-                        if let Some(f) = slot_free.get_mut(slot as usize) {
-                            *f = true;
-                        }
-                    }
-                }
+                Ok(Some(slot)) => self.apply_credit(slot),
                 Ok(None) => return true, // reader thread saw EOF
                 Err(mpsc::TryRecvError::Empty) => return false,
                 Err(mpsc::TryRecvError::Disconnected) => return true,
@@ -619,8 +744,11 @@ impl ServerLink {
         }
     }
 
-    /// Whether a staging slot is currently free (client-credited).
+    /// Whether a staging slot is currently free *and* the window has room.
     pub fn has_free_slot(&self) -> bool {
+        if !self.window_open() {
+            return false;
+        }
         match &self.tx {
             Tx::Rdma { slot_free, .. } => slot_free.iter().any(|f| *f),
             Tx::Tcp { busy, .. } => !*busy,
@@ -629,21 +757,25 @@ impl ServerLink {
 
     /// Non-blocking claim of the first free slot (marks it in use).
     pub fn try_claim_slot(&mut self) -> Option<usize> {
-        match &mut self.tx {
+        if !self.window_open() {
+            return None;
+        }
+        let slot = match &mut self.tx {
             Tx::Rdma { slot_free, .. } => {
                 let slot = slot_free.iter().position(|f| *f)?;
                 slot_free[slot] = false;
-                Some(slot)
+                slot
             }
             Tx::Tcp { busy, .. } => {
                 if *busy {
-                    None
-                } else {
-                    *busy = true;
-                    Some(0)
+                    return None;
                 }
+                *busy = true;
+                0
             }
-        }
+        };
+        self.note_send();
+        Some(slot)
     }
 
     /// Return a claimed slot (used when a frame turns out unchanged).
@@ -652,6 +784,7 @@ impl ServerLink {
             Tx::Rdma { slot_free, .. } => slot_free[slot] = true,
             Tx::Tcp { busy, .. } => *busy = false,
         }
+        self.note_unsend();
     }
 
     /// The claimed slot's registered memory, for `issue_frame`.
@@ -665,24 +798,26 @@ impl ServerLink {
         }
     }
 
-    /// Blocks until an RDMA staging slot is free, absorbing credit messages
-    /// meanwhile. (Credits arrive via the control-reader thread's channel.)
+    /// Blocks until an RDMA staging slot is free *and* the window has room,
+    /// absorbing credit messages meanwhile. (Credits arrive via the
+    /// control-reader thread's channel.)
     fn claim_free_slot_rdma(&mut self) -> Result<usize> {
         loop {
-            if let Tx::Rdma { slot_free, .. } = &mut self.tx {
-                if let Some(slot) = slot_free.iter().position(|f| *f) {
-                    slot_free[slot] = false;
-                    return Ok(slot);
-                }
-            }
-            match self.credit_rx.recv() {
-                Ok(Some(slot)) => {
-                    if let Tx::Rdma { slot_free, .. } = &mut self.tx {
-                        if let Some(f) = slot_free.get_mut(slot as usize) {
-                            *f = true;
-                        }
+            let mut claimed = None;
+            if self.window_open() {
+                if let Tx::Rdma { slot_free, .. } = &mut self.tx {
+                    if let Some(s) = slot_free.iter().position(|f| *f) {
+                        slot_free[s] = false;
+                        claimed = Some(s);
                     }
                 }
+            }
+            if let Some(slot) = claimed {
+                self.note_send();
+                return Ok(slot);
+            }
+            match self.credit_rx.recv() {
+                Ok(Some(slot)) => self.apply_credit(slot),
                 Ok(None) => anyhow::bail!("client hung up"),
                 Err(_) => anyhow::bail!("client disconnected"),
             }
@@ -825,7 +960,12 @@ impl ServerLink {
         if self.video.is_none() {
             return Ok(None); // client hasn't opened its TAG_VIDEO socket yet
         }
-        let t1s = t0d; // no staging-slot credits on TCP
+        // Flow control: the client credits one frame per present (see
+        // `ClientLink::credit_slot`), so wait for room before encoding. This is
+        // what paces TCP sends to the client's display — there are no staging
+        // slots to gate on, unlike RDMA.
+        self.wait_for_window()?;
+        let t1s = t0d; // TCP has no staging-slot credit wait of its own
         let (changed, post_len, mat_times, capacity) = {
             let Tx::Tcp { buf, .. } = &mut self.tx else {
                 unreachable!()
@@ -861,6 +1001,7 @@ impl ServerLink {
             // read-observation is the meaningful receipt stamp)
             (t2, t2)
         };
+        self.note_send();
         self.seq += 1;
         self.send_stamp(
             seq, t0_unix_us, t0d, t0p, t1s, t1_unix_us, t2_unix_us, t2c_unix_us, mat_times,
@@ -1563,8 +1704,13 @@ impl ClientLink {
         Ok(())
     }
 
-    /// Return a slot to the pool (RDMA: credits it for reuse; TCP: recycles
-    /// the buffer to the video reader).
+    /// Return a slot to the pool and tell the server the frame is consumed.
+    ///
+    /// RDMA: credits the staging slot for reuse. TCP: recycles the buffer to
+    /// the video reader. Either way a `Credit` goes to the server, which is
+    /// what paces its sends to our present rate (the flow-control window — see
+    /// `ServerLink::set_window`); on TCP there are no staging slots, so this
+    /// message is the only backpressure the server gets.
     pub fn credit_slot(&mut self, slot: usize) -> Result<()> {
         match &mut self.rx {
             Rx::Rdma { .. } => {
@@ -1581,6 +1727,7 @@ impl ClientLink {
                     let v = std::mem::take(&mut slots[slot]);
                     let _ = recycle_tx.send(v);
                 }
+                self.conn.send(&Message::Credit(slot as u32))?;
             }
         }
         Ok(())
@@ -1692,5 +1839,19 @@ impl ClientLink {
             }
             Rx::Tcp { slots, .. } => Ok(slots[slot].clone()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ema;
+
+    #[test]
+    fn ema_seeds_then_smooths() {
+        // the first sample seeds the average
+        assert_eq!(ema(0, 1000), 1000);
+        // later samples move it by 1/8, so one outlier can't swing the window
+        assert_eq!(ema(1000, 2000), (1000 * 7 + 2000) / 8);
+        assert_eq!(ema(1000, 9000), (1000 * 7 + 9000) / 8);
     }
 }

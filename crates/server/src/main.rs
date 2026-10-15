@@ -99,6 +99,8 @@ fn main() -> Result<()> {
     let mut audio_device: Option<String> = None;
     let mut audio_helper = false;
     let mut capture_sync = CaptureSync::Auto;
+    // frame-pacing policy: how the server sizes its flow-control window
+    let mut pace = Pace::Auto;
     let mut codec = rdma_display_codec::Codec::Lossless;
     // `--codec auto` (default): honour the client's codec preference, falling
     // back to `codec` when the client has none. A specific `--codec` forces it.
@@ -121,7 +123,13 @@ fn main() -> Result<()> {
             "--mode" => mode = args.next().expect("--mode needs a value"),
             "--device" => device = Some(args.next().expect("--device needs a value")),
             "--listen" => listen = Some(args.next().expect("--listen needs a value")),
-            "--slots" => slots = args.next().expect("--slots needs a value").parse()?,
+            // --slots kept as an accepted alias (older scripts/commands)
+            "--frame-slots" | "--slots" => {
+                slots = args
+                    .next()
+                    .expect("--frame-slots needs a value")
+                    .parse()?
+            }
             "--fps" => fps = args.next().expect("--fps needs a value").parse()?,
 
             "--source" => source = args.next().expect("--source needs a value"),
@@ -143,6 +151,11 @@ fn main() -> Result<()> {
                 })?;
             }
             "--input-test" => input_test = true,
+            "--pace" => {
+                let v = args.next().expect("--pace needs a value");
+                pace = Pace::parse(&v)
+                    .with_context(|| format!("--pace must be auto|latency|smooth, got {v:?}"))?;
+            }
             "--codec" => {
                 let v = args.next().expect("--codec needs a value");
                 if v == "auto" {
@@ -198,15 +211,16 @@ fn main() -> Result<()> {
             }
             "-v" | "--verbose" => verbose = true,
             "--help" | "-h" => {
-                println!("usage: rdma-display-server [ADDR[:PORT]] [--mode capture|testcard] [--device mlx5_0] [--listen 0.0.0.0:4791] [--slots 3] [--fps N]\n  \
+                println!("usage: rdma-display-server [ADDR[:PORT]] [--mode capture|testcard] [--device mlx5_0] [--listen 0.0.0.0:4791] [--frame-slots 3] [--fps N]\n  \
   ADDR[:PORT]  listen address, the same as --listen (default 0.0.0.0:4791; the port defaults to 4791 when omitted)\n  \
-  defaults: --mode capture --source drm --fps 0 --codec auto --audio on --capture-sync auto (a bare command is a root KMS capture of the host)\n  \
+  defaults: --mode capture --source drm --fps 0 --codec auto --audio on --capture-sync auto --pace auto (a bare command is a root KMS capture of the host)\n  \
 capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS capture, the host — requires sudo/CAP_SYS_ADMIN, kernel >= 5.8)\n  \
   --input qemu|uinput (default auto: qemu↔qemu-dbus, drm↔uinput)\n  \
   qemu: [--dbus-socket /path/dbus.sock] [--console 0]   drm: [--drm-card /dev/dri/cardN] (default: first card0..card8 with an active scanout)\n  \
   [--materialize egl|plain] [--rendernode /dev/dri/renderD128] [--readback pbo|direct] [--input-test]\n  \
   --materialize egl (default) imports the dmabuf and reads the frame back for raw/lossy and for the CPU/readback lossless fallback; GPU lossless bypasses the readback entirely and encodes straight from the imported dmabuf (no full-frame readback, no re-upload). --readback pbo|direct only affects that readback path.\n  \
   --capture-sync onbehind|vblank|zero|auto|settle[:ms]|fence  (drm) which fb to capture: onbehind = safe, one frame old; vblank = current frame as its vblank retires it (lowest latency; dead on this nvidia-drm stack, falls back); zero = current frame immediately, no sync (testing only, may tear); settle[:ms] = current frame ms after its commit (default 2 ms; usually complete, but frames whose render outlasts the window tear); fence = read the current frame when the compositor's per-frame completion fence signals (tracefs; ~1 ms, tear-free, needs root, falls back); auto = try fence, then vblank, then one-behind (default)\n  \
+  --pace auto|latency|smooth  frame pacing: the server's flow-control window — how many frames it keeps in flight ahead of the client's display. The client credits one frame per present, which paces both TCP and RDMA. auto (default) sizes the window from the measured link (ceil(turnaround / frame interval): keeps the pipe full without queueing); latency = 1 (present-paced, lowest latency, may stall if the link is slower than the display); smooth = the transport maximum (smoothest cadence, highest latency).\n  \
   --codec auto|raw|lossless|lossy  frame coding for the whole session (default auto = honour the client's Hello preference, else lossless). raw = unchanged wire; lossless = v2 tile-delta against the previous frame (desktop-friendly); lossy = PyroWave intra-only GPU codec (needs libpyrowave-shared.so). A non-auto value forces the codec. Build server and client together (lossless v2 is a wire-format version).\n  \
   --lossy-budget BYTES  lossy: max bitstream bytes per frame (default 1000000; slot size sent to the client).\n  \
   --lossy-chroma 420|444  lossy: chroma subsampling (default 420).\n  \
@@ -217,6 +231,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
   --display-control auto|hyprctl|kscreen|none  apply the client's pre-session resolution request (--native / --set-mode) to this compositor's output before capture starts, so the scanout and the session slots match (--source drm; default auto = Hyprland via hyprctl, KDE via kscreen-doctor).\n  \
   --display-output NAME  DRM connector name (e.g. DP-1, HDMI-A-1, eDP-1) to capture and to apply the client's resolution request to (default: the compositor's primary output; with no compositor backend, the first active output).\n  \
   --fps N (capture): pacing cap; 0 = uncapped, consumer-paced by client credits (default 0).\n  \
+  --frame-slots N  receive/staging slots, each holding one coded frame: sets the client's receive-buffer pool and the maximum flow-control window (default 3; --slots is accepted as an alias).\n  \
   --audio | --no-audio [--audio-device my-sink.monitor]  audio side-channel (default on; --no-audio disables): capture the named source's PCM through the pipewire-pulse\n  \
   compat socket (XDG_RUNTIME_DIR must point at the user's session when running under sudo; '@DEFAULT_MONITOR@' = default sink).");
                 return Ok(());
@@ -281,7 +296,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
             rdma_ref, transport, &source, input.as_deref(), &dbus_socket, console, &drm_card,
             &materialize, rendernode.as_deref(), &listen, slots, fps, input_test, &readback,
             capture_sync, audio, audio_device.as_deref(), codec, codec_auto, lossy_budget,
-            lossy_chroma444, &display_control, display_output.as_deref(), idle_metrics,
+            lossy_chroma444, &display_control, display_output.as_deref(), idle_metrics, pace,
         ),
         other => bail!("mode {other:?} not implemented yet"),
     }
@@ -601,6 +616,57 @@ fn read_threads() -> Option<u64> {
     None
 }
 
+/// Frame-pacing policy: how the server sizes its flow-control window — the most
+/// frames it lets be in flight ahead of the client's display. The client credits
+/// one per frame it consumes, so the window is what ties the server's send rate
+/// to the client's present rate (see `rdma_display_rdma::ServerLink`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Pace {
+    /// Present-paced: never more than one frame in flight — lowest latency, but
+    /// can stall (drop the rate) when the link is slower than the display
+    /// period.
+    Latency,
+    /// Never gate: buffer as far as the transport allows — smoothest cadence,
+    /// highest latency.
+    Smooth,
+    /// Size the window from the measured link (default).
+    Auto,
+}
+
+impl Pace {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "latency" => Pace::Latency,
+            "smooth" => Pace::Smooth,
+            "auto" => Pace::Auto,
+            _ => return None,
+        })
+    }
+}
+
+/// Flow-control window for `pace`, derived from the measured link.
+///
+/// `turnaround` is the send -> client-credit time (it already includes the
+/// client's decode and its wait for the next present); `interval` is the source
+/// frame period. Their ratio is the bandwidth-delay product counted in frames —
+/// how many frames must be in flight for the pipeline not to stall — so the
+/// window is `ceil(turnaround / interval)`, floored at 1 (present-paced) and
+/// capped at the transport maximum (the staging-slot count).
+fn pace_window(pace: Pace, turnaround_us: u64, interval_us: u64, max: usize) -> usize {
+    let max = max.max(1);
+    match pace {
+        Pace::Latency => 1,
+        Pace::Smooth => max,
+        Pace::Auto => {
+            if turnaround_us == 0 || interval_us == 0 {
+                // not measured yet: a small, safe, low-latency default
+                return 2.min(max);
+            }
+            (turnaround_us.div_ceil(interval_us) as usize).clamp(1, max)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_capture(
     rdma: Option<(&ibverbs::Context, &ibverbs::ProtectionDomain)>,
@@ -627,6 +693,7 @@ fn run_capture(
     display_control: &str,
     display_output: Option<&str>,
     idle_metrics: u64,
+    pace: Pace,
 ) -> Result<()> {
     if source_name == "drm" && materialize != "egl" && codec != rdma_display_codec::Codec::Lossy {
         bail!("--source drm requires --materialize egl (KMS capture is dmabuf-only)");
@@ -898,6 +965,21 @@ fn run_capture(
         }
         session_active.store(session.is_some(), std::sync::atomic::Ordering::Relaxed);
 
+        // frame pacing: size the flow-control window from the measured link
+        // (cheap; recompute each iteration and log only on change). Both
+        // transports use it, so TCP gets the same present-pacing RDMA has.
+        if let Some(link) = session.as_mut() {
+            let (t, iv, max) = (link.turnaround_us(), link.send_interval_us(), link.max_window());
+            let target = pace_window(pace, t, iv, max);
+            if target != link.window() {
+                let applied = link.set_window(target);
+                log::debug!(
+                    "[server] pacing {pace:?}: window {applied} of max {max} \
+                     (turnaround {t} us, frame interval {iv} us)"
+                );
+            }
+        }
+
         let gate_open =
             cap_period.map_or(true, |p| last_send.map_or(true, |t| t.elapsed() >= p));
         // 1. wait for something to happen: a capture event, the pacing
@@ -951,6 +1033,29 @@ fn run_capture(
                     bail!("capture source ended")
                 }
             },
+        }
+
+        // flow control: if a frame is waiting and the client hasn't credited
+        // room, block for a credit *before* draining, so the drain picks up the
+        // freshest capture (latest-wins mailbox) and we never encode a frame we
+        // cannot send. This is the only backpressure TCP gets (it has no
+        // staging slots); RDMA would otherwise stall later, inside
+        // `claim_free_slot_rdma`, after the frame had already been taken.
+        // Skipped while pipelining: those frames must reach step 5 to be posted
+        // (posting is what eventually frees them).
+        if !pipelined && frame_dirty && session.is_some() {
+            let hung = {
+                let link = session.as_mut().unwrap();
+                if link.window_open() {
+                    false
+                } else {
+                    link.wait_for_window().is_err()
+                }
+            };
+            if hung {
+                log::info!("[server] client gone while waiting for a frame credit");
+                session = None;
+            }
         }
 
         // 2. drain any backlog (each event latches state; newest t0 wins)
@@ -2716,5 +2821,37 @@ mod codec_resolve_tests {
             resolve_codec(false, Codec::Lossy, rdma_display_proto::CODEC_ANY),
             Codec::Lossy
         );
+    }
+}
+
+#[cfg(test)]
+mod pace_tests {
+    use super::{pace_window, Pace};
+
+    #[test]
+    fn latency_mode_is_present_paced() {
+        // always one frame in flight, measured or not
+        assert_eq!(pace_window(Pace::Latency, 10_000, 16_000, 3), 1);
+        assert_eq!(pace_window(Pace::Latency, 0, 0, 3), 1);
+    }
+
+    #[test]
+    fn smooth_mode_uses_the_transport_maximum() {
+        assert_eq!(pace_window(Pace::Smooth, 10_000, 16_000, 3), 3);
+        // max is always at least 1 (a zero max must not produce a zero window)
+        assert_eq!(pace_window(Pace::Smooth, 0, 0, 0), 1);
+    }
+
+    #[test]
+    fn auto_is_a_safe_default_then_the_frame_bdp() {
+        // unmeasured (either EMA missing): small, safe, low-latency default
+        assert_eq!(pace_window(Pace::Auto, 0, 0, 3), 2);
+        assert_eq!(pace_window(Pace::Auto, 0, 16_000, 3), 2);
+        // fast link: turnaround below one frame interval -> present-paced
+        assert_eq!(pace_window(Pace::Auto, 8_000, 16_000, 3), 1);
+        // turnaround spanning ~1.5 frame intervals -> two frames in flight
+        assert_eq!(pace_window(Pace::Auto, 24_000, 16_000, 3), 2);
+        // slow link: grows but is clamped to the staging-slot maximum
+        assert_eq!(pace_window(Pace::Auto, 100_000, 16_000, 3), 3);
     }
 }

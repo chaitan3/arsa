@@ -58,7 +58,13 @@ fn main() -> Result<()> {
         match arg.as_str() {
             "-s" | "--server" => server = Some(args.next().expect("--server needs a value")),
             "--device" => device = Some(args.next().expect("--device needs a value")),
-            "--slots" => slots = args.next().expect("--slots needs a value").parse()?,
+            // --slots kept as an accepted alias (older scripts/commands)
+            "--frame-slots" | "--slots" => {
+                slots = args
+                    .next()
+                    .expect("--frame-slots needs a value")
+                    .parse()?
+            }
             "--dump" => dump = Some(args.next().expect("--dump needs a value")),
             "--seconds" => seconds = Some(args.next().expect("--seconds needs a value").parse()?),
             "--slot-mem" => slot_mem = args.next().expect("--slot-mem needs a value").to_string(),
@@ -107,9 +113,10 @@ fn main() -> Result<()> {
                 };
             }
             "--help" | "-h" => {
-                println!("usage: rdma-display-client [HOST[:PORT]] [--device mlx5_0] [--slots 3] [--dump frame.ppm] [--seconds N]");
+                println!("usage: rdma-display-client [HOST[:PORT]] [--device mlx5_0] [--frame-slots 3] [--dump frame.ppm] [--seconds N]");
                 println!("  HOST[:PORT]           server address, given as the first positional argument (default host 127.0.0.1; :{DEFAULT_PORT} assumed when the port is omitted)");
                 println!("  -s, --server HOST[:PORT]  same as the positional HOST[:PORT] (either form may be used)");
+                println!("  --frame-slots N       receive slots, each holding one coded frame: sets the receive-buffer pool and the maximum flow-control window (default 3; --slots is accepted as an alias)");
                 println!("  --slot-mem host|cuda  receive slots: host = pinned RAM (default); cuda = dormant GPU path");
                 println!("  --cuda-device N       CUDA device ordinal for --slot-mem cuda (default 0)");
                 println!("  --output egl|none     egl = present in a Wayland window (default; needs --slot-mem host); none = headless (e.g. with --dump)");

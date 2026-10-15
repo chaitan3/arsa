@@ -145,17 +145,19 @@ nvidia-drm) is in [`DEBUG.md`](DEBUG.md#4-capture-sync--handover-investigation).
 
 ### 5.1 Slots and flow control
 
-The client allocates `--slots` (default 3) receive slots of the codec's
+The client allocates `--frame-slots` (default 3) receive slots of the codec's
 worst-case size, registers them as memory regions, and advertises
 `{rkey, addr, len}` per slot in `Buffers`. The server posts one RDMA WRITE
 (single SGE) per frame into a slot, with the immediate word encoding
 `{frame_seq, slot_index, flags}`. The immediate arrives as a completion on the
 client's recv QP — the "frame N is in slot k" notification.
 
-Flow control is by **credits**: the client returns a `Credit(slot)` when it is
-done with the slot (after presenting / decoding), and the server reuses a slot
-only after its credit. With TCP the same slot protocol runs over a
-length-prefixed stream on `TAG_VIDEO`.
+Flow control is a **frame window**: the client returns a `Credit(slot)` for
+every frame it consumes (presented *or* superseded), and the server keeps at
+most `window` frames sent-but-uncredited. On RDMA a credit also frees the
+staging slot; with TCP there are no staging slots, so the credit is the *only*
+backpressure (frames ride a length-prefixed stream on `TAG_VIDEO`). Either way
+the client's present rate paces the server's sends.
 
 ### 5.2 Control protocol (`crates/proto`)
 
@@ -205,6 +207,38 @@ pinned host MR → WRITE. Zero-copy dmabuf-MR remains implemented behind the sam
 config for hosts with a cooperative exporter (Intel/AMD rendernode). The
 client-side equivalent investigation (GBM/CUDA slots) is in
 [`DEBUG.md`](DEBUG.md#5-client-zero-copy-c0-findings).
+
+### 5.4 Frame pacing (`--pace`)
+
+Two clocks meet here: the capture is slaved to the *host* compositor's flips,
+the present to the *client's* vsync (or VRR). Nothing couples them, so the
+server in the middle is the only place a frame is ever deliberately held. Its
+flow-control window (§5.1) is that lever: too small and the pipeline stalls (the
+rate drops below the source); too large and it queues (latency creeps).
+
+The right size is the **bandwidth-delay product counted in frames**. The server
+measures the send -> client-credit *turnaround* (which already includes the
+client's decode and its wait for the next present) and the frame *interval*
+(the source period), both as EMAs, and sets
+
+```
+window = ceil(turnaround / interval)     # floored at 1, capped at --frame-slots
+```
+
+`--pace` selects the policy:
+
+| Mode | Window | Use |
+| --- | --- | --- |
+| `auto` (default) | `ceil(turnaround / interval)`, capped at `--frame-slots` | Keeps the pipe full without queueing; adapts to the link. |
+| `latency` | `1` | Present-paced: the client's credit gates every frame. Lowest latency; may stall if the link is slower than the display period. |
+| `smooth` | `--frame-slots` | Never gate: buffer as far as the transport allows. Smoothest cadence, highest latency. |
+
+Both transports obey it. RDMA already had credits (the window was implicitly
+`--frame-slots`); the window now *narrows* it. TCP previously had no frame-level flow
+control at all, so the server free-ran into the socket buffer and the client
+subsampled — the window is new there. Beyond the window, frames are dropped
+**latest-wins** at both the server's capture mailbox and the client's drain, so
+nothing queues and no GPU work is spent on a frame that will not be shown.
 
 ## 6. Codecs (`crates/codec`, `crates/codec-gpu`)
 

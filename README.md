@@ -197,13 +197,14 @@ both ends.
 | `--codec auto\|raw\|lossless\|lossy` | Frame coding. `auto` (default) honours the client's requested codec, else lossless; an explicit value forces it. |
 | `--transport auto\|rdma\|tcp` | Video transport (default `auto`: RDMA when possible). |
 | `--fps N` | Pacing cap; `0` = consumer-paced by client credits (default). |
+| `--pace auto\|latency\|smooth` | Frame pacing: how many frames the server keeps in flight ahead of the client's display (the flow-control window). `auto` (default) sizes it from the measured link; `latency` = 1 (present-paced, lowest latency); `smooth` = the transport maximum (smoothest). |
 | `--capture-sync MODE` | Which fb to capture: `onbehind` (default), `vblank`, `settle[:ms]`, `fence`, `zero`, `auto`. |
 | `--drm-card /dev/dri/cardN` | Pin the KMS card (default: first card with an active scanout). |
 | `--display-control auto\|hyprctl\|kscreen\|none` | Backend for the client's resolution request (default `auto`). |
 | `--display-output NAME` | DRM connector name to capture and to apply the resolution request to (default: the compositor's primary output). |
 | `--audio` / `--no-audio` / `--audio-device SRC` | Audio side-channel (default on; `@DEFAULT_MONITOR@` = default sink). |
 | `--gpu-power off\|p5\|p0\|max\|<sm>[,<mem>]` | Floor NVIDIA clocks (needs root). |
-| `--slots N` | Receive slots (default 3). |
+| `--frame-slots N` | Receive/staging slots, each holding one coded frame; sets the receive-buffer pool and the maximum flow-control window (default 3; `--slots` accepted as an alias). |
 | `--idle-metrics N` | Log RSS/CPU every N seconds. |
 | `-v`, `--verbose` | Debug-level logging for the project's crates (per-frame/per-event detail). `RUST_LOG` overrides. |
 
