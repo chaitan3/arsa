@@ -220,7 +220,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
   [--materialize egl|plain] [--rendernode /dev/dri/renderD128] [--readback pbo|direct] [--input-test]\n  \
   --materialize egl (default) imports the dmabuf and reads the frame back for raw/lossy and for the CPU/readback lossless fallback; GPU lossless bypasses the readback entirely and encodes straight from the imported dmabuf (no full-frame readback, no re-upload). --readback pbo|direct only affects that readback path.\n  \
   --capture-sync onbehind|vblank|zero|auto|settle[:ms]|fence  (drm) which fb to capture: onbehind = safe, one frame old; vblank = current frame as its vblank retires it (lowest latency; dead on this nvidia-drm stack, falls back); zero = current frame immediately, no sync (testing only, may tear); settle[:ms] = current frame ms after its commit (default 2 ms; usually complete, but frames whose render outlasts the window tear); fence = read the current frame when the compositor's per-frame completion fence signals (tracefs; ~1 ms, tear-free, needs root, falls back); auto = try fence, then vblank, then one-behind (default)\n  \
-  --pace auto|latency|smooth  frame pacing: the server's flow-control window — how many frames it keeps in flight ahead of the client's display. The client credits one frame per present, which paces both TCP and RDMA. auto (default) sizes the window from the measured link (ceil(turnaround / frame interval): keeps the pipe full without queueing); latency = 1 (present-paced, lowest latency, may stall if the link is slower than the display); smooth = the transport maximum (smoothest cadence, highest latency).\n  \
+  --pace auto|latency|smooth  frame pacing: the server's flow-control window — how many frames it keeps in flight ahead of the client's display. The client credits one frame per present, which paces both TCP and RDMA. auto (default) sizes the window from the measured link (ceil(turnaround / source frame period): keeps the pipe full without queueing); latency = 1 (present-paced, lowest latency, may stall if the link is slower than the display); smooth = the transport maximum (smoothest cadence, highest latency).\n  \
   --codec auto|raw|lossless|lossy  frame coding for the whole session (default auto = honour the client's Hello preference, else lossless). raw = unchanged wire; lossless = v2 tile-delta against the previous frame (desktop-friendly); lossy = PyroWave intra-only GPU codec (needs libpyrowave-shared.so). A non-auto value forces the codec. Build server and client together (lossless v2 is a wire-format version).\n  \
   --lossy-budget BYTES  lossy: max bitstream bytes per frame (default 1000000; slot size sent to the client).\n  \
   --lossy-chroma 420|444  lossy: chroma subsampling (default 420).\n  \
@@ -647,23 +647,95 @@ impl Pace {
 /// Flow-control window for `pace`, derived from the measured link.
 ///
 /// `turnaround` is the send -> client-credit time (it already includes the
-/// client's decode and its wait for the next present); `interval` is the source
-/// frame period. Their ratio is the bandwidth-delay product counted in frames —
-/// how many frames must be in flight for the pipeline not to stall — so the
-/// window is `ceil(turnaround / interval)`, floored at 1 (present-paced) and
+/// client's decode and its wait for the next present). `source_period` is the
+/// **source** frame period — the capture cadence, which is independent of the
+/// window. Their ratio is the bandwidth-delay product counted in frames — how
+/// many frames must be in flight for the pipeline not to stall — so the window
+/// is `ceil(turnaround / source_period)`, floored at 1 (present-paced) and
 /// capped at the transport maximum (the staging-slot count).
-fn pace_window(pace: Pace, turnaround_us: u64, interval_us: u64, max: usize) -> usize {
+///
+/// The denominator must be the *source* period, never the send interval: the
+/// send interval is a consequence of the window (in steady state
+/// `send_interval == turnaround / window`), so using it makes the formula
+/// `ceil(turnaround / (turnaround/window)) == window` — a neutral fixed point
+/// that can never climb out of a bad value (which is exactly how it collapsed
+/// to 1 on a 30 ms link).
+fn pace_window(pace: Pace, turnaround_us: u64, source_period_us: u64, max: usize) -> usize {
     let max = max.max(1);
     match pace {
         Pace::Latency => 1,
         Pace::Smooth => max,
         Pace::Auto => {
-            if turnaround_us == 0 || interval_us == 0 {
+            if turnaround_us == 0 || source_period_us == 0 {
                 // not measured yet: a small, safe, low-latency default
                 return 2.min(max);
             }
-            (turnaround_us.div_ceil(interval_us) as usize).clamp(1, max)
+            (turnaround_us.div_ceil(source_period_us) as usize).clamp(1, max)
         }
+    }
+}
+
+/// The source frame period, measured from the capture timestamps (`t0`). Unlike
+/// the send interval this is independent of the flow-control window, so it is
+/// the correct denominator for the window.
+///
+/// The raw interval is noisy and bimodal: in fence mode `t0` is the trace
+/// reader's own clock (scheduling jitter), and the compositor only flips on
+/// damage, so a short idle gap shows up as a long interval. An EMA over the raw
+/// intervals therefore wobbled between ~16 and ~155 ms and made the window
+/// oscillate 1..3 (with the p95 latency spiking whenever it dipped to 1).
+///
+/// Use a *low percentile* of a sliding window of intervals instead: it rejects
+/// both the idle gaps and the slow tail of the jitter, and converges to the
+/// **active** frame period — the rate the pipeline actually has to sustain
+/// during a burst.
+#[derive(Default)]
+struct SourcePeriod {
+    /// `t0` (unix µs) of the previous captured frame; 0 = none yet
+    last_t0: u64,
+    /// recent inter-frame intervals (µs), oldest first, bounded to `WINDOW`
+    recent: std::collections::VecDeque<u64>,
+    /// low percentile of `recent` (µs); 0 until measured
+    estimate_us: u64,
+}
+
+impl SourcePeriod {
+    /// Intervals kept for the estimate (~0.5 s at 60 Hz).
+    const WINDOW: usize = 32;
+    /// Percentile of the sorted intervals. Low, so the idle gaps and the slow
+    /// tail of the jitter don't inflate the period.
+    const PCT: usize = 25;
+
+    /// Feed one captured frame's `t0`.
+    fn observe(&mut self, t0: u64) {
+        if self.last_t0 != 0 && t0 > self.last_t0 {
+            let dt = t0 - self.last_t0;
+            // drop only absurd gaps (a paused/blanked screen), not the ordinary
+            // damage-driven ones — the percentile handles those
+            if dt < 1_000_000 {
+                self.recent.push_back(dt);
+                while self.recent.len() > Self::WINDOW {
+                    self.recent.pop_front();
+                }
+                self.estimate_us = Self::percentile(&self.recent, Self::PCT);
+            }
+        }
+        self.last_t0 = t0;
+    }
+
+    /// The active source frame period (µs); 0 until measured.
+    fn period_us(&self) -> u64 {
+        self.estimate_us
+    }
+
+    /// `pct`-th percentile of `v` (0..=100); 0 for an empty window.
+    fn percentile(v: &std::collections::VecDeque<u64>, pct: usize) -> u64 {
+        if v.is_empty() {
+            return 0;
+        }
+        let mut s: Vec<u64> = v.iter().copied().collect();
+        s.sort_unstable();
+        s[(s.len() * pct / 100).min(s.len() - 1)]
     }
 }
 
@@ -889,6 +961,13 @@ fn run_capture(
     // accept and cleared when the session ends
     let session_nonce = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let started = std::time::Instant::now();
+    // source frame period, measured from the capture t0s: the denominator for
+    // the flow-control window (independent of the window, unlike the send
+    // interval)
+    let mut src_period = SourcePeriod::default();
+    // throttle for the periodic pacing log (the turnaround is otherwise only
+    // logged when the window changes, so it was invisible after startup)
+    let mut last_pace_log = std::time::Instant::now();
 
     // pipelined (PBO staging) state: frames issued to the materializer whose
     // fence hasn't been finished+posted yet (slot, t0 event, t0d issue time)
@@ -965,17 +1044,21 @@ fn run_capture(
         }
         session_active.store(session.is_some(), std::sync::atomic::Ordering::Relaxed);
 
-        // frame pacing: size the flow-control window from the measured link
-        // (cheap; recompute each iteration and log only on change). Both
-        // transports use it, so TCP gets the same present-pacing RDMA has.
+        // frame pacing: size the flow-control window from the measured link.
+        // Cheap, so recompute every iteration; log on change *and* every 2 s so
+        // the turnaround is visible after startup (it used to be logged only
+        // when the window changed, which hid it).
         if let Some(link) = session.as_mut() {
             let (t, iv, max) = (link.turnaround_us(), link.send_interval_us(), link.max_window());
-            let target = pace_window(pace, t, iv, max);
-            if target != link.window() {
+            let src = src_period.period_us();
+            let target = pace_window(pace, t, src, max);
+            let changed = target != link.window();
+            if changed || last_pace_log.elapsed() >= std::time::Duration::from_secs(2) {
+                last_pace_log = std::time::Instant::now();
                 let applied = link.set_window(target);
                 log::debug!(
                     "[server] pacing {pace:?}: window {applied} of max {max} \
-                     (turnaround {t} us, frame interval {iv} us)"
+                     (turnaround {t} us, source period {src} us, send interval {iv} us)"
                 );
             }
         }
@@ -1014,7 +1097,7 @@ fn run_capture(
                     handle_capture_event(
                         ev, &mut mat, &mut session, &mut pending_meta,
                         &mut t0_unix_us, &mut frame_dirty, &screen,
-                        &mut pending_scanout,
+                        &mut pending_scanout, &mut src_period,
                     )?;
                 }
                 Err(_) => bail!("capture source ended"),
@@ -1025,7 +1108,7 @@ fn run_capture(
                     handle_capture_event(
                         ev, &mut mat, &mut session, &mut pending_meta,
                         &mut t0_unix_us, &mut frame_dirty, &screen,
-                        &mut pending_scanout,
+                        &mut pending_scanout, &mut src_period,
                     )?;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1065,7 +1148,7 @@ fn run_capture(
                     handle_capture_event(
                         ev, &mut mat, &mut session, &mut pending_meta,
                         &mut t0_unix_us, &mut frame_dirty, &screen,
-                        &mut pending_scanout,
+                        &mut pending_scanout, &mut src_period,
                     )?;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -2176,6 +2259,7 @@ fn handle_capture_event(
     frame_dirty: &mut bool,
     screen: &Arc<ScreenSize>,
     pending_scanout: &mut Option<rdma_display_capture::DmabufScanout>,
+    src_period: &mut SourcePeriod,
 ) -> Result<()> {
     match ev {
         CaptureEvent::Scanout(dmabuf, t0) => {
@@ -2189,10 +2273,12 @@ fn handle_capture_event(
             // t0 comes from the source: for DRM it is the flip that put this
             // (one-behind) frame on screen, ~one frame before the poll noticed
             *t0_unix_us = t0;
+            src_period.observe(t0);
             *frame_dirty = true;
         }
         CaptureEvent::PlainScanout(fmt, data, t0) => {
             *t0_unix_us = t0;
+            src_period.observe(t0);
             mat.prepare(&fmt, None).context("prepare plain scanout")?;
             screen.set(fmt.width, fmt.height);
             mat.handle_event(CaptureEvent::PlainUpdate(
@@ -2221,6 +2307,7 @@ fn handle_capture_event(
         update @ CaptureEvent::DmabufFrame(..) => {
             if let CaptureEvent::DmabufFrame(.., t0) = &update {
                 *t0_unix_us = *t0;
+                src_period.observe(*t0);
             }
             if mat.handle_event(update)? {
                 *frame_dirty = true;
@@ -2844,14 +2931,58 @@ mod pace_tests {
 
     #[test]
     fn auto_is_a_safe_default_then_the_frame_bdp() {
-        // unmeasured (either EMA missing): small, safe, low-latency default
+        // unmeasured (either measurement missing): small, safe, low-latency default
         assert_eq!(pace_window(Pace::Auto, 0, 0, 3), 2);
         assert_eq!(pace_window(Pace::Auto, 0, 16_000, 3), 2);
-        // fast link: turnaround below one frame interval -> present-paced
+        // fast link: turnaround below one source frame period -> present-paced
         assert_eq!(pace_window(Pace::Auto, 8_000, 16_000, 3), 1);
-        // turnaround spanning ~1.5 frame intervals -> two frames in flight
+        // turnaround spanning ~1.5 source periods -> two frames in flight
         assert_eq!(pace_window(Pace::Auto, 24_000, 16_000, 3), 2);
         // slow link: grows but is clamped to the staging-slot maximum
         assert_eq!(pace_window(Pace::Auto, 100_000, 16_000, 3), 3);
+    }
+
+    #[test]
+    fn auto_uses_the_source_period_not_the_send_interval() {
+        // The regression that collapsed the rate to ~1/turnaround: a 30 ms RTT
+        // plus a 120 Hz client gives a ~40 ms loop, so with a 60 Hz source the
+        // window must be ceil(40 / 16.7) = 3 (the max), not 1. The old code
+        // divided by the *send* interval instead, making the formula
+        // `ceil(turnaround / (turnaround/window)) == window` — a neutral fixed
+        // point that just held whatever it first computed.
+        assert_eq!(pace_window(Pace::Auto, 40_000, 16_700, 3), 3);
+        // and it is stable: the source period does not move with the window, so
+        // a correct window stays correct (unlike the send-interval form)
+        assert_eq!(pace_window(Pace::Auto, 40_000, 16_700, 8), 3);
+    }
+}
+
+#[cfg(test)]
+mod source_period_tests {
+    use super::SourcePeriod;
+
+    #[test]
+    fn empty_until_two_samples() {
+        let mut s = SourcePeriod::default();
+        assert_eq!(s.period_us(), 0);
+        s.observe(1_000_000);
+        assert_eq!(s.period_us(), 0); // one sample: no interval yet
+        s.observe(1_016_667);
+        assert_eq!(s.period_us(), 16_667);
+    }
+
+    #[test]
+    fn converges_on_the_active_period_ignoring_idle_gaps() {
+        // 60 Hz bursts with every 5th interval an idle gap — the case that made
+        // the EMA wobble between ~16 and ~155 ms
+        let mut s = SourcePeriod::default();
+        let mut t = 1_000_000u64;
+        s.observe(t);
+        for i in 0..80u64 {
+            t += if i % 5 == 4 { 150_000 } else { 16_667 };
+            s.observe(t);
+        }
+        let p = s.period_us();
+        assert!((15_000..=25_000).contains(&p), "period {p} us (want ~16667)");
     }
 }

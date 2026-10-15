@@ -371,8 +371,10 @@ fn ema(prev: u64, x: u64) -> u64 {
 }
 
 pub struct ServerLink {
-    /// credits arrive from the control-reader thread; None = client gone
-    credit_rx: mpsc::Receiver<Option<u32>>,
+    /// credits arrive from the control-reader thread, each timestamped when the
+    /// reader received it (so the measured turnaround excludes our own loop
+    /// latency); None = client gone
+    credit_rx: mpsc::Receiver<Option<(u32, u64)>>,
     tx: Tx,
     seq: u64,
     /// current `DisplayMeta` generation, stamped into every FrameStamp;
@@ -552,7 +554,7 @@ impl ServerLink {
         // go to the sender loop via a channel; input events are forwarded to
         // the capture side (QEMU D-Bus input injection). Reading ONLY inside
         // wait_free_slot would starve input while slots are busy.
-        let (credit_tx, credit_rx) = mpsc::channel::<Option<u32>>();
+        let (credit_tx, credit_rx) = mpsc::channel::<Option<(u32, u64)>>();
         let reader_rumble = rumble.clone();
         let reader = std::thread::Builder::new()
             .name("control-reader".into())
@@ -560,7 +562,9 @@ impl ServerLink {
                 loop {
                     match conn.recv() {
                         Ok(proto::Message::Credit(slot)) => {
-                            if credit_tx.send(Some(slot)).is_err() {
+                            // timestamp on arrival: the sender's turnaround
+                            // measurement must not absorb its own loop latency
+                            if credit_tx.send(Some((slot, proto::unix_now_us()))).is_err() {
                                 break; // sender gone (server shutting down)
                             }
                         }
@@ -656,8 +660,8 @@ impl ServerLink {
     }
 
     /// Narrow (or widen) the flow-control window; clamped to `[1, max_window]`.
-    /// The caller derives the value from [`ServerLink::turnaround_us`] and
-    /// [`ServerLink::send_interval_us`].
+    /// The caller derives the value from [`ServerLink::turnaround_us`] and the
+    /// source frame period it measures itself (from the capture cadence).
     pub fn set_window(&mut self, n: usize) -> usize {
         self.window = n.clamp(1, self.max_window.max(1));
         self.window
@@ -670,8 +674,10 @@ impl ServerLink {
         self.turnaround_us
     }
 
-    /// EMA of the interval between sends (µs); 0 until measured. The source
-    /// frame period, used to express the turnaround as a frame count.
+    /// EMA of the interval between sends (µs); 0 until measured. This is the
+    /// *send* cadence, which is a consequence of the window — do NOT use it to
+    /// size the window (that makes the formula a neutral fixed point). Kept for
+    /// diagnostics only; the window uses the source frame period.
     pub fn send_interval_us(&self) -> u64 {
         self.send_interval_us
     }
@@ -683,7 +689,7 @@ impl ServerLink {
     pub fn wait_for_window(&mut self) -> Result<()> {
         while !self.window_open() {
             match self.credit_rx.recv() {
-                Ok(Some(slot)) => self.apply_credit(slot),
+                Ok(Some((slot, at))) => self.apply_credit(slot, at),
                 Ok(None) => anyhow::bail!("client hung up"),
                 Err(_) => anyhow::bail!("client disconnected"),
             }
@@ -692,8 +698,11 @@ impl ServerLink {
     }
 
     /// Apply one client credit: free the staging slot (RDMA) and release one
-    /// in-flight frame, folding its turnaround into the EMA.
-    fn apply_credit(&mut self, slot: u32) {
+    /// in-flight frame, folding its turnaround into the EMA. `at_us` is the
+    /// unix-µs the control reader received the credit — using the *arrival*
+    /// time (not `now`) keeps the sender's own loop latency out of the
+    /// measurement.
+    fn apply_credit(&mut self, slot: u32, at_us: u64) {
         if let Tx::Rdma { slot_free, .. } = &mut self.tx {
             if let Some(f) = slot_free.get_mut(slot as usize) {
                 *f = true;
@@ -701,7 +710,7 @@ impl ServerLink {
         }
         self.inflight = self.inflight.saturating_sub(1);
         if let Some(t0) = self.send_times.pop_front() {
-            self.turnaround_us = ema(self.turnaround_us, proto::unix_now_us().saturating_sub(t0));
+            self.turnaround_us = ema(self.turnaround_us, at_us.saturating_sub(t0));
         }
     }
 
@@ -736,7 +745,7 @@ impl ServerLink {
     pub fn client_gone(&mut self) -> bool {
         loop {
             match self.credit_rx.try_recv() {
-                Ok(Some(slot)) => self.apply_credit(slot),
+                Ok(Some((slot, at))) => self.apply_credit(slot, at),
                 Ok(None) => return true, // reader thread saw EOF
                 Err(mpsc::TryRecvError::Empty) => return false,
                 Err(mpsc::TryRecvError::Disconnected) => return true,
@@ -817,7 +826,7 @@ impl ServerLink {
                 return Ok(slot);
             }
             match self.credit_rx.recv() {
-                Ok(Some(slot)) => self.apply_credit(slot),
+                Ok(Some((slot, at))) => self.apply_credit(slot, at),
                 Ok(None) => anyhow::bail!("client hung up"),
                 Err(_) => anyhow::bail!("client disconnected"),
             }

@@ -217,21 +217,46 @@ flow-control window (§5.1) is that lever: too small and the pipeline stalls (th
 rate drops below the source); too large and it queues (latency creeps).
 
 The right size is the **bandwidth-delay product counted in frames**. The server
-measures the send -> client-credit *turnaround* (which already includes the
-client's decode and its wait for the next present) and the frame *interval*
-(the source period), both as EMAs, and sets
+measures the send -> client-credit *turnaround* (an EMA; it already includes the
+client's decode and its wait for the next present) and the **source** frame
+*period* (the capture cadence), and sets
 
 ```
-window = ceil(turnaround / interval)     # floored at 1, capped at --frame-slots
+window = ceil(turnaround / source_period)   # floored at 1, capped at --frame-slots
 ```
+
+The source period is a **low percentile (p25) of a sliding window of capture
+intervals**, not an EMA of them: the raw interval is bimodal — the trace
+reader's scheduling jitter on the short side, and the compositor's
+damage-driven idle gaps on the long side — so an EMA wobbled between ~16 and
+~155 ms and made the window oscillate 1..3. The percentile rejects both tails
+and tracks the *active* frame period (the rate the pipeline must sustain during
+a burst).
+
+The denominator must be the *source* period, **never the send interval**. The
+send interval is a consequence of the window — in steady state
+`send_interval == turnaround / window` — so dividing by it makes the formula
+`ceil(turnaround / (turnaround/window)) == window`: a neutral fixed point that
+just holds whatever it first computed and can never climb out of a bad value.
+(That is exactly how the window collapsed to 1 on a 30 ms-RTT link and capped
+the rate at `1/turnaround`.) The source period is independent of the window, so
+the formula is stable and correct.
+
+The turnaround is timestamped when the **control reader receives the credit**,
+not when the sender loop later consumes it, so the server's own loop latency is
+not billed to the measurement.
 
 `--pace` selects the policy:
 
 | Mode | Window | Use |
 | --- | --- | --- |
-| `auto` (default) | `ceil(turnaround / interval)`, capped at `--frame-slots` | Keeps the pipe full without queueing; adapts to the link. |
-| `latency` | `1` | Present-paced: the client's credit gates every frame. Lowest latency; may stall if the link is slower than the display period. |
+| `auto` (default) | `ceil(turnaround / source_period)`, capped at `--frame-slots` | Keeps the pipe full without queueing; adapts to the link. |
+| `latency` | `1` | Present-paced: the client's credit gates every frame. Lowest latency; only for `turnaround` ≪ the frame period (RDMA/same-host) — on a WAN it caps the rate at `1/turnaround`. |
 | `smooth` | `--frame-slots` | Never gate: buffer as far as the transport allows. Smoothest cadence, highest latency. |
+
+The chosen window, the turnaround, the source period and the send interval are
+logged (debug) on every change **and every 2 s**, so the measurements are visible
+after startup.
 
 Both transports obey it. RDMA already had credits (the window was implicitly
 `--frame-slots`); the window now *narrows* it. TCP previously had no frame-level flow
