@@ -733,6 +733,27 @@ fn zeroed<T: Default>() -> T {
     T::default()
 }
 
+/// Stable identity of an exported dma-buf fd, for import caching.
+///
+/// The kernel keeps exactly one dma-buf per GEM object
+/// (`drm_gem_prime_handle_to_dmabuf` returns the cached `obj->dma_buf`), and
+/// every dma-buf is an anonymous inode with a globally unique `st_ino`
+/// (`alloc_anon_inode` -> `get_next_ino`). So `(st_dev, st_ino)` names the
+/// underlying buffer and is stable for its whole lifetime — unlike the DRM fb
+/// id, which the kernel recycles (it hands out the lowest free id), so a
+/// freed-and-recreated buffer can reuse an id and a stale import would be
+/// served for the new buffer. Returns 0 if the fd can't be stat'd; callers
+/// must not cache then.
+fn dmabuf_identity(fd: i32) -> u64 {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return 0;
+    }
+    // st_ino is unique on its own; st_dev is folded in so the id stays unique
+    // if the inode space were ever shared with another filesystem.
+    ((st.st_dev as u64) << 32) | (st.st_ino as u64 & 0xffff_ffff)
+}
+
 fn import_fb(card: &OwnedFd, fb_id: u32) -> Result<DmabufScanout> {
     let mut fb: DrmModeFbCmd2 = zeroed();
     fb.fb_id = fb_id;
@@ -756,6 +777,9 @@ fn import_fb(card: &OwnedFd, fb_id: u32) -> Result<DmabufScanout> {
     )
     .context("PRIME_HANDLE_TO_FD")?;
     let dmabuf = unsafe { OwnedFd::from_raw_fd(prime.fd) };
+    // identity of the buffer itself (stable across the buffer's lifetime), as
+    // opposed to `fb_id`, which the kernel recycles
+    let buf_id = dmabuf_identity(dmabuf.as_raw_fd());
 
     let mut close = DrmGemClose { handle: fb.handles[0], pad: 0 };
     ioctl(
@@ -781,6 +805,7 @@ fn import_fb(card: &OwnedFd, fb_id: u32) -> Result<DmabufScanout> {
     };
     Ok(DmabufScanout {
         fb_id,
+        buf_id,
         fds: vec![dmabuf],
         offsets: vec![fb.offsets[0]],
         strides: vec![fb.pitches[0]],
@@ -1478,7 +1503,8 @@ fn emit_scanout(fd: &OwnedFd, id: u32, t0: u64, tx: &Sender<CaptureEvent>) -> Re
     match import_fb(fd, id) {
         Ok(dmabuf) => {
             log::debug!(
-                "[capture-drm] fb {id} {}x{} fourcc={:#010x} '{}' modifier={:#x} stride={}",
+                "[capture-drm] fb {id} buf {} {}x{} fourcc={:#010x} '{}' modifier={:#x} stride={}",
+                dmabuf.buf_id,
                 dmabuf.format.width,
                 dmabuf.format.height,
                 dmabuf.format.fourcc,
@@ -2135,5 +2161,29 @@ mod tests {
         assert_eq!(t.update(0, Some(4_000)), FbAction::Disabled);
         assert_eq!(t.update(0, Some(5_000)), FbAction::None);
         assert_eq!(t.update(7, Some(6_000)), FbAction::Capture(7, 6_000));
+    }
+
+    #[test]
+    fn dmabuf_identity_is_stable_and_distinct() {
+        use std::os::fd::AsRawFd;
+        let a = std::fs::File::open("/dev/null").unwrap();
+        let a2 = std::fs::File::open("/dev/null").unwrap();
+        let b = std::fs::File::open("/dev/zero").unwrap();
+        // the same underlying object -> the same identity (this is what makes
+        // the import cache safe across the buffer's lifetime)
+        assert_eq!(
+            dmabuf_identity(a.as_raw_fd()),
+            dmabuf_identity(a2.as_raw_fd())
+        );
+        // a different object -> a different identity (so a recycled fb id that
+        // now names a new buffer can never hit a stale import)
+        assert_ne!(
+            dmabuf_identity(a.as_raw_fd()),
+            dmabuf_identity(b.as_raw_fd())
+        );
+        // a real object is cacheable...
+        assert_ne!(dmabuf_identity(a.as_raw_fd()), 0);
+        // ...an unusable fd is "no stable identity" (must not cache)
+        assert_eq!(dmabuf_identity(-1), 0);
     }
 }

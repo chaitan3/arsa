@@ -205,9 +205,18 @@ mod tests {
 /// A dmabuf scanout with owned (duplicated) plane fds.
 #[derive(Debug)]
 pub struct DmabufScanout {
-    /// stable DRM framebuffer id for this buffer (the fds are re-imported each
-    /// frame, so this is the identifier to cache imports on)
+    /// DRM framebuffer id that was current when this was grabbed. **Logging
+    /// only** — the kernel recycles fb ids (lowest free id), so an id does not
+    /// identify the underlying buffer across its lifetime and must not be used
+    /// to cache imports.
     pub fb_id: u32,
+    /// Identity of the underlying buffer: `(st_dev, st_ino)` of the dma-buf fd.
+    /// The kernel keeps exactly one dma-buf per GEM object and gives each a
+    /// unique, lifetime-stable inode, so this stays constant while the buffer
+    /// lives and changes when the compositor frees it and a new buffer reuses
+    /// the fb id. **Cache imports on this, not `fb_id`.** 0 = no stable
+    /// identity (e.g. QEMU D-Bus scanouts); callers must not cache those.
+    pub buf_id: u64,
     pub fds: Vec<std::os::fd::OwnedFd>,
     pub offsets: Vec<u32>,
     pub strides: Vec<u32>,

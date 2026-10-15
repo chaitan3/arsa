@@ -1775,7 +1775,7 @@ impl FrameCodec {
         }
         use std::os::fd::AsRawFd;
         gpu.set_scanout(&rdma_display_codec_gpu::DmabufImage {
-            key: d.fb_id as u64,
+            key: d.buf_id,
             fd: d.fds[0].as_raw_fd(),
             offset: d.offsets.first().copied().unwrap_or(0),
             stride: d.strides.first().copied().unwrap_or(d.format.stride),

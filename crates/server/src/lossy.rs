@@ -35,16 +35,20 @@ fn fourcc_to_vk(fourcc: u32) -> Option<vk::Format> {
     })
 }
 
-/// Identifies an imported scanout buffer: the DRM fb id plus the properties
-/// that determine the import layout. The compositor cycles a handful of
-/// buffers, so keying the import on this turns the per-frame Vulkan import
-/// (and its `device_wait_idle`) into a lookup — mirrors the lossless codec's
-/// `SrcImport` cache in `codec-gpu`.
-type ImportKey = (u32, u32, u32, u64, u32, u32, u32);
+/// Identifies an imported scanout buffer: the buffer's own identity
+/// (`buf_id` = dma-buf inode) plus the properties that determine the import
+/// layout. The compositor cycles a handful of buffers, so keying the import on
+/// this turns the per-frame Vulkan import (and its `device_wait_idle`) into a
+/// lookup — mirrors the lossless codec's `SrcImport` cache in `codec-gpu`.
+///
+/// Keyed on `buf_id`, NOT the DRM fb id: the kernel recycles fb ids (lowest
+/// free id), so a freed-and-recreated buffer can reuse one and a stale import
+/// would then be served for the new buffer (a visible stale/flicker frame).
+type ImportKey = (u64, u32, u32, u64, u32, u32, u32);
 
 fn import_key(fmt: &FrameFormat, d: &DmabufScanout) -> ImportKey {
     (
-        d.fb_id,
+        d.buf_id,
         fmt.width,
         fmt.height,
         fmt.modifier,
@@ -184,9 +188,10 @@ impl FrameMaterializer for LossyMaterializer {
         // have already imported; otherwise import it once and cache it. The
         // import (and its `device_wait_idle`) used to run every frame.
         let key = import_key(fmt, d);
-        if d.fb_id == 0 {
-            // no stable buffer id (e.g. QEMU D-Bus scanouts): re-import every
-            // frame rather than risk reusing the previous image for a new buf
+        if d.buf_id == 0 {
+            // no stable buffer identity (e.g. QEMU D-Bus scanouts): re-import
+            // every frame rather than risk reusing the previous image for a
+            // new buffer
             let img = self.import_scanout(fmt, d)?;
             if let Some((_, old)) = self.cur.replace((key, img)) {
                 self.vk.device_wait_idle()?;

@@ -253,8 +253,11 @@ impl Gl {
 /// is only borrowed for the duration of [`GpuCodec::set_scanout`].
 #[derive(Clone, Copy, Debug)]
 pub struct DmabufImage {
-    /// stable buffer id (DRM fb_id): the fds are re-created each frame, so the
-    /// import cache keys on this rather than the fd
+    /// Identity of the underlying buffer: the dma-buf's inode (`fstat`). The
+    /// fds are re-created each frame and the DRM fb id is recycled by the
+    /// kernel, so the import cache keys on this instead — it is stable while
+    /// the buffer lives and changes when a new buffer reuses the fb id. 0 = no
+    /// stable identity (never cached).
     pub key: u64,
     pub fd: i32,
     pub offset: u32,
