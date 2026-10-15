@@ -737,7 +737,7 @@ fn import_fb(card: &OwnedFd, fb_id: u32) -> Result<DmabufScanout> {
     let mut fb: DrmModeFbCmd2 = zeroed();
     fb.fb_id = fb_id;
     ioctl(card.as_raw_fd(), DRM_IOCTL_MODE_GETFB2, &mut fb as *mut _ as *mut _)
-        .context("GETFB2 (needs root/CAP_SYS_ADMIN; kernel >= 5.8)")?;
+        .context("GETFB2")?;
     if fb.handles[0] == 0 {
         bail!("GETFB2 returned no plane handle");
     }
@@ -1219,6 +1219,8 @@ struct SettleTracker {
     due: VecDeque<(u32, u64, u64)>,
     /// last frame whose import failed; re-offered immediately on the next poll
     retry: Option<(u32, u64)>,
+    /// consecutive failed retries of that frame (bounded)
+    retries: u32,
 }
 
 impl SettleTracker {
@@ -1250,6 +1252,7 @@ impl SettleTracker {
             self.seen = fb;
             self.changed_ms = now_ms;
             self.seen_since_us = now_us;
+            self.retries = 0;
             self.due
                 .push_back((fb, now_ms.saturating_add(self.settle_ms), now_us));
             while self.due.len() > 4 {
@@ -1270,10 +1273,17 @@ impl SettleTracker {
         FbAction::None
     }
 
-    /// The import failed: re-offer the frame on the next poll.
+    /// The import failed: re-offer the frame once, then give up so a dead fb
+    /// (the compositor replaced its scanout buffers) can't wedge the loop — the
+    /// caller re-resolves the card after a few consecutive failures.
     fn capture_failed(&mut self) {
-        if self.last_captured != 0 {
+        if self.last_captured != 0 && self.retries < 2 {
+            self.retries += 1;
             self.retry = Some((self.last_captured, self.last_t0));
+        } else {
+            self.retry = None;
+            self.last_captured = 0;
+            self.retries = 0;
         }
     }
 }
@@ -1461,9 +1471,10 @@ enum ActiveSync {
     Fence,
 }
 
-/// Import `id` and emit a `Scanout`. False = import failed (the fb may already
-/// be freed/reused); the caller lets the tracker retry.
-fn emit_scanout(fd: &OwnedFd, id: u32, t0: u64, tx: &Sender<CaptureEvent>) -> bool {
+/// Import `id` and emit a `Scanout`. `Err` = the import failed (the fb may
+/// already be freed/reused, or the compositor replaced its scanout buffers);
+/// the caller lets the tracker retry and re-resolves the card if it persists.
+fn emit_scanout(fd: &OwnedFd, id: u32, t0: u64, tx: &Sender<CaptureEvent>) -> Result<()> {
     match import_fb(fd, id) {
         Ok(dmabuf) => {
             log::debug!(
@@ -1476,11 +1487,11 @@ fn emit_scanout(fd: &OwnedFd, id: u32, t0: u64, tx: &Sender<CaptureEvent>) -> bo
                 dmabuf.format.stride,
             );
             let _ = tx.send(CaptureEvent::Scanout(dmabuf, t0));
-            true
+            Ok(())
         }
         Err(e) => {
             log::debug!("[capture-drm] fb {id} import failed: {e:#}");
-            false
+            Err(e)
         }
     }
 }
@@ -1530,6 +1541,42 @@ fn run(
     let mut vns_prev: Option<i64> = None;
     // log CRTC_GET_SEQUENCE failures once (otherwise silently frozen -> 0)
     let mut vblank_err_logged = false;
+    // consecutive failed imports of the current scanout. A framebuffer that
+    // keeps failing is gone (GETFB2 ENOENT — the compositor replaced/destroyed
+    // its scanout buffers, e.g. on a fullscreen/direct-scanout transition);
+    // retrying it forever froze the stream, so after a few we re-resolve the
+    // card (re-open + re-pick the CRTC/plane and its current fb).
+    const FB_FAIL_RESCAN: u32 = 3;
+    let mut fb_fail_streak: u32 = 0;
+    macro_rules! capture_or_recover {
+        ($tracker:expr, $id:expr, $t0:expr) => {
+            match emit_scanout(&card.as_ref().unwrap().0, $id, $t0, &tx) {
+                Ok(()) => {
+                    disabled_reported = false;
+                    fb_fail_streak = 0;
+                }
+                Err(e) => {
+                    $tracker.capture_failed();
+                    fb_fail_streak += 1;
+                    if fb_fail_streak >= FB_FAIL_RESCAN {
+                        log::warn!(
+                            "[capture-drm] scanout un-importable {}x in a row ({e:#}); \
+                             re-resolving the card",
+                            fb_fail_streak
+                        );
+                        card = None;
+                        last_open_attempt = Some(std::time::Instant::now());
+                        fb_fail_streak = 0;
+                        tracker = FbTracker::default();
+                        ztracker = ZeroTracker::default();
+                        stracker = SettleTracker::new(settle_ms);
+                        vtracker = VblankTracker::default();
+                        ftracker = FenceTracker::default();
+                    }
+                }
+            }
+        };
+    }
     loop {
         if stop.stopped() {
             return Ok(());
@@ -1727,13 +1774,7 @@ fn run(
                 match tracker.update(now_ms, now_us, fb) {
                     FbAction::None => {}
                     FbAction::Disabled => disabled(&mut disabled_reported),
-                    FbAction::Capture(id, t0) => {
-                        if emit_scanout(&card.as_ref().unwrap().0, id, t0, &tx) {
-                            disabled_reported = false;
-                        } else {
-                            tracker.capture_failed();
-                        }
-                    }
+                    FbAction::Capture(id, t0) => capture_or_recover!(tracker, id, t0),
                 }
             }
             ActiveSync::Zero => {
@@ -1742,13 +1783,7 @@ fn run(
                 match ztracker.update(now_ms, now_us, fb) {
                     FbAction::None => {}
                     FbAction::Disabled => disabled(&mut disabled_reported),
-                    FbAction::Capture(id, t0) => {
-                        if emit_scanout(&card.as_ref().unwrap().0, id, t0, &tx) {
-                            disabled_reported = false;
-                        } else {
-                            ztracker.capture_failed();
-                        }
-                    }
+                    FbAction::Capture(id, t0) => capture_or_recover!(ztracker, id, t0),
                 }
             }
             ActiveSync::Settle => {
@@ -1758,13 +1793,7 @@ fn run(
                 match stracker.update(now_ms, now_us, fb) {
                     FbAction::None => {}
                     FbAction::Disabled => disabled(&mut disabled_reported),
-                    FbAction::Capture(id, t0) => {
-                        if emit_scanout(&card.as_ref().unwrap().0, id, t0, &tx) {
-                            disabled_reported = false;
-                        } else {
-                            stracker.capture_failed();
-                        }
-                    }
+                    FbAction::Capture(id, t0) => capture_or_recover!(stracker, id, t0),
                 }
             }
             ActiveSync::Fence => {
@@ -1783,13 +1812,7 @@ fn run(
                     match tracker.update(now_ms, now_us, fb) {
                         FbAction::None => {}
                         FbAction::Disabled => disabled(&mut disabled_reported),
-                        FbAction::Capture(id, t0) => {
-                            if emit_scanout(&card.as_ref().unwrap().0, id, t0, &tx) {
-                                disabled_reported = false;
-                            } else {
-                                tracker.capture_failed();
-                            }
-                        }
+                        FbAction::Capture(id, t0) => capture_or_recover!(tracker, id, t0),
                     }
                 } else {
                     // newest completion-fence signal since we last looked
@@ -1808,13 +1831,7 @@ fn run(
                     match ftracker.update(fb, trigger) {
                         FbAction::None => {}
                         FbAction::Disabled => disabled(&mut disabled_reported),
-                        FbAction::Capture(id, t0) => {
-                            if emit_scanout(&card.as_ref().unwrap().0, id, t0, &tx) {
-                                disabled_reported = false;
-                            } else {
-                                ftracker.capture_failed();
-                            }
-                        }
+                        FbAction::Capture(id, t0) => capture_or_recover!(ftracker, id, t0),
                     }
                 }
             }
@@ -1852,11 +1869,7 @@ fn run(
                             vlag.clear();
                             vints.clear();
                         }
-                        if emit_scanout(&card.as_ref().unwrap().0, id, t0, &tx) {
-                            disabled_reported = false;
-                        } else {
-                            vtracker.capture_failed();
-                        }
+                        capture_or_recover!(vtracker, id, t0);
                     }
                 }
                 if vtracker.give_up() && active == ActiveSync::Vblank {
@@ -2089,6 +2102,22 @@ mod tests {
         // the import failed: the next poll re-offers the settled frame
         t.capture_failed();
         assert_eq!(t.update(2, 2_000, 5), FbAction::Capture(5, 0));
+    }
+
+    #[test]
+    fn settle_tracker_gives_up_after_bounded_retries() {
+        // a frame that never imports must not be re-offered forever (the caller
+        // re-resolves the card after a few consecutive failures instead)
+        let mut t = SettleTracker::new(1);
+        assert_eq!(t.update(0, 0, 5), FbAction::None);
+        assert_eq!(t.update(1, 1_000, 5), FbAction::Capture(5, 0));
+        t.capture_failed();
+        assert_eq!(t.update(2, 2_000, 5), FbAction::Capture(5, 0)); // retry 1
+        t.capture_failed();
+        assert_eq!(t.update(3, 3_000, 5), FbAction::Capture(5, 0)); // retry 2
+        t.capture_failed();
+        // bounded: the dead frame is no longer re-offered
+        assert_eq!(t.update(4, 4_000, 5), FbAction::None);
     }
 
     #[test]

@@ -242,6 +242,16 @@ and triple buffering: expect ~1–2 frames (8–16 ms at 120 Hz). To reduce it:
 (file capabilities live on the inode). Confirm with `getcap
 target/release/rdma-display-server`.
 
+**Video freezes when a fullscreen app/game starts (audio keeps playing).** The
+compositor replaces/destroys its scanout buffers, so the framebuffer the
+capture loop is reading stops existing (`GETFB2 … ENOENT`) and it used to
+retry that dead id forever. It now re-resolves the card after a few
+consecutive failures and logs `scanout un-importable Nx … re-resolving`. If
+that doesn't recover, the current scanout buffer isn't exportable (a
+direct-scanout client buffer on this driver); see the KMS limitation in
+[`ARCHITECTURE.md`](ARCHITECTURE.md) — the compositor would need to composite
+that output.
+
 **Audio / resolution control / `--gpu-power` do nothing under `sudo`.** The
 server needs the session environment (`XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY`).
 Use `sudo -E`, or run the setcap binary directly as your user. Audio uses a
