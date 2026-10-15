@@ -135,7 +135,7 @@ Which fb to read, trading latency against tearing:
 | `vblank` | Read the current frame as its vblank retires it. Dead on the nvidia-drm stack (frozen vblank counter); falls back. |
 | `zero` | Read the current frame immediately, no sync (testing; may tear). |
 | `settle[:ms]` | Read the current frame `ms` after its commit was observed (default 2 ms). |
-| `fence` (alias `bpf`) | Read the current frame when the compositor's per-frame completion fence signals (tracefs; needs root; falls back). |
+| `fence` (alias `bpf`) | Read the current frame when the compositor's per-frame completion fence signals (tracefs; mounts it via `mount(2)` needing `CAP_SYS_ADMIN`, writes needing `CAP_DAC_OVERRIDE` — or pre-mount with `uid=`; falls back). |
 | `auto` | Try `fence`, then `vblank`, then `onbehind`. |
 
 The reasoning behind these (and why there is no userspace completion fence on

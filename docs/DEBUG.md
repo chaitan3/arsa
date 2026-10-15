@@ -269,8 +269,10 @@ commits a mode change asynchronously; the server waits (bounded) for the DRM
 scanout to match the reply before sizing. If it times out it logs the mismatch.
 
 **`fence`/`vblank` sync fell back to one-behind.** `vblank` needs a running
-kernel vblank counter (frozen on nvidia-drm); `fence` needs root and a
-tracefs-capable kernel. Both fall back to one-behind automatically and say so.
+kernel vblank counter (frozen on nvidia-drm); `fence` mounts tracefs itself
+(needs `CAP_SYS_ADMIN`) and writes it (`CAP_DAC_OVERRIDE`, or pre-mount tracefs
+with `uid=<you>`) on a tracefs-capable kernel. Both fall back to one-behind
+automatically and say so.
 
 **Client has no window / `wayland connect` error.** The client needs
 `WAYLAND_DISPLAY` + `XDG_RUNTIME_DIR` (e.g. under `sudo -E`).

@@ -101,18 +101,28 @@ fn ensure_tracefs() -> Result<String> {
     }
     for p in TRACEFS_CANDIDATES {
         let _ = std::fs::create_dir_all(p);
-        if let Ok(s) = std::process::Command::new("mount")
-            .args(["-t", "tracefs", "tracefs", p])
-            .status()
-        {
-            if s.success() {
-                if let Some(found) = find_tracefs() {
-                    return Ok(found);
-                }
+        // Mount in-process via mount(2): a setcap server's CAP_SYS_ADMIN is
+        // effective here, whereas a child `mount` process would not inherit a
+        // file capability and would fail with "must be superuser".
+        let Ok(target) = std::ffi::CString::new(p) else {
+            continue;
+        };
+        let rc = unsafe {
+            libc::mount(
+                c"tracefs".as_ptr(),
+                target.as_ptr(),
+                c"tracefs".as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if rc == 0 {
+            if let Some(found) = find_tracefs() {
+                return Ok(found);
             }
         }
     }
-    bail!("tracefs unavailable (need root and a tracefs-capable kernel)")
+    bail!("tracefs unavailable (mounting it needs CAP_SYS_ADMIN; also needs a tracefs-capable kernel)")
 }
 
 /// Parse the digits following `key` in a human-readable ftrace line.
@@ -139,7 +149,7 @@ fn calibrate(tracefs: &str, calib: Duration) -> Result<u32> {
         &format!("{tracefs}/events/dma_fence/dma_fence_init/enable"),
         "1\n",
     )
-    .context("enable dma_fence_init (need root)")?;
+    .context("enable dma_fence_init (needs CAP_DAC_OVERRIDE, or mount tracefs with uid=)")?;
     let _ = std::fs::OpenOptions::new()
         .append(true)
         .open(format!("{tracefs}/kprobe_events"))

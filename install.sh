@@ -18,7 +18,7 @@ cd "$(dirname "$(readlink -f "$0")")"
 # CAP_SYS_ADMIN is the one that matters for GETFB2 ("master or CAP_SYS_ADMIN").
 # It does NOT cover the other privileged bits:
 #   --input uinput        -> /dev/uinput access (input group, or root)
-#   --capture-sync fence  -> tracefs writes (root or CAP_DAC_OVERRIDE)
+#   --capture-sync fence  -> mounts tracefs (CAP_SYS_ADMIN) and writes it (CAP_DAC_OVERRIDE, or mount tracefs with uid=<you>)
 #   --gpu-power           -> nvidia-smi clock floor (root)
 # Set CAPS to widen the set if you need those, e.g.
 #   CAPS=cap_sys_admin,cap_dac_override,cap_dac_read_search ./install.sh

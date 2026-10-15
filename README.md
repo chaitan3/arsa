@@ -88,7 +88,8 @@ in `install.sh`):
 
 ```bash
 # --input uinput needs /dev/uinput (root or the `input` group)
-# --capture-sync fence and --gpu-power need root / tracefs / nvidia-smi
+# --capture-sync fence needs cap_sys_admin (mount tracefs) + cap_dac_override (writes)
+# --gpu-power needs root (nvidia-smi)
 CAPS=cap_sys_admin,cap_dac_override,cap_dac_read_search ./install.sh
 ```
 
@@ -154,9 +155,10 @@ sudo usermod -aG input,video,render "$USER"   # add rdma too if you use the RDMA
 ```
 
 Group names and node ownership vary by distribution; if a node is already
-world-accessible you can skip it. Only two features need **root** rather than a
-group: `--capture-sync fence` (tracefs writes — or widen `install.sh`'s `CAPS=`
-with `cap_dac_override`) and `--gpu-power` (nvidia-smi).
+world-accessible you can skip it. `--capture-sync fence` no longer needs root —
+it mounts tracefs itself with the server's `cap_sys_admin` and writes it with
+`cap_dac_override` (or pre-mount tracefs with `uid=<you>`). Only `--gpu-power`
+(nvidia-smi) genuinely needs root.
 
 ### Firewall / networking
 
