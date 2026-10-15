@@ -22,7 +22,7 @@ cd "$(dirname "$(readlink -f "$0")")"
 #   --gpu-power           -> nvidia-smi clock floor (root)
 # Set CAPS to widen the set if you need those, e.g.
 #   CAPS=cap_sys_admin,cap_dac_override,cap_dac_read_search ./install.sh
-CAPS="${CAPS:-cap_sys_admin}"
+CAPS="${CAPS:-cap_sys_admin,cap_dac_override}"
 
 SERVER=target/release/rdma-display-server
 CLIENT=target/release/rdma-display-client
@@ -53,23 +53,32 @@ SETCAP=$(find_tool setcap) || {
     exit 1
 }
 
-# Newest mtime among the files that feed the binaries. If both binaries are at
-# least this new, they were built from the current sources (wherever that
-# happened) and there is nothing to rebuild.
-newest_source_mtime() {
-    find crates Cargo.toml Cargo.lock .cargo/config.toml -type f \
-        -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1
+# Newest mtime among the given paths.
+newest_mtime() {
+    find "$@" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1
 }
+
+# Cargo relinks a binary only when a crate it depends on changes, so each binary
+# is compared against *its own* sources: a change under crates/capture (say)
+# relinks the server but not the client, and must not force a client rebuild.
+# Keep these in sync with crates/{server,client}/Cargo.toml.
+ROOT_FILES=(Cargo.toml Cargo.lock .cargo/config.toml)
+SERVER_CRATES=(crates/proto crates/capture crates/rdma crates/audio crates/egl \
+    crates/codec crates/codec-gpu crates/vkcore crates/lifecycle crates/server)
+CLIENT_CRATES=(crates/proto crates/rdma crates/audio crates/codec \
+    crates/codec-gpu crates/vkcore crates/lifecycle crates/client)
 
 build_needed=1
 if [ "${SKIP_BUILD:-0}" = "1" ]; then
     echo "==> SKIP_BUILD=1; skipping cargo build"
     build_needed=0
 elif [ -x "$SERVER" ] && [ -x "$CLIENT" ]; then
-    src=$(newest_source_mtime)
+    srv_src=$(newest_mtime "${SERVER_CRATES[@]}" "${ROOT_FILES[@]}")
+    cli_src=$(newest_mtime "${CLIENT_CRATES[@]}" "${ROOT_FILES[@]}")
     srv=$(stat -c %Y "$SERVER" 2>/dev/null || echo 0)
     cli=$(stat -c %Y "$CLIENT" 2>/dev/null || echo 0)
-    if [ -n "$src" ] && [ "$srv" -ge "$src" ] && [ "$cli" -ge "$src" ]; then
+    if [ -n "$srv_src" ] && [ -n "$cli_src" ] \
+        && [ "$srv" -ge "$srv_src" ] && [ "$cli" -ge "$cli_src" ]; then
         echo "==> binaries are newer than the sources; skipping cargo build"
         build_needed=0
     fi
@@ -98,5 +107,5 @@ else
     echo "         (build it with scripts/build-pyrowave-docker.sh)" >&2
 fi
 
-echo "==> setcap $CAPS+ep $SERVER"
+echo "==> setcap $CAPS+ep $DEST/rdma-display-server"
 sudo "$SETCAP" "$CAPS+ep" "$DEST"/rdma-display-server
