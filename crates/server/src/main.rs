@@ -739,6 +739,28 @@ impl SourcePeriod {
     }
 }
 
+/// p50/p95 of a bounded sample window, in KiB (judder instrumentation).
+fn percentile_kib(v: &std::collections::VecDeque<usize>) -> (usize, usize) {
+    let mut s: Vec<usize> = v.iter().copied().collect();
+    s.sort_unstable();
+    if s.is_empty() {
+        return (0, 0);
+    }
+    (
+        s[s.len() / 2] / 1024,
+        s[(s.len() * 95 / 100).min(s.len() - 1)] / 1024,
+    )
+}
+
+/// Push a sample into a bounded window, dropping the oldest (judder
+/// instrumentation).
+fn push_bounded(v: &mut std::collections::VecDeque<usize>, x: usize, cap: usize) {
+    v.push_back(x);
+    while v.len() > cap {
+        v.pop_front();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_capture(
     rdma: Option<(&ibverbs::Context, &ibverbs::ProtectionDomain)>,
@@ -965,6 +987,8 @@ fn run_capture(
     // the flow-control window (independent of the window, unlike the send
     // interval)
     let mut src_period = SourcePeriod::default();
+    // judder diagnostics: coded bytes of recently sent frames (bounded window)
+    let mut coded_sizes: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     // throttle for the periodic pacing log (the turnaround is otherwise only
     // logged when the window changes, so it was invisible after startup)
     let mut last_pace_log = std::time::Instant::now();
@@ -1027,6 +1051,7 @@ fn run_capture(
                 send_prep = None;
                 session_connected_at = None;
                 first_scanout_logged = false;
+                coded_sizes.clear();
                 log::info!("[server] session ended; pipeline idle");
             }
             // put the display mode back if a session changed it (also covers a
@@ -1056,9 +1081,19 @@ fn run_capture(
             if changed || last_pace_log.elapsed() >= std::time::Duration::from_secs(2) {
                 last_pace_log = std::time::Instant::now();
                 let applied = link.set_window(target);
+                // judder diagnostics: in-flight count, coded frame size, and the
+                // kernel send-queue depth on the TCP video socket (a growing
+                // sockout ⇒ the link, not the pacing loop, is the bottleneck)
+                let inflight = link.inflight();
+                let (c50, c95) = percentile_kib(&coded_sizes);
+                let sockout = match link.video_outq_bytes() {
+                    Some(b) => format!("{} KiB", b / 1024),
+                    None => "n/a".to_string(),
+                };
                 log::debug!(
                     "[server] pacing {pace:?}: window {applied} of max {max} \
-                     (turnaround {t} us, source period {src} us, send interval {iv} us)"
+                     (turnaround {t} us, source period {src} us, send interval {iv} us) \
+                     | inflight {inflight} | coded p50 {c50} KiB p95 {c95} KiB | sockout {sockout}"
                 );
             }
         }
@@ -1653,6 +1688,7 @@ fn run_capture(
                     Ok(Some(seq)) => {
                         frame_dirty = false;
                         last_send = Some(std::time::Instant::now());
+                        push_bounded(&mut coded_sizes, link.last_sent_bytes(), 256);
                         log::debug!("[server] frame {} sent", seq);
                         if seq == 0 {
                             log::debug!(
@@ -1735,6 +1771,7 @@ fn run_capture(
                 ) {
                     Ok(Some(seq)) => {
                         last_send = Some(std::time::Instant::now());
+                        push_bounded(&mut coded_sizes, link.last_sent_bytes(), 256);
                         log::debug!("[server] frame {} sent", seq);
                         if seq == 0 {
                             if let Some(t) = session_connected_at {

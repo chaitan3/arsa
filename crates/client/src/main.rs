@@ -336,6 +336,11 @@ fn main() -> Result<()> {
     let mut last_seq = 0u64;
     let mut last_report = Instant::now();
     let mut dumped = false;
+    // judder diagnostics: how long after a frame's completion the client holds
+    // it before crediting (credit is sent right after present), and the reader
+    // frame counter for the receive-rate delta
+    let mut credit_lags: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+    let mut last_reader_frames: u64 = 0;
 
     loop {
         if let Some(d) = deadline {
@@ -514,6 +519,13 @@ fn main() -> Result<()> {
                     )?
                 };
                 link.credit_slot(slot)?; // upload consumed the pointer
+                {
+                    let lag = rdma_display_proto::unix_now_us().saturating_sub(t3);
+                    credit_lags.push_back(lag);
+                    while credit_lags.len() > 128 {
+                        credit_lags.pop_front();
+                    }
+                }
                 if let Some(m) = metrics.as_mut() {
                     m.record(seq, t3, t4, t5, fb);
                 }
@@ -619,11 +631,34 @@ fn main() -> Result<()> {
         }
         if last_report.elapsed() >= std::time::Duration::from_secs(5) {
             let elapsed = started.elapsed().as_secs_f64();
+            // judder diagnostics: the true delivery cadence at the reader thread
+            // (independent of the flow-control math), how often the reader had
+            // to wait for a recycled buffer, and how long the client held a
+            // frame before crediting it.
+            let rs = link.video_reader_stats();
+            let recv_dt = last_report.elapsed().as_secs_f64().max(1e-6);
+            let recv_fps = rs.frames.saturating_sub(last_reader_frames) as f64 / recv_dt;
+            last_reader_frames = rs.frames;
+            let credit_p50 = {
+                let mut v: Vec<u64> = credit_lags.iter().copied().collect();
+                v.sort_unstable();
+                if v.is_empty() {
+                    0
+                } else {
+                    v[v.len() / 2] / 1000
+                }
+            };
             log::debug!(
-                "[stats] frames={} fps={:.1} seq={}",
+                "[stats] frames={} fps={:.1} seq={} | recv {:.1}/s gap p50 {:.1} p95 {:.1} max {:.1} ms stall {} | credit p50 {} ms",
                 frames,
                 frames as f64 / elapsed,
-                last_seq
+                last_seq,
+                recv_fps,
+                rs.gap_p50_us as f64 / 1000.0,
+                rs.gap_p95_us as f64 / 1000.0,
+                rs.gap_max_us as f64 / 1000.0,
+                rs.stalls,
+                credit_p50,
             );
             if let Some(m) = metrics.as_mut() {
                 while let Some(ev) = link.try_control() {

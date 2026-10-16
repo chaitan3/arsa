@@ -370,6 +370,14 @@ fn ema(prev: u64, x: u64) -> u64 {
     }
 }
 
+// --- SIOCOUTQ: bytes queued in a socket's kernel send buffer (Linux) ---------
+/// `SIOCOUTQ`/`TIOCOUTQ` (identical value on Linux).
+const SIOCOUTQ: u64 = 0x5411;
+
+extern "C" {
+    fn ioctl(fd: i32, request: u64, ...) -> i32;
+}
+
 pub struct ServerLink {
     /// credits arrive from the control-reader thread, each timestamped when the
     /// reader received it (so the measured turnaround excludes our own loop
@@ -407,6 +415,8 @@ pub struct ServerLink {
     send_interval_us: u64,
     /// last send time (unix µs), for `send_interval_us`
     last_send_us: u64,
+    /// coded bytes of the most recently sent frame (judder instrumentation)
+    last_sent_bytes: usize,
 }
 
 impl ServerLink {
@@ -623,6 +633,7 @@ impl ServerLink {
             turnaround_us: 0,
             send_interval_us: 0,
             last_send_us: 0,
+            last_sent_bytes: 0,
         })
     }
 
@@ -680,6 +691,30 @@ impl ServerLink {
     /// diagnostics only; the window uses the source frame period.
     pub fn send_interval_us(&self) -> u64 {
         self.send_interval_us
+    }
+
+    /// Frames sent and not yet credited (the in-flight count within the window).
+    pub fn inflight(&self) -> usize {
+        self.inflight
+    }
+
+    /// Coded bytes of the most recently sent frame (0 until the first send).
+    pub fn last_sent_bytes(&self) -> usize {
+        self.last_sent_bytes
+    }
+
+    /// Bytes still queued in the TCP video socket's kernel send buffer
+    /// (`SIOCOUTQ`). Non-zero and growing ⇒ the link, not the pacing loop, is
+    /// the bottleneck. `None` for RDMA or before the video socket is attached.
+    pub fn video_outq_bytes(&self) -> Option<u32> {
+        let s = self.video.as_ref()?;
+        let mut q: i32 = 0;
+        let rc = unsafe { ioctl(s.as_raw_fd(), SIOCOUTQ, &mut q) };
+        if rc == 0 && q >= 0 {
+            Some(q as u32)
+        } else {
+            None
+        }
     }
 
     /// Block until the window has room (a client credit arrives) or the client
@@ -884,7 +919,8 @@ impl ServerLink {
         let t1s = proto::unix_now_us(); // staging slot available
         let slot_wait_us = t1s.saturating_sub(t0d);
         if slot_wait_us > 5_000 {
-            log::info!(
+            // can fire every frame when the client credits lag: keep it behind -v
+            log::debug!(
                 "[rdma] slot wait {} ms (client credits lagging)",
                 slot_wait_us / 1000
             );
@@ -953,6 +989,7 @@ impl ServerLink {
             (t2, proto::unix_now_us())
         };
         self.seq += 1;
+        self.last_sent_bytes = post_len;
         self.send_stamp(
             seq, t0_unix_us, t0d, t0p, t1s, t1_unix_us, t2_unix_us, t2c_unix_us, mat_times,
         );
@@ -994,11 +1031,15 @@ impl ServerLink {
                 unreachable!()
             };
             let w = self.video.as_mut().expect("video attached");
-            if let Err(e) = w.peer_addr() {
-                log::info!(
-                    "[rdma] video socket fd {} is not a socket before write ({e}); an fd was closed and reused",
-                    w.as_raw_fd()
-                );
+            // per-frame fd sanity check: it costs a getpeername syscall, so run
+            // it only when debug logging is enabled
+            if log::log_enabled!(log::Level::Debug) {
+                if let Err(e) = w.peer_addr() {
+                    log::debug!(
+                        "[rdma] video socket fd {} is not a socket before write ({e}); an fd was closed and reused",
+                        w.as_raw_fd()
+                    );
+                }
             }
             w.write_all(&(post_len as u32).to_le_bytes())
                 .context("tcp video frame length")?;
@@ -1012,6 +1053,7 @@ impl ServerLink {
         };
         self.note_send();
         self.seq += 1;
+        self.last_sent_bytes = post_len;
         self.send_stamp(
             seq, t0_unix_us, t0d, t0p, t1s, t1_unix_us, t2_unix_us, t2c_unix_us, mat_times,
         );
@@ -1080,6 +1122,7 @@ impl ServerLink {
         mat_times: proto::MatTimes,
     ) -> Result<Option<u64>> {
         let seq = self.seq;
+        self.last_sent_bytes = post_len;
         match self.transport {
             Transport::Rdma => {
                 let (t2, t2c) = {
@@ -1143,11 +1186,15 @@ impl ServerLink {
                         buf.len()
                     );
                     let w = self.video.as_mut().expect("video attached");
-                    if let Err(e) = w.peer_addr() {
-                        log::info!(
-                            "[rdma] video socket fd {} is not a socket before write ({e}); an fd was closed and reused",
-                            w.as_raw_fd()
-                        );
+                    // per-frame fd sanity check: it costs a getpeername syscall,
+                    // so run it only when debug logging is enabled
+                    if log::log_enabled!(log::Level::Debug) {
+                        if let Err(e) = w.peer_addr() {
+                            log::debug!(
+                                "[rdma] video socket fd {} is not a socket before write ({e}); an fd was closed and reused",
+                                w.as_raw_fd()
+                            );
+                        }
                     }
                     w.write_all(&(post_len as u32).to_le_bytes())
                         .context("tcp video frame length")?;
@@ -1325,6 +1372,78 @@ pub struct ClientLink {
     /// bytes moved by the most recently returned frame (the RDMA WRITE / TCP
     /// payload length) — the actual wire transfer, for the bandwidth display
     last_rx_bytes: usize,
+    /// diagnostics shared with the TCP video-reader thread (arrival cadence,
+    /// buffer stalls); stays all-zero for RDMA
+    video_reader: std::sync::Arc<VideoReaderStats>,
+}
+
+/// Diagnostics shared by the TCP video-reader thread and the presenter: the
+/// frame arrival cadence and how often the bounded buffer pool starved.
+/// (Temporary instrumentation for the judder investigation.)
+#[derive(Default)]
+pub struct VideoReaderStats {
+    inner: std::sync::Mutex<ReaderInner>,
+}
+
+#[derive(Default)]
+struct ReaderInner {
+    last_arrival_us: u64,
+    /// recent inter-arrival gaps (µs), oldest first, bounded
+    gaps: VecDeque<u64>,
+    frames: u64,
+    /// times the reader had no free buffer and had to wait on `recycle_rx`
+    stalls: u64,
+}
+
+/// A snapshot of [`VideoReaderStats`] for logging.
+#[derive(Clone, Copy, Default)]
+pub struct VideoReaderSnapshot {
+    pub frames: u64,
+    pub stalls: u64,
+    pub gap_p50_us: u64,
+    pub gap_p95_us: u64,
+    pub gap_max_us: u64,
+}
+
+impl VideoReaderStats {
+    /// Record one frame arrival (µs, reader clock) and whether the reader had
+    /// to wait for a recycled buffer before it could read it.
+    fn observe(&self, now_us: u64, stalled: bool) {
+        let mut g = self.inner.lock().unwrap();
+        if stalled {
+            g.stalls += 1;
+        }
+        if g.last_arrival_us != 0 && now_us > g.last_arrival_us {
+            let gap = now_us - g.last_arrival_us;
+            g.gaps.push_back(gap);
+            while g.gaps.len() > 256 {
+                g.gaps.pop_front();
+            }
+        }
+        g.last_arrival_us = now_us;
+        g.frames += 1;
+    }
+
+    /// Percentiles over the recent gaps; zero until measured.
+    pub fn snapshot(&self) -> VideoReaderSnapshot {
+        let g = self.inner.lock().unwrap();
+        let mut v: Vec<u64> = g.gaps.iter().copied().collect();
+        v.sort_unstable();
+        let pick = |p: usize| -> u64 {
+            if v.is_empty() {
+                0
+            } else {
+                v[(v.len() * p / 100).min(v.len() - 1)]
+            }
+        };
+        VideoReaderSnapshot {
+            frames: g.frames,
+            stalls: g.stalls,
+            gap_p50_us: pick(50),
+            gap_p95_us: pick(95),
+            gap_max_us: v.last().copied().unwrap_or(0),
+        }
+    }
 }
 
 /// Read length-prefixed `[u32 len][u64 seq][payload]` video frames off the
@@ -1337,6 +1456,7 @@ fn spawn_video_reader(
     slots: usize,
     frame_tx: mpsc::Sender<(u64, Vec<u8>)>,
     recycle_rx: mpsc::Receiver<Vec<u8>>,
+    stats: std::sync::Arc<VideoReaderStats>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("video-reader".into())
@@ -1344,12 +1464,19 @@ fn spawn_video_reader(
             let mut free: Vec<Vec<u8>> =
                 (0..slots).map(|_| Vec::with_capacity(slot_len)).collect();
             loop {
+                let stalled;
                 let mut buf = match free.pop() {
-                    Some(b) => b,
-                    None => match recycle_rx.recv() {
-                        Ok(b) => b,
-                        Err(_) => break, // presenter gone
-                    },
+                    Some(b) => {
+                        stalled = false;
+                        b
+                    }
+                    None => {
+                        stalled = true;
+                        match recycle_rx.recv() {
+                            Ok(b) => b,
+                            Err(_) => break, // presenter gone
+                        }
+                    }
                 };
                 let mut hdr = [0u8; 12];
                 if std::io::Read::read_exact(&mut stream, &mut hdr).is_err() {
@@ -1366,6 +1493,8 @@ fn spawn_video_reader(
                 if std::io::Read::read_exact(&mut stream, &mut buf).is_err() {
                     break;
                 }
+                // arrival stamped after the payload lands in memory
+                stats.observe(proto::unix_now_us(), stalled);
                 if frame_tx.send((seq, buf)).is_err() {
                     break;
                 }
@@ -1515,6 +1644,7 @@ impl ClientLink {
             meta.frame_bytes
         );
 
+        let video_reader = std::sync::Arc::new(VideoReaderStats::default());
         let rx = match transport {
             Transport::Rdma => {
                 let (qp, _send_cq, recv_cq) = endpoint.expect("rdma endpoint");
@@ -1578,6 +1708,7 @@ impl ClientLink {
                     ctrl_rx: spawn_control_reader(reader_stream),
                     transport,
                     last_rx_bytes: 0,
+                    video_reader: video_reader.clone(),
                 };
                 link.rearm_all()?;
                 return Ok(link);
@@ -1590,7 +1721,7 @@ impl ClientLink {
                     .context("send TAG_VIDEO")?;
                 let (frame_tx, frame_rx) = mpsc::channel();
                 let (recycle_tx, recycle_rx) = mpsc::channel();
-                let reader = spawn_video_reader(s, slot_len, slots, frame_tx, recycle_rx);
+                let reader = spawn_video_reader(s, slot_len, slots, frame_tx, recycle_rx, video_reader.clone());
                 Rx::Tcp {
                     frame_rx,
                     recycle_tx,
@@ -1615,6 +1746,7 @@ impl ClientLink {
             ctrl_rx: spawn_control_reader(reader_stream),
             transport,
             last_rx_bytes: 0,
+            video_reader,
         })
     }
 
@@ -1693,6 +1825,12 @@ impl ClientLink {
     /// size, not the uncompressed frame size — use it for bandwidth.
     pub fn last_rx_bytes(&self) -> usize {
         self.last_rx_bytes
+    }
+
+    /// Snapshot of the TCP video-reader diagnostics (frame arrival cadence and
+    /// buffer stalls); all-zero for RDMA. Temporary judder instrumentation.
+    pub fn video_reader_stats(&self) -> VideoReaderSnapshot {
+        self.video_reader.snapshot()
     }
 
     /// The negotiated video transport.
