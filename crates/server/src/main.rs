@@ -1495,6 +1495,37 @@ fn run_capture(
                 }
                 // lossy chroma advertised to the client: 0 = 4:2:0, 1 = 4:4:4
                 let session_chroma: u8 = if want_lossy && lossy_chroma444 { 1 } else { 0 };
+                // The session needs the scanout geometry. If the source has not
+                // produced a frame yet — e.g. `--source portal`, where the picker
+                // may still be open — wait for it (pumping capture events)
+                // instead of dropping the client into a dead half-session.
+                if geometry.is_none() && pending_meta.is_none() {
+                    log::info!(
+                        "[server] no geometry yet; waiting for the first captured frame \
+                         before setting up the session (client {peer})"
+                    );
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    while pending_meta.is_none() && std::time::Instant::now() < deadline {
+                        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                            Ok(ev) => handle_capture_event(
+                                ev, &mut mat, &mut session, &mut pending_meta,
+                                &mut t0_unix_us, &mut frame_dirty, &screen,
+                                &mut pending_scanout, &mut src_period,
+                            )?,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                bail!("capture source ended")
+                            }
+                        }
+                    }
+                    if pending_meta.is_none() {
+                        log::warn!(
+                            "[server] no captured frame within 30 s; dropping the client ({peer})"
+                        );
+                        continue;
+                    }
+                    log::info!("[server] geometry arrived; setting up the session");
+                }
                 if let Some(meta) = geometry.clone().or_else(|| pending_meta.clone()) {
                     let t_connect = std::time::Instant::now();
                     log::info!("client connected: {peer}");
