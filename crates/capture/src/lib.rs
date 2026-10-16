@@ -34,53 +34,36 @@ use anyhow::Result;
 /// ~0.75 ms (p50), ~1-2 ms (p90), ~8-16 ms (p99) after the commit is observed.
 pub const DEFAULT_SETTLE_MS: u64 = 2;
 
-/// How the DRM/KMS source chooses which framebuffer to capture relative to
-/// the compositor's flips.
+/// How the DRM/KMS source chooses when to capture, relative to the compositor's
+/// flips. The DRM path always polls `plane.fb_id` at 1 ms and emits only when it
+/// changes; these modes add a wait before the read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureSync {
-    /// Capture the fb that was just superseded. Always safe — that buffer
-    /// scanned out for a full interval and is complete — but the mirrored
-    /// image is one compositor frame old.
-    OneBehind,
-    /// Capture the current fb `N` ms after its commit was observed, instead of
-    /// waiting for the next commit (one-behind). The compositor commits with a
-    /// non-blocking atomic commit and finishes its GPU work a little later; on
-    /// this stack the per-frame completion fence (NVIDIA semsurf) signals ~1 ms
-    /// after handover. Small N therefore removes most of the one-behind lag,
-    /// but frames whose render outlasts N are read mid-render and can tear.
-    /// This is a latency/tearing tradeoff, not a guarantee.
-    Settle(u64),
-    /// Capture the current fb immediately when its commit is observed — no
-    /// vblank wait and no one-behind. **Testing only:** the buffer may still
-    /// be mid-render or not yet latched (this stack has no producer fence), so
-    /// the image can tear or be a frame early. Exists to measure the latency
-    /// floor and to see how badly this stack tears, not for regular use.
-    Zero,
-    /// Capture the current fb as soon as the vblank that latches it has
-    /// retired, so the mirrored image is the one actually on screen now.
-    /// Falls back to one-behind for a frame when no vblank arrives in time
-    /// (VRR idle, low refresh) and degrades permanently if vblank never
-    /// advances.
-    Vblank,
-    /// Try [`CaptureSync::Fence`], then [`CaptureSync::Vblank`], then degrade
-    /// to [`CaptureSync::OneBehind`]. Fence needs root and a flipping
-    /// compositor during calibration; each step falls through on failure.
+    /// Use the compositor's per-frame completion fence when it is ready, and
+    /// fall back to [`CaptureSync::Settle`]`(DEFAULT_SETTLE_MS)` otherwise. The
+    /// default.
     Auto,
+    /// Capture the current fb `N` ms after its commit was observed. The
+    /// compositor commits with a non-blocking atomic commit and finishes the
+    /// frame's GPU work afterwards; on this stack the per-frame completion fence
+    /// (NVIDIA semsurf) signals ~0.75 ms (p50) after handover, so a small settle
+    /// usually captures a complete frame. Frames whose render outlasts the
+    /// window are read mid-render and can tear — a latency/tearing tradeoff,
+    /// not a guarantee.
+    Settle(u64),
     /// Read the current fb when the compositor's per-frame completion fence
     /// signals, observed through the kernel `dma_fence:dma_fence_signaled`
     /// tracepoint (via tracefs; the same tracepoint an eBPF program would use).
     /// Tear-free at ~1 ms latency on this stack, at the cost of requiring root
     /// and an actively flipping compositor during a short calibration; falls
-    /// back to one-behind on any failure. See `capture::fence`.
+    /// back to [`CaptureSync::Settle`]`(DEFAULT_SETTLE_MS)` until the watch is
+    /// ready. See `capture::fence`.
     Fence,
 }
 
 impl CaptureSync {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "onbehind" | "one-behind" | "off" => Some(Self::OneBehind),
-            "zero" | "now" => Some(Self::Zero),
-            "vblank" => Some(Self::Vblank),
             "auto" => Some(Self::Auto),
             // "bpf" is accepted as an alias: the mechanism is the dma_fence
             // tracepoint, whether consumed via tracefs (here) or an eBPF probe.
@@ -185,11 +168,6 @@ mod tests {
 
     #[test]
     fn capture_sync_parse() {
-        assert_eq!(CaptureSync::parse("onbehind"), Some(CaptureSync::OneBehind));
-        assert_eq!(CaptureSync::parse("off"), Some(CaptureSync::OneBehind));
-        assert_eq!(CaptureSync::parse("zero"), Some(CaptureSync::Zero));
-        assert_eq!(CaptureSync::parse("now"), Some(CaptureSync::Zero));
-        assert_eq!(CaptureSync::parse("vblank"), Some(CaptureSync::Vblank));
         assert_eq!(CaptureSync::parse("auto"), Some(CaptureSync::Auto));
         assert_eq!(CaptureSync::parse("fence"), Some(CaptureSync::Fence));
         assert_eq!(CaptureSync::parse("bpf"), Some(CaptureSync::Fence));

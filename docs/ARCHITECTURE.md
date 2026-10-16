@@ -82,15 +82,21 @@ rdma-display/
 
 `open_card` probes `/dev/dri/card0..8` (or `--drm-card`) and finds the active
 scanout (or resolves a named `--display-output` connector to its CRTC — see §9).
-On nvidia-drm the framebuffer pointer lives on the **CRTC**
-(`GETCRTC.fb_id` is backfilled; planes report `crtc=0/fb=0`), so the CRTC is
-tried first, then a bound `PRIMARY` plane for atomic drivers that populate
-plane state instead. `probe_display` imports the current fb (`GETFB2` → dmabuf)
-and returns a `FrameFormat { width, height, stride, fourcc, modifier }`.
+On nvidia-drm the framebuffer pointer lives on the **plane** state, not the
+legacy CRTC (atomic-only drivers do not populate `crtc.fb_id`), so the capture
+picks the **first bound, non-cursor plane** in `GETPLANERESOURCES` order
+(Sunshine's selection) and reads its `fb_id`.
+`DRM_CLIENT_CAP_UNIVERSAL_PLANES` + `DRM_CLIENT_CAP_ATOMIC` are enabled first,
+or the legacy getters report stale/zero state; if no plane is bound the
+connector's CRTC is used instead. `probe_display` imports the current fb
+(`GETFB2` → dmabuf) and returns a
+`FrameFormat { width, height, stride, fourcc, modifier }`.
 
-The capture loop polls the CRTC for the current `fb_id`. Because the frame may
-still be rendering at handover, the *sync mode* chooses when to read it
-(§4.4).
+The capture loop polls `plane.fb_id` every 1 ms and emits a scanout only when it
+changes — one frame per flip, silent while the screen is idle. The export
+(`GETFB2` → `PRIME_HANDLE_TO_FD`) runs in the same iteration as the read, so the
+compositor cannot destroy the fb in between. The *sync mode* adds a wait before
+the read (§4.4).
 
 ### 4.2 QEMU D-Bus source (`crates/capture/src/qemu.rs`)
 
@@ -127,16 +133,14 @@ dmabuf** — no full-frame readback, no re-upload (§6).
 
 ### 4.4 Capture sync modes (`--capture-sync`)
 
-Which fb to read, trading latency against tearing:
+The loop always polls `plane.fb_id` at 1 ms and emits only when it changes. The
+sync mode adds a wait before the read, trading latency against tearing:
 
 | Mode | Behaviour |
 | --- | --- |
-| `onbehind` (default) | Read the previous frame's fb (one refresh old, tear-free). |
-| `vblank` | Read the current frame as its vblank retires it. Dead on the nvidia-drm stack (frozen vblank counter); falls back. |
-| `zero` | Read the current frame immediately, no sync (testing; may tear). |
+| `auto` (default) | Use `fence` when the completion-fence watch is ready, else fall back to `settle:2ms`. |
 | `settle[:ms]` | Read the current frame `ms` after its commit was observed (default 2 ms). |
-| `fence` (alias `bpf`) | Read the current frame when the compositor's per-frame completion fence signals (tracefs; mounts it via `mount(2)` needing `CAP_SYS_ADMIN`, writes needing `CAP_DAC_OVERRIDE` — or pre-mount with `uid=`; falls back). |
-| `auto` | Try `fence`, then `vblank`, then `onbehind`. |
+| `fence` (alias `bpf`) | Read the current frame when the compositor's per-frame completion fence signals (tracefs; mounts it via `mount(2)` needing `CAP_SYS_ADMIN`, writes needing `CAP_DAC_OVERRIDE` — or pre-mount with `uid=`; falls back to `settle:2ms` until the watch is ready). |
 
 The reasoning behind these (and why there is no userspace completion fence on
 nvidia-drm) is in [`DEBUG.md`](DEBUG.md#4-capture-sync--handover-investigation).
@@ -445,13 +449,13 @@ reply is an error and the session runs at the current resolution.
 
 ### Output selection (multiple outputs)
 
-When the compositor has several outputs, one selection drives **both** capture
-and mode control, so they never disagree:
+When the compositor has several outputs, one selection drives the mode request:
 
 - `--display-output NAME` forces a **DRM connector name** (`DP-1`, `HDMI-A-1`,
-  `eDP-1` — the same string sysfs and the compositors use). Capture resolves the
-  connector to its current CRTC (`GETCONNECTOR` → `GETENCODER` → `GETCRTC`) and
-  captures that framebuffer; the mode request targets the same output.
+  `eDP-1` — the same string sysfs and the compositors use) for the mode request.
+  Capture picks the first bound, non-cursor plane (§4.1) regardless of the
+  connector, so with several active outputs make sure only the intended one is
+  scanning out.
 - With no `--display-output`, the default is the compositor's **primary**
   output: Hyprland's focused monitor, or KScreen's priority-1 output. With no
   compositor backend, capture falls back to the first active CRTC (there is no

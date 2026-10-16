@@ -66,8 +66,8 @@ user-facing lines — init, connection/disconnect, and feature-disabling failure
 - **`--input-test`** (server): synthesize a test input sequence.
 - `RDMA_DISPLAY_LOSSY_DEBUG=1`: verbose lossy dma-buf import diagnostics.
 - `RDMA_DISPLAY_LOSSY_CPU=1`: force the lossy CPU download/upload path.
-- Capture-sync logs (`[capture-drm] …`) report the chosen sync mode and why a
-  mode fell back (e.g. frozen vblank counter, tracefs unavailable).
+- Capture-sync logs (`[capture-drm] …`) report when the fence watch is
+  unavailable and the mode falls back to `settle`.
 
 ## 3. Performance
 
@@ -97,9 +97,11 @@ CPU-decodable.
 
 ## 4. Capture sync / handover investigation
 
-KMS capture polls `GETCRTC`; with no producer fence on the scanout dma-buf it
-uses **one-behind** — tear-free but one refresh of latency (`queue ~16.5 ms` at
-60 Hz). The `vblank` mode that would avoid it is dead on this stack:
+KMS capture polls the plane's `fb_id` every 1 ms and emits only when it changes.
+There is no producer fence on the scanout dma-buf, so the read timing is the
+only lever; the default (`auto`) reads on the compositor's per-frame completion
+fence when it is available and falls back to `settle:2ms`. A `vblank`-synced
+read would avoid the wait entirely but is dead on this stack:
 `CRTC_GET_SEQUENCE` returns `Ok` with a frozen counter (`1`, `ns 0`).
 
 Kernel surface on the test host (6.12.74, driver 610.57.04): the `dma_fence_*`
@@ -164,12 +166,12 @@ There is no userspace wait for completion on this stack. Options:
 
 | option | latency | tearing | deps |
 | --- | --- | --- | --- |
-| one-behind (default) | ~16.5 ms | none | none |
-| settle read | settle ms | when render outlasts settle | none |
+| `settle:2ms` (the `auto` fallback) | ~2 ms | when render outlasts settle | none |
 | eBPF-triggered read on the semsurf signal | ~1 ms | none | eBPF + root |
 | `ext-image-copy-capture` (screencopy) | ~1 compositor frame | none | Wayland capture |
 
-Two modes were added; `onbehind` stays the default:
+Two modes implement this; `auto` (the default) is `fence` with a `settle:2ms`
+fallback:
 
 - **`--capture-sync settle[:ms]`** (default 2 ms): read the current fb `ms`
   after its commit was observed, with a bounded delay queue. No dependencies;
@@ -179,11 +181,11 @@ Two modes were added; `onbehind` stays the default:
   `dma_fence:dma_fence_signaled` tracepoint through tracefs (no libbpf). It
   calibrates the completion context by matching `dma_fence_init` counts against
   the atomic-commit count, in a background thread that retries until the screen
-  is active (an idle desktop has no commits), capturing one-behind meanwhile.
-  Root is required; only a tracefs mount failure is a hard fallback.
+  is active (an idle desktop has no commits), settling meanwhile. Root is
+  required; a tracefs mount failure falls back to `settle:2ms`.
 
-Benchmark with the client overlay (`queue prep slot mat`) over `onbehind`,
-`settle:2`, `settle:4`, and `fence`.
+Benchmark with the client overlay (`queue prep slot mat`) over `settle:2`,
+`settle:4`, and `fence`.
 
 ## 5. Client zero-copy (C0) findings
 
@@ -242,15 +244,14 @@ and triple buffering: expect ~1–2 frames (8–16 ms at 120 Hz). To reduce it:
 (file capabilities live on the inode). Confirm with `getcap
 target/release/rdma-display-server`.
 
-**Video freezes when a fullscreen app/game starts (audio keeps playing).** The
-compositor replaces/destroys its scanout buffers, so the framebuffer the
-capture loop is reading stops existing (`GETFB2 … ENOENT`) and it used to
-retry that dead id forever. It now re-resolves the card after a few
-consecutive failures and logs `scanout un-importable Nx … re-resolving`. If
-that doesn't recover, the current scanout buffer isn't exportable (a
-direct-scanout client buffer on this driver); see the KMS limitation in
-[`ARCHITECTURE.md`](ARCHITECTURE.md) — the compositor would need to composite
-that output.
+**Video freezes or goes black when a fullscreen app/game starts (audio keeps
+playing).** Under **direct scanout** the compositor points the plane at the
+client's own buffer, which on this driver is not readable through the scanout
+path, so the captured frame is blank. Disable direct scanout in the compositor
+(e.g. Hyprland) or keep the client composited. Separately, the compositor can
+replace/destroy its scanout buffers, so the fb the capture loop is reading stops
+existing (`GETFB2 … ENOENT`); after a few consecutive failures the loop re-picks
+the plane and logs `GETFB2 failed Nx in a row … re-picking the plane`.
 
 **Audio / resolution control / `--gpu-power` do nothing under `sudo`.** The
 server needs the session environment (`XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY`).
@@ -268,11 +269,11 @@ advertised mode (the server picks the nearest).
 commits a mode change asynchronously; the server waits (bounded) for the DRM
 scanout to match the reply before sizing. If it times out it logs the mismatch.
 
-**`fence`/`vblank` sync fell back to one-behind.** `vblank` needs a running
-kernel vblank counter (frozen on nvidia-drm); `fence` mounts tracefs itself
-(needs `CAP_SYS_ADMIN`) and writes it (`CAP_DAC_OVERRIDE`, or pre-mount tracefs
-with `uid=<you>`) on a tracefs-capable kernel. Both fall back to one-behind
-automatically and say so.
+**`fence` sync fell back to `settle`.** `fence` mounts tracefs itself (needs
+`CAP_SYS_ADMIN`) and writes it (`CAP_DAC_OVERRIDE`, or pre-mount tracefs with
+`uid=<you>`) on a tracefs-capable kernel, and only engages once its calibration
+sees an actively flipping screen. Until then (and if tracefs is unavailable) it
+falls back to `settle:2ms` and says so.
 
 **Client has no window / `wayland connect` error.** The client needs
 `WAYLAND_DISPLAY` + `XDG_RUNTIME_DIR` (e.g. under `sudo -E`).

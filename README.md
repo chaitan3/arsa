@@ -198,10 +198,10 @@ both ends.
 | `--transport auto\|rdma\|tcp` | Video transport (default `auto`: RDMA when possible). |
 | `--fps N` | Pacing cap; `0` = consumer-paced by client credits (default). |
 | `--pace auto\|latency\|smooth` | Frame pacing: how many frames the server keeps in flight ahead of the client's display (the flow-control window). `auto` (default) sizes it from the measured link; `latency` = 1 (present-paced, lowest latency); `smooth` = the transport maximum (smoothest). |
-| `--capture-sync MODE` | Which fb to capture: `onbehind` (default), `vblank`, `settle[:ms]`, `fence`, `zero`, `auto`. |
+| `--capture-sync MODE` | When to capture, on top of the 1 ms poll that emits only when the plane's fb changes: `auto` (default) = read the current frame when the compositor's per-frame completion fence signals, falling back to `settle:2ms` while the watch calibrates; `settle[:ms]` = read the current frame `ms` after its commit (default 2 ms); `fence` = the same as `auto`, forcing the fence path. |
 | `--drm-card /dev/dri/cardN` | Pin the KMS card (default: first card with an active scanout). |
 | `--display-control auto\|hyprctl\|kscreen\|none` | Backend for the client's resolution request (default `auto`). |
-| `--display-output NAME` | DRM connector name to capture and to apply the resolution request to (default: the compositor's primary output). |
+| `--display-output NAME` | DRM connector name for the resolution request (default: the compositor's primary output). Capture picks the first bound plane. |
 | `--audio` / `--no-audio` / `--audio-device SRC` | Audio side-channel (default on; `@DEFAULT_MONITOR@` = default sink). |
 | `--gpu-power off\|p5\|p0\|max\|<sm>[,<mem>]` | Floor NVIDIA clocks (needs root). |
 | `--frame-slots N` | Receive/staging slots, each holding one coded frame; sets the receive-buffer pool and the maximum flow-control window (default 3; `--slots` accepted as an alias). |

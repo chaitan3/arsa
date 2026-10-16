@@ -17,34 +17,28 @@
 //! Requires kernel ≥ 5.8 (GETFB2); no libdrm dependency — hand-rolled ioctl
 //! wrappers, same style as the verbs/EGL code.
 //!
-//! Flip sync: a scanout dmabuf on this stack carries no usable producer fence
-//! (the `syncprobe` verdict: stub fences only), so we cannot wait on the
-//! compositor's GPU work before reading a buffer. Two safe policies instead:
-//!   * one-behind (default fallback): capture the fb that was just superseded
-//!     — it scanned out for a full interval, so it is complete, at the cost of
-//!     one compositor frame of lag;
-//!   * vblank (`--capture-sync vblank|auto`): wait for the vblank that retires
-//!     the *current* commit, then capture it — the kernel only latches a ready
-//!     buffer, so it is complete and it is the frame actually on screen. A
-//!     bounded wait falls back to one-behind per frame and degrades for the
-//!     session if vblank never advances (VRR idle, broken accounting).
-//!
-//! There is also a deliberately unsafe `--capture-sync zero` (testing only):
-//! grab the current fb the instant its commit is seen, with no wait at all.
-//! It is the latency floor and a tear-behaviour test, not a mode to ship.
+//! Polling: we re-read `plane.fb_id` every 1 ms and emit a scanout only when it
+//! changes — a flip is noticed within ~1 ms and the capture stays silent while
+//! the screen is idle (no fd churn, no re-encoding the same frame). The export
+//! happens in the same iteration as the read, so the fb cannot vanish in
+//! between. `--capture-sync` is accepted for compatibility but not used by the
+//! DRM path: a scanout dmabuf on this stack carries no usable producer fence
+//! (the `syncprobe` verdict: stub fences only), so there is nothing to wait on.
 //!
 //! Known gaps: no cursor-plane blending (hardware cursors are invisible;
 //! software cursors are in the fb), no damage info (every flip is full-frame),
 //! readback is unfenced (scanout buffers are stable while scanned out; the
 //! compositor's next render into the same buffer is ~1-2 flips away).
 
-use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::mpsc::Sender;
 
 use anyhow::{bail, Context, Result};
 
-use crate::{CaptureEvent, CaptureSource, CaptureSync, DmabufScanout, FrameFormat, Running, Stop};
+use crate::{
+    CaptureEvent, CaptureSource, CaptureSync, DmabufScanout, FrameFormat, Running, Stop,
+    DEFAULT_SETTLE_MS,
+};
 
 // --- drm uapi (numbers + layouts from /usr/include/drm/drm.h, drm_mode.h) ---
 
@@ -120,6 +114,13 @@ struct DrmModeGetPlane {
     gamma_size: u32,
     count_format_types: u32,
     format_type_ptr: u64,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DrmSetClientCap {
+    capability: u64,
+    value: u64,
 }
 
 #[repr(C)]
@@ -242,78 +243,21 @@ const DRM_IOCTL_MODE_GETFB2: u64 = iowr(0xCE, std::mem::size_of::<DrmModeFbCmd2>
 const DRM_IOCTL_PRIME_HANDLE_TO_FD: u64 =
     iowr(0x2d, std::mem::size_of::<DrmPrimeHandle>());
 const DRM_IOCTL_GEM_CLOSE: u64 = iowr_ioctl(0x09, std::mem::size_of::<DrmGemClose>());
+const DRM_IOCTL_SET_CLIENT_CAP: u64 =
+    iowr_ioctl(0x0D, std::mem::size_of::<DrmSetClientCap>());
 
 // plane object type for OBJ_GETPROPERTIES (drm_mode.h)
 const DRM_MODE_OBJECT_PLANE: u32 = 0xeeee_eeee;
-// plane "type" property enum values (libdrm): 0=overlay 1=primary 2=cursor
-const DRM_PLANE_TYPE_PRIMARY: u64 = 1;
+// plane "type" property enum values (kernel drm_plane_type): 0=overlay
+// 1=primary 2=cursor
+const DRM_PLANE_TYPE_CURSOR: u64 = 2;
+// drm_set_client_cap capabilities (drm.h)
+const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
+const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
 
 // GEM_CLOSE is _IOW (write dir, =1), not _IOWR
 const fn iowr_ioctl(nr: u16, size: usize) -> u64 {
     (1 << 30) | ((size as u64) << 16) | (D << 8) | nr as u64
-}
-
-// --- vblank UAPI (include/uapi/drm/drm.h) -----------------------------------
-// GET_SEQUENCE reports the most recent vblank's count and its timestamp
-// ("time of first pixel out", CLOCK_MONOTONIC ns). It is registered with no
-// DRM_MASTER/DRM_AUTH flag, so a non-master observer (us) may call it, and it
-// keeps the vblank counter enabled — which matters on VRR displays where the
-// interrupt is otherwise off while idle.
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
-struct DrmCrtcGetSequence {
-    crtc_id: u32,
-    active: u32,
-    sequence: u64,
-    sequence_ns: i64,
-}
-const DRM_IOCTL_CRTC_GET_SEQUENCE: u64 =
-    iowr(0x3b, std::mem::size_of::<DrmCrtcGetSequence>());
-
-/// Most recent vblank for `crtc_id` as `(sequence, ktime_ns)`.
-fn get_sequence(fd: i32, crtc_id: u32) -> Result<(u64, i64)> {
-    let mut s = DrmCrtcGetSequence {
-        crtc_id,
-        ..Default::default()
-    };
-    ioctl(
-        fd,
-        DRM_IOCTL_CRTC_GET_SEQUENCE,
-        &mut s as *mut _ as *mut core::ffi::c_void,
-    )?;
-    Ok((s.sequence, s.sequence_ns))
-}
-
-/// Does `CRTC_GET_SEQUENCE` actually advance? A driver can return `Ok` with a
-/// frozen counter and a zero timestamp (nvidia-drm does when its vblank IRQ is
-/// not running), so "the ioctl succeeded" is not enough — that probe used to
-/// pick vblank and then fall back to one-behind ~200 ms later. Sample twice and
-/// report both sequences plus the second timestamp.
-fn probe_vblank(fd: i32, crtc_id: u32) -> Result<(u64, u64, i64)> {
-    let (s1, _) = get_sequence(fd, crtc_id)?;
-    std::thread::sleep(std::time::Duration::from_millis(40));
-    let (s2, ns) = get_sequence(fd, crtc_id)?;
-    Ok((s1, s2, ns))
-}
-
-#[allow(clippy::useless_conversion)] // time_t/c_long: i64 here, i32 elsewhere
-fn clock_us(clk: libc::clockid_t) -> i64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    unsafe { libc::clock_gettime(clk, &mut ts) };
-    i64::from(ts.tv_sec) * 1_000_000 + i64::from(ts.tv_nsec) / 1000
-}
-
-/// A CLOCK_MONOTONIC nanosecond timestamp (the kernel's vblank time) ->
-/// unix-epoch microseconds. Same host, so the two clocks differ by a constant.
-fn mono_ns_to_unix_us(ns: i64) -> u64 {
-    if ns <= 0 {
-        return rdma_display_proto::unix_now_us();
-    }
-    let delta = clock_us(libc::CLOCK_REALTIME) - clock_us(libc::CLOCK_MONOTONIC);
-    ((ns / 1000) + delta).max(0) as u64
 }
 
 // --- dma-buf UAPI (include/uapi/linux/dma-buf.h) ----------------------------
@@ -448,15 +392,13 @@ impl CaptureSource for DrmKmsSource {
 /// Open a card node and return (fd, target) for the active display.
 ///
 /// When `connector` is given (a DRM connector name like `DP-1`), it is resolved
-/// to its current CRTC and used directly. Otherwise the target is chosen by
-/// probing (what the C probe showed live on nvidia-drm):
-///   1. CRTCs: GETCRTC's fb_id IS populated on nvidia-drm (the atomic state
-///      is backfilled for this ioctl), while planes report crtc=0/fb=0 —
-///      the legacy fb pointer lives on the CRTC here.
-///   2. Planes (fallback): other atomic drivers populate plane.fb_id but not
-///      crtc.fb_id; find a bound plane of type PRIMARY.
+/// to its current CRTC and used directly. The target is then a *bound plane* on
+/// that CRTC when one exists (see [`find_plane_for_crtc`]), else the CRTC.
 ///
-/// Every probe is logged — a silent skip cost us a whole round-trip.
+/// We enable `DRM_CLIENT_CAP_UNIVERSAL_PLANES` + `DRM_CLIENT_CAP_ATOMIC` before
+/// probing (as Sunshine does). Without them the legacy getters report stale or
+/// zero state on an atomic compositor, so a fullscreen game's direct scanout is
+/// invisible and the capture sees a static placeholder.
 fn open_card(preferred: Option<&str>, connector: Option<&str>) -> Result<(OwnedFd, Target)> {
     let candidates: Vec<String> = match preferred {
         Some(p) => vec![p.to_string()],
@@ -578,94 +520,75 @@ fn open_card_and_find_target(path: &str, connector: Option<&str>) -> Result<(Own
     let card = unsafe { OwnedFd::from_raw_fd(fd) };
     let fdr = card.as_raw_fd();
 
-    // explicit connector: resolve it to its CRTC and skip the "first active"
-    // guess entirely, so capture and mode control agree on the output
+    // Universal planes + atomic (what Sunshine sets): without them the legacy
+    // getters report stale/zero state on an atomic compositor, so a fullscreen
+    // game's direct scanout is invisible and we capture a static placeholder.
+    for cap in [DRM_CLIENT_CAP_UNIVERSAL_PLANES, DRM_CLIENT_CAP_ATOMIC] {
+        let mut c = DrmSetClientCap { capability: cap, value: 1 };
+        match ioctl(fdr, DRM_IOCTL_SET_CLIENT_CAP, &mut c as *mut _ as *mut _) {
+            Ok(_) => log::debug!("[capture-drm] client cap {cap} enabled"),
+            Err(e) => log::warn!("[capture-drm] SET_CLIENT_CAP {cap}: {e:#}"),
+        }
+    }
+
+    // Sunshine's plane selection: the first bound, non-cursor plane on the
+    // card, in GETPLANERESOURCES order — it does NOT filter by the connector's
+    // CRTC. A fullscreen game can direct-scan-out onto a plane while the CRTC
+    // primary shows a stale/black placeholder, so the first *bound* plane is
+    // the live scanout.
+    if let Some(plane_id) = find_first_bound_plane(fdr) {
+        return Ok((card, Target::Plane(plane_id)));
+    }
+
+    // Nothing bound (display off / no scanout). Sunshine bails here; we keep a
+    // connector's CRTC as the target so `--display-output` mode control still
+    // has an output, and the empty-plane timer re-picks once a plane appears.
     if let Some(name) = connector {
         let crtc_id = resolve_connector_crtc(fdr, name)?;
-        let c = get_crtc(fdr, crtc_id).with_context(|| format!("GETCRTC {crtc_id}"))?;
-        if c.fb_id == 0 {
-            bail!("connector {name:?} (crtc {crtc_id}) has no bound framebuffer");
-        }
+        log::debug!("[capture-drm] no bound plane; using connector {name:?} crtc {crtc_id}");
         return Ok((card, Target::Crtc(crtc_id)));
     }
 
-    // 1. CRTC path: GETRESOURCES (two-call; zero counts for lists not provided)
-    let mut res = DrmModeCardRes {
-        count_crtcs: 0,
-        ..zeroed()
-    };
-    ioctl(fdr, DRM_IOCTL_MODE_GETRESOURCES, &mut res as *mut _ as *mut _)
-        .context("GETRESOURCES")?;
-    let n = res.count_crtcs as usize;
-    if n > 0 {
-        let mut crtcs: Vec<u32> = vec![0; n];
-        let mut res = DrmModeCardRes {
-            crtc_id_ptr: crtcs.as_mut_ptr() as u64,
-            count_crtcs: n as u32,
-            ..zeroed()
-        };
-        ioctl(fdr, DRM_IOCTL_MODE_GETRESOURCES, &mut res as *mut _ as *mut _)
-            .context("GETRESOURCES #2")?;
-        for &crtc_id in crtcs.iter().take(res.count_crtcs as usize) {
-            match get_crtc(fdr, crtc_id) {
-                Ok(c) => {
-                    log::debug!(
-                        "[capture-drm] CRTC {}: fb_id={} active={} mode={}x{}",
-                        crtc_id, c.fb_id, c.mode_valid, c.mode.hdisplay, c.mode.vdisplay
-                    );
-                    if c.fb_id != 0 {
-                        return Ok((card, Target::Crtc(crtc_id)));
-                    }
-                }
-                Err(e) => log::debug!("[capture-drm] CRTC {crtc_id}: GETCRTC: {e}"),
-            }
-        }
-    }
+    bail!("{path}: no bound plane (display off?)")
+}
 
-    // 2. plane fallback: bound plane of type PRIMARY (other atomic drivers)
+/// Sunshine's plane selection: the first plane in `GETPLANERESOURCES` order
+/// that has a bound framebuffer and is not a cursor plane. `None` if nothing
+/// is bound. (This is exactly `display_t::init`'s loop in Sunshine's
+/// `kmsgrab.cpp`, for monitor index 0.)
+fn find_first_bound_plane(fd: i32) -> Option<u32> {
     let mut pres = DrmModeGetPlaneRes::default();
-    ioctl(fdr, DRM_IOCTL_MODE_GETPLANERESOURCES, &mut pres as *mut _ as *mut _)
-        .context("GETPLANERESOURCES")?;
-    let pn = pres.count_planes as usize;
-    if pn > 0 {
-        let mut planes: Vec<u32> = vec![0; pn];
-        let mut pres = DrmModeGetPlaneRes {
-            plane_id_ptr: planes.as_mut_ptr() as u64,
-            count_planes: pn as u32,
-        };
-        ioctl(fdr, DRM_IOCTL_MODE_GETPLANERESOURCES, &mut pres as *mut _ as *mut _)
-            .context("GETPLANERESOURCES #2")?;
-        let mut fallback: Option<u32> = None;
-        for &plane_id in planes.iter().take(pres.count_planes as usize) {
-            let p = match get_plane(fdr, plane_id) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::debug!("[capture-drm] plane {plane_id}: GETPLANE: {e}");
-                    continue;
-                }
-            };
-            if p.fb_id == 0 || p.crtc_id == 0 {
-                log::debug!(
-                    "[capture-drm] plane {plane_id}: unbound (crtc={} fb={})",
-                    p.crtc_id, p.fb_id
-                );
-                continue;
-            }
-            let ty = plane_type(fdr, plane_id).unwrap_or(u64::MAX);
-            log::debug!("[capture-drm] plane {plane_id}: crtc={} fb={} type={ty}", p.crtc_id, p.fb_id);
-            if ty == DRM_PLANE_TYPE_PRIMARY {
-                return Ok((card, Target::Plane(plane_id)));
-            }
-            if fallback.is_none() {
-                fallback = Some(plane_id);
-            }
-        }
-        if let Some(p) = fallback {
-            return Ok((card, Target::Plane(p)));
-        }
+    if ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &mut pres as *mut _ as *mut _).is_err() {
+        return None;
     }
-
-    bail!("{path}: no CRTC or plane with a bound framebuffer (display off?)")
+    let pn = pres.count_planes as usize;
+    if pn == 0 {
+        return None;
+    }
+    let mut planes: Vec<u32> = vec![0; pn];
+    let mut pres = DrmModeGetPlaneRes {
+        plane_id_ptr: planes.as_mut_ptr() as u64,
+        count_planes: pn as u32,
+    };
+    if ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &mut pres as *mut _ as *mut _).is_err() {
+        return None;
+    }
+    for &id in planes.iter().take(pres.count_planes as usize) {
+        let Ok(p) = get_plane(fd, id) else { continue };
+        if p.fb_id == 0 {
+            continue;
+        }
+        if plane_type(fd, id).unwrap_or(u64::MAX) == DRM_PLANE_TYPE_CURSOR {
+            continue;
+        }
+        log::debug!(
+            "[capture-drm] plane {id}: crtc={} fb={} (Sunshine first bound non-cursor)",
+            p.crtc_id,
+            p.fb_id
+        );
+        return Some(id);
+    }
+    None
 }
 
 /// Legacy CRTC readout (scan + per-poll).
@@ -1070,216 +993,72 @@ pub fn sync_probe(
     Ok(())
 }
 
-/// Settle window: once the current fb has been unchanged this long, flips have
-/// stopped and it is certainly fully rendered, so it is safe to capture it.
-const SETTLE_MS: u64 = 20;
+/// Read framebuffer `id` and emit a `Scanout`, exporting its dma-buf fd
+/// immediately — in the same breath as the caller's `GETPLANE` (Sunshine's
+/// `refresh()` does exactly this), so the compositor cannot destroy the fb in
+/// between. Returns the scanout `(width, height)`; `Err` means the fb is gone
+/// (`GETFB2` ENOENT) and the caller should retry / re-pick the plane.
+fn emit_scanout(fd: &OwnedFd, id: u32, t0: u64, tx: &Sender<CaptureEvent>) -> Result<(u32, u32)> {
+    let dmabuf = import_fb(fd, id)?;
+    log::debug!(
+        "[capture-drm] fb {id} buf {} {}x{} fourcc={:#010x} '{}' modifier={:#x} stride={}",
+        dmabuf.buf_id,
+        dmabuf.format.width,
+        dmabuf.format.height,
+        dmabuf.format.fourcc,
+        crate::fourcc_name(dmabuf.format.fourcc),
+        dmabuf.format.modifier,
+        dmabuf.format.stride,
+    );
+    let size = (dmabuf.format.width, dmabuf.format.height);
+    let _ = tx.send(CaptureEvent::Scanout(dmabuf, t0));
+    Ok(size)
+}
 
-/// Calibration window for [`crate::fence::FenceWatch`] (the `fence` sync mode):
-/// long enough to see tens of commits and pick the per-frame completion context.
+/// Calibration window for [`crate::fence::FenceWatch`] (the `fence` sync mode).
 const FENCE_CALIB: std::time::Duration = std::time::Duration::from_millis(400);
 
-/// If the completion-fence signal stream goes quiet this long while the fb is
-/// still changing, capture defensively instead of freezing the stream.
-const FENCE_STALL_MS: u64 = 200;
-
-/// One poll's decision.
-#[derive(Debug, PartialEq, Eq)]
-enum FbAction {
-    /// Nothing new worth capturing.
+/// Emit decision for one poll (flip-sync modes).
+enum Step {
     None,
-    /// No scanout (DPMS off).
-    Disabled,
-    /// Capture this fb id — already known to be complete — plus the unix-us
-    /// time it became visible on screen (the flip that latched it).
     Capture(u32, u64),
 }
 
-/// KMS flip tracker implementing the "one-behind" read.
-///
-/// `GETCRTC`/`GETPLANE` report the *pending* fb: the compositor may have
-/// committed it with an in-fence that has not signaled yet, so reading it races
-/// the GPU still rendering into it (blank/torn regions). The fb it just
-/// replaced, however, was scanned out for a full interval and is therefore
-/// complete. So on every change we capture the *previous* fb; when flips stop,
-/// we capture the settled current fb once it has been stable for [`SETTLE_MS`].
-/// Cost: one frame of capture latency. Benefit: never sample a buffer mid-render.
-#[derive(Default)]
-struct FbTracker {
-    /// most recent fb id seen on the CRTC/plane (the pending one)
-    seen: u32,
-    /// last fb id handed to the importer
-    last_captured: u32,
-    /// when `seen` last changed (ms since capture start)
-    changed_ms: u64,
-    /// when `seen` was first observed, unix us: the moment that fb went on
-    /// screen (within the poll granularity). This is the captured frame's t0.
-    seen_since_us: u64,
-}
-
-impl FbTracker {
-    fn update(&mut self, now_ms: u64, now_us: u64, fb: u32) -> FbAction {
-        if fb == 0 {
-            if self.seen == 0 {
-                return FbAction::None;
-            }
-            self.seen = 0;
-            self.last_captured = 0;
-            return FbAction::Disabled;
-        }
-        if fb != self.seen {
-            let prev = self.seen;
-            // before overwriting: `seen_since_us` is when the PREVIOUS fb
-            // (the one we are about to capture) first appeared
-            let prev_since = self.seen_since_us;
-            self.seen = fb;
-            self.changed_ms = now_ms;
-            self.seen_since_us = now_us;
-            // The previous fb was on screen for a full interval -> complete. On
-            // the very first observation there is no previous, so take the
-            // current one immediately (a one-time possible tear) to get a
-            // picture up; it is corrected on the next flip.
-            let candidate = if prev != 0 { prev } else { fb };
-            let t0 = if prev != 0 { prev_since } else { now_us };
-            if candidate != self.last_captured {
-                self.last_captured = candidate;
-                return FbAction::Capture(candidate, t0);
-            }
-            return FbAction::None;
-        }
-        // Flips stopped: the current fb has been stable long enough to be
-        // certainly rendered -> capture it so the settled frame is shown.
-        if self.last_captured != self.seen
-            && now_ms.saturating_sub(self.changed_ms) >= SETTLE_MS
-        {
-            self.last_captured = self.seen;
-            return FbAction::Capture(self.seen, self.seen_since_us);
-        }
-        FbAction::None
-    }
-
-    /// The import failed: forget the claim so a later poll can retry.
-    fn capture_failed(&mut self) {
-        self.last_captured = 0;
-    }
-}
-
-/// Zero-delay capture (TESTING ONLY): on every change, hand the *current* fb to
-/// the importer immediately — no vblank wait, no one-behind. This is the
-/// Sunshine-style "grab the pending fb". The buffer may still be mid-render (we
-/// have no producer fence) or not yet latched, so the mirrored image can tear or
-/// be a frame early; it exists to measure the latency floor and to observe how
-/// this stack tears, not for regular use.
-#[derive(Default)]
-struct ZeroTracker {
-    /// latest fb seen on the crtc/plane
-    seen: u32,
-    /// fb handed to the importer last
-    last_captured: u32,
-    /// when `seen` last changed (ms since capture start)
-    changed_ms: u64,
-    /// unix us when `seen` first appeared (its t0)
-    seen_since_us: u64,
-}
-
-impl ZeroTracker {
-    fn update(&mut self, now_ms: u64, now_us: u64, fb: u32) -> FbAction {
-        if fb == 0 {
-            if self.seen == 0 {
-                return FbAction::None;
-            }
-            self.seen = 0;
-            self.last_captured = 0;
-            return FbAction::Disabled;
-        }
-        if fb != self.seen {
-            self.seen = fb;
-            self.changed_ms = now_ms;
-            self.seen_since_us = now_us;
-            self.last_captured = fb;
-            return FbAction::Capture(fb, now_us);
-        }
-        // Flips stopped: if the immediate import failed, retry the settled
-        // current fb so a picture still gets up.
-        if self.last_captured != self.seen
-            && now_ms.saturating_sub(self.changed_ms) >= SETTLE_MS
-        {
-            self.last_captured = self.seen;
-            return FbAction::Capture(self.seen, self.seen_since_us);
-        }
-        FbAction::None
-    }
-
-    /// The import failed: forget the claim so a later poll can retry.
-    fn capture_failed(&mut self) {
-        self.last_captured = 0;
-    }
-}
-
-/// Short-settle capture: hand the current fb to the importer `settle_ms` after
-/// its commit was observed.
+/// `settle` mode: emit the current fb `ms` after its commit was first seen.
 ///
 /// The compositor commits with a non-blocking atomic commit and finishes the
 /// frame's GPU work afterwards; on this stack the per-frame completion fence
 /// (NVIDIA semsurf) signals ~0.75 ms (p50), ~8-16 ms (p99) after handover, so a
-/// small settle captures a complete frame most of the time without paying the
-/// full one-refresh one-behind wait. Frames whose render outlasts the settle are
-/// read mid-render and can tear — an explicit latency/tearing tradeoff, not a
-/// guarantee. A small backlog keeps a settle larger than the frame interval
-/// progressing in order (bounded so we cannot fall arbitrarily behind).
+/// small settle captures a complete frame most of the time without waiting a
+/// full refresh. Frames whose render outlasts the window are read mid-render
+/// and can tear — an explicit latency/tearing tradeoff, not a guarantee. A small
+/// backlog keeps a settle larger than the frame interval progressing in order
+/// (bounded so we cannot fall arbitrarily behind).
 #[derive(Default)]
-struct SettleTracker {
-    /// latest fb seen on the crtc/plane
+struct SettleState {
+    /// latest fb seen on the plane
     seen: u32,
     /// last fb handed to the importer
     last_captured: u32,
-    /// t0 of the last fb handed to the importer
-    last_t0: u64,
-    /// when `seen` last changed (ms since capture start)
-    changed_ms: u64,
-    /// unix us when `seen` first appeared
-    seen_since_us: u64,
-    /// settle window (ms)
-    settle_ms: u64,
     /// commits awaiting their settle deadline: (fb, due_ms, t0_us)
-    due: VecDeque<(u32, u64, u64)>,
-    /// last frame whose import failed; re-offered immediately on the next poll
-    retry: Option<(u32, u64)>,
-    /// consecutive failed retries of that frame (bounded)
-    retries: u32,
+    due: std::collections::VecDeque<(u32, u64, u64)>,
+    /// settle window (ms)
+    ms: u64,
 }
 
-impl SettleTracker {
-    fn new(settle_ms: u64) -> Self {
+impl SettleState {
+    fn new(ms: u64) -> Self {
         Self {
-            settle_ms,
+            ms,
             ..Default::default()
         }
     }
 
-    fn update(&mut self, now_ms: u64, now_us: u64, fb: u32) -> FbAction {
-        if fb == 0 {
-            if self.seen == 0 {
-                return FbAction::None;
-            }
-            self.seen = 0;
-            self.last_captured = 0;
-            self.due.clear();
-            self.retry = None;
-            return FbAction::Disabled;
-        }
-        // a failed import is retried at once (the frame is already complete)
-        if let Some((id, t0)) = self.retry.take() {
-            self.last_captured = id;
-            self.last_t0 = t0;
-            return FbAction::Capture(id, t0);
-        }
+    fn update(&mut self, now_ms: u64, now_us: u64, fb: u32) -> Step {
         if fb != self.seen {
             self.seen = fb;
-            self.changed_ms = now_ms;
-            self.seen_since_us = now_us;
-            self.retries = 0;
             self.due
-                .push_back((fb, now_ms.saturating_add(self.settle_ms), now_us));
+                .push_back((fb, now_ms.saturating_add(self.ms), now_us));
             while self.due.len() > 4 {
                 self.due.pop_front();
             }
@@ -1291,234 +1070,44 @@ impl SettleTracker {
             self.due.pop_front();
             if id != self.last_captured {
                 self.last_captured = id;
-                self.last_t0 = t0;
-                return FbAction::Capture(id, t0);
+                return Step::Capture(id, t0);
             }
         }
-        FbAction::None
-    }
-
-    /// The import failed: re-offer the frame once, then give up so a dead fb
-    /// (the compositor replaced its scanout buffers) can't wedge the loop — the
-    /// caller re-resolves the card after a few consecutive failures.
-    fn capture_failed(&mut self) {
-        if self.last_captured != 0 && self.retries < 2 {
-            self.retries += 1;
-            self.retry = Some((self.last_captured, self.last_t0));
-        } else {
-            self.retry = None;
-            self.last_captured = 0;
-            self.retries = 0;
-        }
-    }
-}
-
-/// Completion-fence-triggered capture (the `fence` sync mode). The caller drains
-/// the fence signals and passes the latest timestamp; we capture the current fb
-/// when it differs from the last one captured. See [`crate::fence`].
-#[derive(Default)]
-struct FenceTracker {
-    last_captured: u32,
-}
-
-impl FenceTracker {
-    fn update(&mut self, fb: u32, t0: Option<u64>) -> FbAction {
-        if fb == 0 {
-            if self.last_captured == 0 {
-                return FbAction::None;
-            }
-            self.last_captured = 0;
-            return FbAction::Disabled;
-        }
-        if let Some(t0) = t0 {
-            if fb != self.last_captured {
-                self.last_captured = fb;
-                return FbAction::Capture(fb, t0);
-            }
-        }
-        FbAction::None
-    }
-
-    /// The import failed: forget the claim so a later signal can retry.
-    fn capture_failed(&mut self) {
-        self.last_captured = 0;
-    }
-}
-
-/// Vblank-synced capture: on every flip to fb B, wait for the next vblank — the
-/// moment the kernel latches B onto the display. B is complete then (the kernel
-/// only latches a ready buffer) and stays on screen for at least one interval,
-/// so reading it is tear-free without a producer fence (this box's scanout
-/// dmabuf carries only stub fences). That removes the one-frame lag of
-/// [`FbTracker`] while keeping the same safety argument. (Like the one-behind,
-/// this relies on the read finishing before the compositor renders into B
-/// again — two intervals away, so comfortable at 60 Hz and tight above
-/// ~240 Hz.)
-///
-/// The wait is bounded: if no vblank advances within [`VBLANK_TIMEOUT_MS`] the
-/// frame falls back to one-behind, and after [`VBLANK_FAILS_TO_GIVEUP`]
-/// consecutive failures the caller degrades to one-behind for the session.
-#[derive(Default)]
-struct VblankTracker {
-    /// latest fb seen on the crtc/plane
-    seen: u32,
-    /// fb handed to the importer last
-    last_captured: u32,
-    /// when `seen` last changed (ms since capture start)
-    changed_ms: u64,
-    /// unix us when `seen` first appeared (fallback t0)
-    seen_since_us: u64,
-    /// a commit waiting for the vblank that retires it
-    wait: Option<VblankWait>,
-    /// consecutive vblank timeouts
-    failures: u32,
-}
-
-struct VblankWait {
-    /// fb whose commit we are waiting to see retired
-    fb: u32,
-    target_seq: u64,
-    since_ms: u64,
-    /// the fb the wait replaced (one-behind fallback)
-    prev: u32,
-    prev_t0_us: u64,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum VStep {
-    None,
-    Disabled,
-    Capture(u32, u64),
-}
-
-const VBLANK_TIMEOUT_MS: u64 = 60;
-const VBLANK_FAILS_TO_GIVEUP: u32 = 3;
-
-impl VblankTracker {
-    /// One poll. `seq`/`ns` come from `get_sequence` (0/0 when unavailable).
-    fn update(&mut self, now_ms: u64, now_us: u64, fb: u32, seq: u64, ns: i64) -> VStep {
-        if fb == 0 {
-            if self.seen == 0 {
-                return VStep::None;
-            }
-            self.seen = 0;
-            self.last_captured = 0;
-            self.wait = None;
-            return VStep::Disabled;
-        }
-        // A pending commit whose target vblank has passed is captured first,
-        // *before* looking for a newer commit. The old order replaced the wait
-        // whenever `fb != seen`; under continuous flips a new commit can land
-        // within the 1 ms poll period after the target vblank, so the wait was
-        // replaced again and again and frames were never captured in order.
-        if let Some(w) = self.wait.as_ref() {
-            let (w_fb, w_target, w_since, w_prev, w_prev_t0) =
-                (w.fb, w.target_seq, w.since_ms, w.prev, w.prev_t0_us);
-            if seq >= w_target {
-                let t0 = mono_ns_to_unix_us(ns);
-                self.wait = None;
-                self.last_captured = w_fb;
-                self.failures = 0;
-                // leave `seen` alone: if a newer commit is current, the next
-                // poll's `fb != seen` arms a wait for it (it retires a later
-                // vblank), so continuous flips are captured in order
-                return VStep::Capture(w_fb, t0);
-            }
-            if now_ms.saturating_sub(w_since) > VBLANK_TIMEOUT_MS {
-                self.wait = None;
-                self.failures += 1;
-                // A replacement resets `since_ms`, so reaching the timeout
-                // means `fb` stayed put AND the sequence did not advance: the
-                // kernel's vblank counter is not running (nvidia-drm can
-                // return a frozen `sequence_ns` even though the ioctl succeeds).
-                log::debug!(
-                    "[capture-drm] vblank timeout: fb {w_fb} (seen {}) waiting for seq {w_target}, \
-                     now seq {seq} ns {ns} after {} ms — sequence not advancing",
-                    self.seen,
-                    now_ms.saturating_sub(w_since),
-                );
-                // prefer the frame that certainly retired; else the committed
-                // one, which is certainly complete after this long a wait
-                let (id, t0) = if w_prev != 0 && w_prev != self.last_captured {
-                    (w_prev, w_prev_t0)
-                } else {
-                    (self.seen, self.seen_since_us)
-                };
-                self.last_captured = id;
-                return VStep::Capture(id, t0);
-            }
-            return VStep::None;
-        }
-        if fb != self.seen {
-            let prev = self.seen;
-            let prev_t0 = self.seen_since_us;
-            self.seen = fb;
-            self.changed_ms = now_ms;
-            self.seen_since_us = now_us;
-            // the next vblank retires this commit
-            self.wait = Some(VblankWait {
-                fb,
-                target_seq: seq.wrapping_add(1),
-                since_ms: now_ms,
-                prev,
-                prev_t0_us: prev_t0,
-            });
-            return VStep::None;
-        }
-        // no pending wait: flips stopped — take the settled current fb
-        if self.last_captured != self.seen
-            && now_ms.saturating_sub(self.changed_ms) >= SETTLE_MS
-        {
-            self.last_captured = self.seen;
-            return VStep::Capture(self.seen, self.seen_since_us);
-        }
-        VStep::None
-    }
-
-    /// True once vblank has failed enough times in a row to stop trusting it.
-    fn give_up(&self) -> bool {
-        self.failures >= VBLANK_FAILS_TO_GIVEUP
+        Step::None
     }
 
     /// The import failed: forget the claim so a later poll can retry.
-    fn capture_failed(&mut self) {
+    fn failed(&mut self) {
         self.last_captured = 0;
     }
 }
 
-/// Resolved (post-probe) capture policy for this session.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ActiveSync {
-    OneBehind,
-    Settle,
-    Zero,
-    Vblank,
-    Fence,
+/// `fence` mode: emit the current fb when the compositor's per-frame completion
+/// fence signals. The caller drains the (process-wide) signal stream and passes
+/// the latest timestamp; we capture the current fb when it differs from the
+/// last one captured. See [`crate::fence`].
+#[derive(Default)]
+struct FenceState {
+    /// last fb handed to the importer
+    last_captured: u32,
 }
 
-/// Import `id` and emit a `Scanout`. `Err` = the import failed (the fb may
-/// already be freed/reused, or the compositor replaced its scanout buffers);
-/// the caller lets the tracker retry and re-resolves the card if it persists.
-fn emit_scanout(fd: &OwnedFd, id: u32, t0: u64, tx: &Sender<CaptureEvent>) -> Result<()> {
-    match import_fb(fd, id) {
-        Ok(dmabuf) => {
-            log::debug!(
-                "[capture-drm] fb {id} buf {} {}x{} fourcc={:#010x} '{}' modifier={:#x} stride={}",
-                dmabuf.buf_id,
-                dmabuf.format.width,
-                dmabuf.format.height,
-                dmabuf.format.fourcc,
-                crate::fourcc_name(dmabuf.format.fourcc),
-                dmabuf.format.modifier,
-                dmabuf.format.stride,
-            );
-            let _ = tx.send(CaptureEvent::Scanout(dmabuf, t0));
-            Ok(())
+impl FenceState {
+    /// `trigger` is the fence signal's timestamp, or `None` if no signal arrived
+    /// since the last poll.
+    fn update(&mut self, fb: u32, trigger: Option<u64>) -> Step {
+        if let Some(t0) = trigger {
+            if fb != self.last_captured {
+                self.last_captured = fb;
+                return Step::Capture(fb, t0);
+            }
         }
-        Err(e) => {
-            log::debug!("[capture-drm] fb {id} import failed: {e:#}");
-            Err(e)
-        }
+        Step::None
+    }
+
+    /// The import failed: forget the claim so a later signal can retry.
+    fn failed(&mut self) {
+        self.last_captured = 0;
     }
 }
 
@@ -1533,76 +1122,34 @@ fn run(
         "[capture-drm] opening card {}",
         card_pref.unwrap_or("(probe /dev/dri/card0..8)")
     );
-    let mut card: Option<(OwnedFd, Target)> = None;
-    let mut disabled_reported = false;
-    let mut tracker = FbTracker::default();
-    let mut vtracker = VblankTracker::default();
-    let mut ztracker = ZeroTracker::default();
-    let settle_ms = match sync {
-        CaptureSync::Settle(ms) => ms,
-        _ => 0,
+    // Flip-sync policy. `auto` (the default) and `fence` use the compositor's
+    // per-frame completion fence when it is ready and fall back to a short
+    // settle otherwise; `settle[:ms]` uses the settle window alone.
+    let (use_fence, settle_ms) = match sync {
+        CaptureSync::Settle(ms) => (false, ms),
+        CaptureSync::Auto | CaptureSync::Fence => (true, DEFAULT_SETTLE_MS),
     };
-    let mut stracker = SettleTracker::new(settle_ms);
-    let mut ftracker = FenceTracker::default();
-    // completion-fence watch (`fence` mode); started once, falls back on error
+    let mut settle = SettleState::new(settle_ms);
+    let mut fence_state = FenceState::default();
+    // process-wide completion-fence watch (started once, calibrates in the
+    // background); `fence_seq` is the last signal consumed
     let mut fence: Option<&'static crate::fence::FenceWatch> = None;
     let mut fence_tried = false;
-    // fence-mode runtime state: calibration becomes `ready` in the background
-    // (an idle screen at boot has nothing to calibrate against), so we capture
-    // with one-behind until then and switch over when signals start flowing
-    let mut fence_ready = false;
-    let mut fence_last_ms = 0u64;
-    // last signal sequence consumed from the (process-wide) fence watch
     let mut fence_seq: u64 = 0;
-    let mut active = ActiveSync::OneBehind;
-    let mut crtc_id: Option<u32> = None;
+    let mut card: Option<(OwnedFd, Target)> = None;
+    let mut disabled_reported = false;
     let started = std::time::Instant::now();
     // throttles card (re)opens to once a second after a failure
     let mut last_open_attempt: Option<std::time::Instant> = None;
-    // vblank timestamp diagnostic: `emit - t0` and the observed vblank interval.
-    // If the former tracks the latter, the driver's `sequence_ns` is stale by a
-    // full refresh (which would inflate the client's `queue`, `t0d - t0`).
-    let mut vlag: Vec<u64> = Vec::new();
-    let mut vints: Vec<u64> = Vec::new();
-    let mut vns_prev: Option<i64> = None;
-    // log CRTC_GET_SEQUENCE failures once (otherwise silently frozen -> 0)
-    let mut vblank_err_logged = false;
-    // consecutive failed imports of the current scanout. A framebuffer that
-    // keeps failing is gone (GETFB2 ENOENT — the compositor replaced/destroyed
-    // its scanout buffers, e.g. on a fullscreen/direct-scanout transition);
-    // retrying it forever froze the stream, so after a few we re-resolve the
-    // card (re-open + re-pick the CRTC/plane and its current fb).
-    const FB_FAIL_RESCAN: u32 = 3;
-    let mut fb_fail_streak: u32 = 0;
-    macro_rules! capture_or_recover {
-        ($tracker:expr, $id:expr, $t0:expr) => {
-            match emit_scanout(&card.as_ref().unwrap().0, $id, $t0, &tx) {
-                Ok(()) => {
-                    disabled_reported = false;
-                    fb_fail_streak = 0;
-                }
-                Err(e) => {
-                    $tracker.capture_failed();
-                    fb_fail_streak += 1;
-                    if fb_fail_streak >= FB_FAIL_RESCAN {
-                        log::warn!(
-                            "[capture-drm] scanout un-importable {}x in a row ({e:#}); \
-                             re-resolving the card",
-                            fb_fail_streak
-                        );
-                        card = None;
-                        last_open_attempt = Some(std::time::Instant::now());
-                        fb_fail_streak = 0;
-                        tracker = FbTracker::default();
-                        ztracker = ZeroTracker::default();
-                        stracker = SettleTracker::new(settle_ms);
-                        vtracker = VblankTracker::default();
-                        ftracker = FenceTracker::default();
-                    }
-                }
-            }
-        };
-    }
+    // Sunshine's `empty_plane_timer`: re-pick the plane once it has had no
+    // framebuffer for this long.
+    const EMPTY_MS: u64 = 250;
+    let mut empty_since_ms: Option<u64> = None;
+    // consecutive failed exports (GETFB2 ENOENT): re-pick the plane after a few
+    const FAIL_RESCAN: u32 = 3;
+    let mut fail_streak: u32 = 0;
+    // size of the first captured scanout, to re-pick the plane on a mode change
+    let mut captured_size: Option<(u32, u32)> = None;
     loop {
         if stop.stopped() {
             return Ok(());
@@ -1619,118 +1166,16 @@ fn run(
             last_open_attempt = Some(std::time::Instant::now());
             match open_card(card_pref, connector) {
                 Ok((fdr, target)) => {
-                    let fdi = fdr.as_raw_fd();
-                    // vblank is per-CRTC; the plane target must resolve its crtc
-                    crtc_id = match target {
-                        Target::Crtc(id) => Some(id),
-                        Target::Plane(id) => get_plane(fdi, id)
-                            .ok()
-                            .map(|p| p.crtc_id)
-                            .filter(|c| *c != 0),
-                    };
-                    let vblank_probe = crtc_id.map(|c| probe_vblank(fdi, c));
-                    let vblank_ok =
-                        matches!(&vblank_probe, Some(Ok((s1, s2, _))) if s2 > s1);
-                    // Resolve the effective mode. `auto` tries the best
-                    // (lowest-latency, tear-free) mode first and degrades:
-                    // completion fence -> vblank -> one-behind. The fence
-                    // attempt runs once (it needs root + a flipping compositor
-                    // during FENCE_CALIB) and is cached for later card opens.
-                    let wants_fence = matches!(sync, CaptureSync::Fence | CaptureSync::Auto);
-                    let mut fence_active = false;
-                    if wants_fence && fence.is_none() && !fence_tried {
-                        fence_tried = true;
-                        match crate::fence::start(FENCE_CALIB) {
-                            Ok(w) => {
-                                fence = Some(w);
-                                fence_active = true;
-                            }
-                            Err(e) => {
-                                if matches!(sync, CaptureSync::Auto) {
-                                    log::warn!(
-                                        "[capture-drm] fence watch unavailable: {e:#}; \
-                                         trying vblank"
-                                    );
-                                } else {
-                                    log::warn!(
-                                        "[capture-drm] fence watch unavailable: {e:#}; \
-                                         using one-behind"
-                                    );
-                                }
-                            }
-                        }
-                    } else if wants_fence && fence.is_some() {
-                        fence_active = true;
-                    }
-                    active = if fence_active {
-                        ActiveSync::Fence
-                    } else {
-                        match sync {
-                            CaptureSync::Zero => ActiveSync::Zero,
-                            CaptureSync::OneBehind => ActiveSync::OneBehind,
-                            CaptureSync::Settle(_) => ActiveSync::Settle,
-                            // the fence watch is unavailable (or died): degrade
-                            CaptureSync::Fence => ActiveSync::OneBehind,
-                            CaptureSync::Vblank | CaptureSync::Auto => {
-                                if vblank_ok {
-                                    ActiveSync::Vblank
-                                } else {
-                                    ActiveSync::OneBehind
-                                }
-                            }
-                        }
-                    };
-                    log::debug!(
-                        "[capture-drm] target: {target:?} (crtc {crtc_id:?}); flip sync: {} (requested {sync:?})",
-                        match active {
-                            ActiveSync::Vblank => "vblank-synced current frame",
-                            ActiveSync::OneBehind => "one-behind",
-                            ActiveSync::Zero => "zero-delay current frame (TESTING ONLY)",
-                            ActiveSync::Settle => "short-settle current frame",
-                            ActiveSync::Fence => "completion-fence-triggered current frame",
-                        }
-                    );
-                    if matches!(sync, CaptureSync::Vblank | CaptureSync::Auto) && !vblank_ok {
-                        match &vblank_probe {
-                            Some(Err(e)) => {
-                                log::warn!(
-                                    "[capture-drm] vblank unavailable: CRTC_GET_SEQUENCE failed: \
-                                     {e:#}; using one-behind"
-                                );
-                                let unsupported = e
-                                    .downcast_ref::<std::io::Error>()
-                                    .and_then(|io| io.raw_os_error())
-                                    == Some(libc::EOPNOTSUPP);
-                                if unsupported {
-                                    log::debug!(
-                                        "[capture-drm] hint: this driver has no DRM vblank support \
-                                         (nvidia-drm disables it by default) — \
-                                         `options nvidia_drm vblank=1` in modprobe.d + initramfs \
-                                         rebuild enables vblank capture"
-                                    );
-                                }
-                            }
-                            Some(Ok((s1, s2, ns))) => log::warn!(
-                                "[capture-drm] vblank unavailable: CRTC_GET_SEQUENCE returned Ok but \
-                                 the sequence did not advance ({s1} -> {s2} over 40 ms, ns {ns}) — \
-                                 the kernel's vblank counter is not running; using one-behind. \
-                                 One-behind costs up to one refresh of capture latency."
-                            ),
-                            None => log::warn!(
-                                "[capture-drm] vblank unavailable (no CRTC for the selected \
-                                 target); using one-behind"
-                            ),
-                        }
-                    }
+                    log::debug!("[capture-drm] target: {target:?} (Sunshine plane selection)");
                     card = Some((fdr, target));
-                    // a (re)opened card means a fresh scanout: reset the
-                    // trackers so the first frame is captured immediately
-                    tracker = FbTracker::default();
-                    vtracker = VblankTracker::default();
-                    ztracker = ZeroTracker::default();
-                    stracker = SettleTracker::new(settle_ms);
-                    ftracker = FenceTracker::default();
+                    empty_since_ms = None;
+                    fail_streak = 0;
+                    captured_size = None;
                     disabled_reported = false;
+                    // a (re)opened card means a fresh scanout: reset the sync
+                    // state so the first frame is captured immediately
+                    settle = SettleState::new(settle_ms);
+                    fence_state = FenceState::default();
                 }
                 Err(e) => {
                     log::debug!("[capture-drm] {e:#}; retrying…");
@@ -1740,32 +1185,15 @@ fn run(
         }
         let (fdr, target) = card.as_ref().unwrap();
         let fdi = fdr.as_raw_fd();
-        // vblank mode: sample the sequence BEFORE the fb, so a commit we see
-        // now cannot already have been retired by a vblank folded into `seq`
-        // (which would make us wait one extra vblank)
-        let vblank = if active == ActiveSync::Vblank {
-            match crtc_id.map(|c| get_sequence(fdi, c)) {
-                Some(Ok(v)) => Some(v),
-                Some(Err(e)) => {
-                    if !vblank_err_logged {
-                        log::debug!("[capture-drm] vblank: CRTC_GET_SEQUENCE failed: {e:#}");
-                        vblank_err_logged = true;
-                    }
-                    None
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
+        // Sunshine's `refresh()`: read the plane's CURRENT framebuffer.
         let fb = match *target {
             Target::Crtc(crtc_id) => match get_crtc(fdi, crtc_id) {
                 Ok(c) => c.fb_id,
                 Err(e) => {
-                    log::debug!("[capture-drm] GETCRTC: {e}; rescanning");
+                    log::debug!("[capture-drm] GETCRTC: {e}; re-picking");
                     card = None;
                     last_open_attempt = Some(std::time::Instant::now());
-                    if crate::sleep_or_stop(&stop, std::time::Duration::from_secs(1)) {
+                    if crate::sleep_or_stop(&stop, std::time::Duration::from_millis(500)) {
                         return Ok(());
                     }
                     continue;
@@ -1774,10 +1202,10 @@ fn run(
             Target::Plane(plane_id) => match get_plane(fdi, plane_id) {
                 Ok(p) => p.fb_id,
                 Err(e) => {
-                    log::debug!("[capture-drm] GETPLANE: {e}; rescanning");
+                    log::debug!("[capture-drm] GETPLANE: {e}; re-picking");
                     card = None;
                     last_open_attempt = Some(std::time::Instant::now());
-                    if crate::sleep_or_stop(&stop, std::time::Duration::from_secs(1)) {
+                    if crate::sleep_or_stop(&stop, std::time::Duration::from_millis(500)) {
                         return Ok(());
                     }
                     continue;
@@ -1786,139 +1214,100 @@ fn run(
         };
         let now_ms = started.elapsed().as_millis() as u64;
         let now_us = rdma_display_proto::unix_now_us();
-        let disabled = |disabled_reported: &mut bool| {
-            // DPMS off / no scanout — tell the server once
-            if !*disabled_reported {
-                *disabled_reported = true;
+        if fb == 0 {
+            // no framebuffer (DPMS off / no scanout). Tell the server once, and
+            // re-pick the plane once the empty window elapses (Sunshine).
+            let since = *empty_since_ms.get_or_insert(now_ms);
+            if !disabled_reported {
+                disabled_reported = true;
                 let _ = tx.send(CaptureEvent::Disabled);
             }
-        };
-        match active {
-            ActiveSync::OneBehind => {
-                // capture the fb that was just superseded (complete), and the
-                // settled current fb once flips stop — never the pending one
-                match tracker.update(now_ms, now_us, fb) {
-                    FbAction::None => {}
-                    FbAction::Disabled => disabled(&mut disabled_reported),
-                    FbAction::Capture(id, t0) => capture_or_recover!(tracker, id, t0),
+            if now_ms.saturating_sub(since) >= EMPTY_MS {
+                log::debug!(
+                    "[capture-drm] target has had no framebuffer for {} ms; re-picking",
+                    now_ms - since
+                );
+                card = None;
+                last_open_attempt = Some(std::time::Instant::now());
+                empty_since_ms = None;
+                continue;
+            }
+            continue;
+        }
+        empty_since_ms = None;
+        disabled_reported = false;
+        // Decide whether to emit this poll, per the flip-sync policy. The export
+        // happens in the same iteration as the GETPLANE read above, so the fb
+        // cannot vanish in between — that is Sunshine's `refresh()`.
+        let step = if use_fence {
+            // start the process-wide fence watch once; it calibrates in the
+            // background and reports `ready` once signals flow
+            if fence.is_none() && !fence_tried {
+                fence_tried = true;
+                match crate::fence::start(FENCE_CALIB) {
+                    Ok(w) => fence = Some(w),
+                    Err(e) => log::warn!(
+                        "[capture-drm] fence watch unavailable: {e:#}; using settle:{settle_ms}ms"
+                    ),
                 }
             }
-            ActiveSync::Zero => {
-                // TESTING: grab the current fb the moment it changes — no sync
-                // at all, so the read may catch the compositor mid-render
-                match ztracker.update(now_ms, now_us, fb) {
-                    FbAction::None => {}
-                    FbAction::Disabled => disabled(&mut disabled_reported),
-                    FbAction::Capture(id, t0) => capture_or_recover!(ztracker, id, t0),
-                }
-            }
-            ActiveSync::Settle => {
-                // capture the current fb `settle_ms` after its commit was seen:
-                // usually complete by then (the completion fence signals at
-                // ~1 ms), without the full one-refresh one-behind wait
-                match stracker.update(now_ms, now_us, fb) {
-                    FbAction::None => {}
-                    FbAction::Disabled => disabled(&mut disabled_reported),
-                    FbAction::Capture(id, t0) => capture_or_recover!(stracker, id, t0),
-                }
-            }
-            ActiveSync::Fence => {
-                let ready_now = fence.as_ref().is_some_and(|w| w.ready());
-                if ready_now != fence_ready {
-                    fence_ready = ready_now;
-                    fence_last_ms = now_ms;
-                    if ready_now {
-                        // signals take over: start fresh so the next one captures
-                        ftracker = FenceTracker::default();
-                    }
-                }
-                if !ready_now {
-                    // calibrating (an idle screen at boot has no commits to
-                    // calibrate against): one-behind until activity appears
-                    match tracker.update(now_ms, now_us, fb) {
-                        FbAction::None => {}
-                        FbAction::Disabled => disabled(&mut disabled_reported),
-                        FbAction::Capture(id, t0) => capture_or_recover!(tracker, id, t0),
-                    }
-                } else {
+            match fence.filter(|w| w.ready()) {
+                // calibrating (an idle screen has no commits to calibrate
+                // against), or the watch is unavailable: short settle
+                None => settle.update(now_ms, now_us, fb),
+                Some(w) => {
                     // newest completion-fence signal since we last looked
-                    // (process-wide watch; a session restart does not reset it)
-                    let sig = fence.and_then(|w| w.signal_since(fence_seq));
-                    if let Some((s, _)) = sig {
+                    let trigger = w.signal_since(fence_seq).map(|(s, t)| {
                         fence_seq = s;
-                        fence_last_ms = now_ms;
-                    }
-                    // signal-driven capture, with a defensive capture if the
-                    // stream stalls while the fb is still changing
-                    let trigger = sig.map(|(_, t)| t).or_else(|| {
-                        (now_ms.saturating_sub(fence_last_ms) > FENCE_STALL_MS)
-                            .then_some(now_us)
+                        t
                     });
-                    match ftracker.update(fb, trigger) {
-                        FbAction::None => {}
-                        FbAction::Disabled => disabled(&mut disabled_reported),
-                        FbAction::Capture(id, t0) => capture_or_recover!(ftracker, id, t0),
-                    }
+                    fence_state.update(fb, trigger)
                 }
             }
-            ActiveSync::Vblank => {
-                // capture the CURRENT fb as soon as its vblank retires it
-                let (seq, ns) = vblank.unwrap_or((0, 0));
-                match vtracker.update(now_ms, now_us, fb, seq, ns) {
-                    VStep::None => {}
-                    VStep::Disabled => disabled(&mut disabled_reported),
-                    VStep::Capture(id, t0) => {
-                        // Diagnostic: how long after the stamped capture time the
-                        // poll actually noticed the vblank. If this tracks the
-                        // observed vblank interval, the driver's `sequence_ns` is
-                        // stale by a full refresh (nvidia-drm vblank=1 quirk) and
-                        // the client's `queue` (t0d - t0) is inflated by it.
-                        let now = rdma_display_proto::unix_now_us();
-                        vlag.push(now.saturating_sub(t0));
-                        if let Some(prev) = vns_prev {
-                            vints.push((ns.saturating_sub(prev) / 1000).max(0) as u64);
-                        }
-                        vns_prev = Some(ns);
-                        if vlag.len() >= 240 {
-                            vlag.sort_unstable();
-                            vints.sort_unstable();
-                            let lag = vlag[vlag.len() / 2];
-                            let iv = if vints.is_empty() {
-                                0
-                            } else {
-                                vints[vints.len() / 2]
-                            };
+        } else {
+            settle.update(now_ms, now_us, fb)
+        };
+        if let Step::Capture(id, t0) = step {
+            match emit_scanout(fdr, id, t0, &tx) {
+                Ok(size) => {
+                    fail_streak = 0;
+                    match captured_size {
+                        Some(prev) if prev != size => {
                             log::debug!(
-                                "[capture-drm] vblank: emit-t0 p50 {lag} us | vblank interval p50 {iv} us ({} samples)",
-                                vlag.len(),
+                                "[capture-drm] scanout {}x{} -> {}x{}; re-picking the plane",
+                                prev.0,
+                                prev.1,
+                                size.0,
+                                size.1
                             );
-                            vlag.clear();
-                            vints.clear();
+                            card = None;
+                            last_open_attempt = Some(std::time::Instant::now());
+                            captured_size = None;
+                            continue;
                         }
-                        capture_or_recover!(vtracker, id, t0);
+                        None => captured_size = Some(size),
+                        _ => {}
                     }
                 }
-                if vtracker.give_up() && active == ActiveSync::Vblank {
-                    log::debug!(
-                        "[capture-drm] vblank never advanced within {VBLANK_TIMEOUT_MS} ms \
-                         ({VBLANK_FAILS_TO_GIVEUP}× in a row) — switching to one-behind"
-                    );
-                    active = ActiveSync::OneBehind;
-                    tracker = FbTracker::default();
+                Err(e) => {
+                    // Sunshine returns `timeout` here and retries the same plane
+                    // on the next iteration; only after a few do we re-pick.
+                    settle.failed();
+                    fence_state.failed();
+                    fail_streak += 1;
+                    if fail_streak >= FAIL_RESCAN {
+                        log::debug!(
+                            "[capture-drm] GETFB2 failed {}x in a row ({e:#}); re-picking the plane",
+                            fail_streak
+                        );
+                        card = None;
+                        last_open_attempt = Some(std::time::Instant::now());
+                        fail_streak = 0;
+                    }
                 }
             }
         }
-        // polling cadence: vblank/zero/settle/fence modes need a tight poll
-        // (they are trying to shave every millisecond); one-behind can afford 2 ms
-        let poll_ms = if matches!(
-            active,
-            ActiveSync::Vblank | ActiveSync::Zero | ActiveSync::Settle | ActiveSync::Fence
-        ) {
-            1
-        } else {
-            2
-        };
-        if crate::sleep_or_stop(&stop, std::time::Duration::from_millis(poll_ms)) {
+        if crate::sleep_or_stop(&stop, std::time::Duration::from_millis(1)) {
             return Ok(());
         }
     }
@@ -1942,7 +1331,6 @@ mod tests {
         assert_eq!(size_of::<DrmModeFbCmd2>(), 104); // u64 modifier[] pads
         assert_eq!(size_of::<DrmPrimeHandle>(), 12);
         assert_eq!(size_of::<DrmGemClose>(), 8);
-        assert_eq!(size_of::<DrmCrtcGetSequence>(), 24);
         // ioctl request numbers: _IOWR dir bits = 3 (READ|WRITE). Verified
         // against /usr/include/drm/drm.h macros via gcc (not self-computed!)
         assert_eq!(DRM_IOCTL_MODE_GETRESOURCES, 0xC04064A0);
@@ -1955,8 +1343,6 @@ mod tests {
         assert_eq!(DRM_IOCTL_MODE_GETPROPERTY, 0xC04064AA);
         assert_eq!(DRM_IOCTL_MODE_GETFB2, 0xC06864CE);
         assert_eq!(DRM_IOCTL_PRIME_HANDLE_TO_FD, 0xC00C642D);
-        // vblank sequence query (drm.h: DRM_IOWR(0x3b, drm_crtc_get_sequence))
-        assert_eq!(DRM_IOCTL_CRTC_GET_SEQUENCE, 0xC018643B);
         assert_eq!(DRM_IOCTL_GEM_CLOSE, 0x40086409); // _IOW, dir=1
         // dma-buf fence export: _IOWR('b', 2, struct {u32; s32}) = dir3, size8
         assert_eq!(DMA_BUF_IOCTL_EXPORT_SYNC_FILE, 0xC0086202);
@@ -1974,193 +1360,6 @@ mod tests {
         assert_eq!(format!("{}-{}", connector_type_name(11), 1), "HDMI-A-1");
         assert_eq!(format!("{}-{}", connector_type_name(14), 1), "eDP-1");
         assert_eq!(format!("{}-{}", connector_type_name(0), 1), "Unknown-1");
-    }
-
-    #[test]
-    fn fb_tracker_one_behind_and_settle() {
-        let mut t = FbTracker::default();
-        // first sight: capture the current fb immediately to get a picture up
-        assert_eq!(t.update(0, 0, 10), FbAction::Capture(10, 0));
-        // A->B: the previous (A) was already captured — nothing new yet
-        assert_eq!(t.update(2, 2_000, 11), FbAction::None);
-        // B->C: capture the now-complete B, t0 = when B first appeared
-        assert_eq!(t.update(4, 4_000, 12), FbAction::Capture(11, 2_000));
-        // C->D: capture C, t0 = when C first appeared
-        assert_eq!(t.update(6, 6_000, 13), FbAction::Capture(12, 4_000));
-        // flips stop: not yet settled
-        assert_eq!(t.update(10, 10_000, 13), FbAction::None);
-        // settled: capture the final frame with its on-screen time
-        assert_eq!(t.update(6 + SETTLE_MS, 26_000, 13), FbAction::Capture(13, 6_000));
-        // and never repeat it
-        assert_eq!(t.update(1000, 1_000_000, 13), FbAction::None);
-        // DPMS off (once), then a fresh first frame on re-enable
-        assert_eq!(t.update(1002, 1_002_000, 0), FbAction::Disabled);
-        assert_eq!(t.update(1004, 1_004_000, 0), FbAction::None);
-        assert_eq!(t.update(1006, 1_006_000, 20), FbAction::Capture(20, 1_006_000));
-    }
-
-    #[test]
-    fn fb_tracker_failed_import_retries_after_settle() {
-        let mut t = FbTracker::default();
-        assert_eq!(t.update(0, 0, 5), FbAction::Capture(5, 0));
-        // the import failed -> the claim is dropped and the settled fb is
-        // captured again on a later poll
-        t.capture_failed();
-        assert_eq!(t.update(SETTLE_MS + 1, 21_000, 5), FbAction::Capture(5, 0));
-    }
-
-    #[test]
-    fn vblank_tracker_waits_for_the_retire() {
-        let mut t = VblankTracker::default();
-        // first commit: hold until the vblank that retires it
-        assert_eq!(t.update(0, 0, 10, 100, 0), VStep::None);
-        // same vblank: still nothing
-        assert_eq!(t.update(1, 1_000, 10, 100, 0), VStep::None);
-        // vblank advanced: the commit is on screen and complete -> capture it
-        assert!(matches!(
-            t.update(2, 2_000, 10, 101, 0),
-            VStep::Capture(10, t0) if t0 > 0
-        ));
-        // a new commit gets its own wait
-        assert_eq!(t.update(3, 3_000, 11, 101, 0), VStep::None);
-        assert!(matches!(
-            t.update(4, 4_000, 11, 102, 0),
-            VStep::Capture(11, _)
-        ));
-        assert_eq!(t.failures, 0);
-    }
-
-    #[test]
-    fn vblank_tracker_timeout_falls_back_then_gives_up() {
-        let mut t = VblankTracker::default();
-        // prime: capture 10 at its vblank
-        assert_eq!(t.update(0, 0, 10, 100, 0), VStep::None);
-        assert!(matches!(
-            t.update(1, 1_000, 10, 101, 0),
-            VStep::Capture(10, _)
-        ));
-
-        // a commit whose vblank never arrives: after the bounded wait take the
-        // committed frame (certainly complete by then)
-        assert_eq!(t.update(2, 2_000, 11, 101, 0), VStep::None);
-        assert!(matches!(
-            t.update(2 + VBLANK_TIMEOUT_MS + 1, 70_000, 11, 101, 0),
-            VStep::Capture(11, 2_000)
-        ));
-        assert_eq!(t.failures, 1);
-        assert!(!t.give_up());
-
-        // two more consecutive failures cross the give-up threshold
-        for (fb, now_ms, now_us) in [(12u32, 80u64, 80_000u64), (13, 160, 160_000)] {
-            assert_eq!(t.update(now_ms, now_us, fb, 101, 0), VStep::None);
-            assert!(matches!(
-                t.update(now_ms + VBLANK_TIMEOUT_MS + 1, now_us + 70_000, fb, 101, 0),
-                VStep::Capture(b, _) if b == fb
-            ));
-        }
-        assert!(t.give_up());
-    }
-
-    #[test]
-    fn zero_tracker_captures_immediately() {
-        let mut t = ZeroTracker::default();
-        // first observation: capture the current fb at once, no wait
-        assert_eq!(t.update(0, 0, 5), FbAction::Capture(5, 0));
-        // unchanged: nothing
-        assert_eq!(t.update(1, 1_000, 5), FbAction::None);
-        // new commit: capture it immediately with its observation time as t0
-        assert_eq!(t.update(2, 2_000, 6), FbAction::Capture(6, 2_000));
-        // and again, no filtering
-        assert_eq!(t.update(3, 3_000, 7), FbAction::Capture(7, 3_000));
-        // DPMS off once, then a fresh first frame on re-enable
-        assert_eq!(t.update(4, 4_000, 0), FbAction::Disabled);
-        assert_eq!(t.update(5, 5_000, 0), FbAction::None);
-        assert_eq!(t.update(6, 6_000, 8), FbAction::Capture(8, 6_000));
-    }
-
-    #[test]
-    fn zero_tracker_failed_import_retries_after_settle() {
-        let mut t = ZeroTracker::default();
-        assert_eq!(t.update(0, 0, 5), FbAction::Capture(5, 0));
-        t.capture_failed();
-        assert_eq!(t.update(SETTLE_MS + 1, 21_000, 5), FbAction::Capture(5, 0));
-    }
-
-    #[test]
-    fn settle_tracker_waits_then_captures_current() {
-        let mut t = SettleTracker::new(2);
-        // first observation: nothing until the settle elapses
-        assert_eq!(t.update(0, 0, 5), FbAction::None);
-        assert_eq!(t.update(1, 1_000, 5), FbAction::None);
-        // settle elapsed: capture the current fb with its observation time
-        assert_eq!(t.update(2, 2_000, 5), FbAction::Capture(5, 0));
-        // no repeat
-        assert_eq!(t.update(3, 3_000, 5), FbAction::None);
-        // a new commit is captured 2 ms later
-        assert_eq!(t.update(10, 10_000, 6), FbAction::None);
-        assert_eq!(t.update(12, 12_000, 6), FbAction::Capture(6, 10_000));
-        // DPMS off once, then a fresh first frame
-        assert_eq!(t.update(20, 20_000, 0), FbAction::Disabled);
-        assert_eq!(t.update(21, 21_000, 0), FbAction::None);
-        assert_eq!(t.update(30, 30_000, 7), FbAction::None);
-        assert_eq!(t.update(32, 32_000, 7), FbAction::Capture(7, 30_000));
-    }
-
-    #[test]
-    fn settle_tracker_keeps_order_when_settle_exceeds_interval() {
-        // settle (5 ms) longer than the commit interval (2 ms): a frame is
-        // still emitted in commit order, settle after *its own* commit
-        let mut t = SettleTracker::new(5);
-        assert_eq!(t.update(0, 0, 10), FbAction::None);
-        assert_eq!(t.update(2, 2_000, 11), FbAction::None);
-        assert_eq!(t.update(4, 4_000, 12), FbAction::None);
-        assert_eq!(t.update(5, 5_000, 12), FbAction::Capture(10, 0));
-        assert_eq!(t.update(7, 7_000, 12), FbAction::Capture(11, 2_000));
-        assert_eq!(t.update(9, 9_000, 12), FbAction::Capture(12, 4_000));
-        assert_eq!(t.update(11, 11_000, 12), FbAction::None);
-    }
-
-    #[test]
-    fn settle_tracker_failed_import_retries() {
-        let mut t = SettleTracker::new(1);
-        assert_eq!(t.update(0, 0, 5), FbAction::None);
-        assert_eq!(t.update(1, 1_000, 5), FbAction::Capture(5, 0));
-        // the import failed: the next poll re-offers the settled frame
-        t.capture_failed();
-        assert_eq!(t.update(2, 2_000, 5), FbAction::Capture(5, 0));
-    }
-
-    #[test]
-    fn settle_tracker_gives_up_after_bounded_retries() {
-        // a frame that never imports must not be re-offered forever (the caller
-        // re-resolves the card after a few consecutive failures instead)
-        let mut t = SettleTracker::new(1);
-        assert_eq!(t.update(0, 0, 5), FbAction::None);
-        assert_eq!(t.update(1, 1_000, 5), FbAction::Capture(5, 0));
-        t.capture_failed();
-        assert_eq!(t.update(2, 2_000, 5), FbAction::Capture(5, 0)); // retry 1
-        t.capture_failed();
-        assert_eq!(t.update(3, 3_000, 5), FbAction::Capture(5, 0)); // retry 2
-        t.capture_failed();
-        // bounded: the dead frame is no longer re-offered
-        assert_eq!(t.update(4, 4_000, 5), FbAction::None);
-    }
-
-    #[test]
-    fn fence_tracker_captures_on_signal() {
-        let mut t = FenceTracker::default();
-        // no signal: nothing, even on a new fb
-        assert_eq!(t.update(5, None), FbAction::None);
-        // a signal with a changed fb -> capture, t0 = the signal time
-        assert_eq!(t.update(5, Some(1_000)), FbAction::Capture(5, 1_000));
-        // another signal for the same fb -> nothing (already sent)
-        assert_eq!(t.update(5, Some(2_000)), FbAction::None);
-        // new fb + signal -> capture
-        assert_eq!(t.update(6, Some(3_000)), FbAction::Capture(6, 3_000));
-        // DPMS off once, then a fresh first frame
-        assert_eq!(t.update(0, Some(4_000)), FbAction::Disabled);
-        assert_eq!(t.update(0, Some(5_000)), FbAction::None);
-        assert_eq!(t.update(7, Some(6_000)), FbAction::Capture(7, 6_000));
     }
 
     #[test]
