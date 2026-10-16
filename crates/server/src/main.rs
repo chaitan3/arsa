@@ -692,10 +692,10 @@ fn pace_window(pace: Pace, turnaround_us: u64, source_period_us: u64, max: usize
 /// intervals therefore wobbled between ~16 and ~155 ms and made the window
 /// oscillate 1..3 (with the p95 latency spiking whenever it dipped to 1).
 ///
-/// Use a *low percentile* of a sliding window of intervals instead: it rejects
-/// both the idle gaps and the slow tail of the jitter, and converges to the
-/// **active** frame period — the rate the pipeline actually has to sustain
-/// during a burst.
+/// Use the *minimum* of a sliding window of intervals instead: it is the
+/// display period (the fastest flip), which rejects the idle gaps, the slow
+/// tail of the jitter, and — importantly — the pipeline's own achieved cadence,
+/// so the window can't be throttled by the very rate it produced.
 #[derive(Default)]
 struct SourcePeriod {
     /// `t0` (unix µs) of the previous captured frame; 0 = none yet
@@ -709,9 +709,13 @@ struct SourcePeriod {
 impl SourcePeriod {
     /// Intervals kept for the estimate (~0.5 s at 60 Hz).
     const WINDOW: usize = 32;
-    /// Percentile of the sorted intervals. Low, so the idle gaps and the slow
-    /// tail of the jitter don't inflate the period.
-    const PCT: usize = 25;
+    /// Percentile of the sorted intervals. The **minimum** (0) is the display
+    /// period — the fastest the compositor flips. A higher percentile instead
+    /// follows the *achieved* cadence, which is self-limiting: a throttled
+    /// pipeline reports long intervals, those shrink the flow-control window,
+    /// which throttles it further. The minimum floors the window at the display
+    /// period and breaks that loop.
+    const PCT: usize = 0;
 
     /// Feed one captured frame's `t0`.
     fn observe(&mut self, t0: u64) {

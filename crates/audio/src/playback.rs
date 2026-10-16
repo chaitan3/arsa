@@ -196,6 +196,11 @@ fn session(addr: std::net::SocketAddr, buffer_ms: u32) -> Result<()> {
     let _sock_guard = SocketGuard(sock);
 
     let mut next_report = Instant::now() + Duration::from_secs(5);
+    // The sink's own latency is fixed and can be large (a Bluetooth/USB sink, or
+    // a pulse `tsched` buffer); only *growth* means the two clocks are drifting.
+    // Track the running minimum as the baseline, so the guard fires on real
+    // drift instead of on a constant sink latency.
+    let mut latency_floor_us: u64 = 0; // 0 = not measured yet
     loop {
         let payload = {
             let (lock, cv) = &*shared;
@@ -223,15 +228,32 @@ fn session(addr: std::net::SocketAddr, buffer_ms: u32) -> Result<()> {
             };
             match stream.latency_us() {
                 Ok(us) => {
-                    // drift guard: if backlog exceeds the buffer by a wide
-                    // margin (clock skew between the two pulse streams),
-                    // flush and resync rather than accumulating latency
-                    let backlog_us = us as i64 - (buffer_ms as i64) * 1000;
-                    if backlog_us > 150_000 {
-                        log::debug!("[audio] playout latency {} ms > buffer, flushing to resync (ring drops {drops})", us / 1000);
+                    // drift guard: the playout latency should sit at the sink's
+                    // own floor. If it grows well above the floor, the two pulse
+                    // streams' clocks are drifting apart — flush and re-baseline
+                    // rather than accumulating latency.
+                    if latency_floor_us == 0 || us < latency_floor_us {
+                        latency_floor_us = us;
+                    }
+                    let drift_us = us.saturating_sub(latency_floor_us);
+                    if drift_us > 150_000 {
+                        log::debug!(
+                            "[audio] playout latency {} ms, {} ms above the {}-ms floor, \
+                             flushing to resync (ring drops {drops})",
+                            us / 1000,
+                            drift_us / 1000,
+                            latency_floor_us / 1000
+                        );
                         stream.flush()?;
+                        latency_floor_us = 0; // re-baseline after the flush
                     } else {
-                        log::debug!("[audio] playout latency ~{} ms (ring drops {drops})", us / 1000);
+                        log::debug!(
+                            "[audio] playout latency ~{} ms ({} ms above the {}-ms floor; \
+                             ring drops {drops})",
+                            us / 1000,
+                            drift_us / 1000,
+                            latency_floor_us / 1000
+                        );
                     }
                 }
                 Err(e) => log::debug!("[audio] latency query failed: {e:#}"),
