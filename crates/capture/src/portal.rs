@@ -32,9 +32,20 @@ use ashpd::enumflags2::BitFlags;
 use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
+use spa::buffer::DataType;
 use spa::param::format::{FormatProperties, MediaSubtype, MediaType};
 use spa::param::video::{VideoFormat, VideoInfoRaw};
 use spa::pod::Pod;
+use spa::utils::{Choice, ChoiceEnum, ChoiceFlags};
+
+/// `SPA_PARAM_BUFFERS_*` property keys (spa/param/buffers.h; not exposed by
+/// libspa's Rust API, so they are spelled out here, keeping the C names).
+#[allow(non_upper_case_globals)]
+const SPA_PARAM_BUFFERS_buffers: u32 = 1;
+#[allow(non_upper_case_globals)]
+const SPA_PARAM_BUFFERS_blocks: u32 = 2;
+#[allow(non_upper_case_globals)]
+const SPA_PARAM_BUFFERS_dataType: u32 = 6;
 
 use crate::{CaptureEvent, CaptureSource, DmabufScanout, FrameFormat, Running, Stop};
 use rdma_display_proto::unix_now_us;
@@ -183,6 +194,8 @@ struct State {
     tx: Sender<CaptureEvent>,
     format: VideoInfoRaw,
     have_format: bool,
+    /// the non-dmabuf warning is once-only (it would otherwise fire per frame)
+    logged_non_dmabuf: bool,
 }
 
 impl State {
@@ -268,6 +281,21 @@ fn enum_format_pod() -> Vec<u8> {
             VideoFormat::RGBx,
             VideoFormat::RGBA
         ),
+        // the modifier property is what makes the producer allocate *dmabuf*
+        // buffers (modifiers only apply to dmabufs); without it XDPH defaults
+        // to MemFd, which the materializer cannot import
+        spa::pod::Property {
+            key: FormatProperties::VideoModifier.as_raw(),
+            flags: spa::pod::PropertyFlags::MANDATORY
+                | spa::pod::PropertyFlags::DONT_FIXATE,
+            value: spa::pod::Value::Choice(spa::pod::ChoiceValue::Long(Choice::<i64>(
+                ChoiceFlags::empty(),
+                ChoiceEnum::<i64>::Enum {
+                    default: 0,
+                    alternatives: vec![0],
+                },
+            ))),
+        },
         spa::pod::property!(
             FormatProperties::VideoSize,
             Choice,
@@ -297,6 +325,44 @@ fn enum_format_pod() -> Vec<u8> {
         &spa::pod::Value::Object(obj),
     )
     .expect("serialize EnumFormat pod")
+    .0
+    .into_inner()
+}
+
+/// Build the `SPA_PARAM_Buffers` pod, asking for **dmabuf**-backed buffers.
+/// Without it the producer (XDPH) hands out MemFd buffers, which this source
+/// cannot import — the materializer needs a dmabuf.
+fn buffers_pod() -> Vec<u8> {
+    let data_type = 1u32 << DataType::DmaBuf.as_raw();
+    let obj = spa::pod::Object {
+        type_: spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
+        id: spa::param::ParamType::Buffers.as_raw(),
+        properties: vec![
+            spa::pod::Property {
+                key: SPA_PARAM_BUFFERS_buffers,
+                flags: spa::pod::PropertyFlags::empty(),
+                value: spa::pod::Value::Choice(spa::pod::ChoiceValue::Int(Choice::<i32>(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::<i32>::Range {
+                        default: 8,
+                        min: 2,
+                        max: 64,
+                    },
+                ))),
+            },
+            spa::pod::Property::new(SPA_PARAM_BUFFERS_blocks, spa::pod::Value::Int(1)),
+            spa::pod::Property {
+                key: SPA_PARAM_BUFFERS_dataType,
+                flags: spa::pod::PropertyFlags::MANDATORY,
+                value: spa::pod::Value::Int(data_type as i32),
+            },
+        ],
+    };
+    spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &spa::pod::Value::Object(obj),
+    )
+    .expect("serialize Buffers pod")
     .0
     .into_inner()
 }
@@ -334,6 +400,7 @@ fn pipewire_run(
         tx,
         format: VideoInfoRaw::new(),
         have_format: false,
+        logged_non_dmabuf: false,
     };
 
     let _listener = stream
@@ -373,10 +440,18 @@ fn pipewire_run(
                 return;
             }
             let data = &mut datas[0];
-            if data.type_() != spa::buffer::DataType::DmaBuf {
-                // the portal gave us a memfd/memptr buffer: not zero-copy, and
-                // this source only speaks dmabuf — log once and skip
-                log::debug!("[portal] non-dmabuf buffer ({:?}); skipping", data.type_());
+            if data.type_() != DataType::DmaBuf {
+                // the portal gave us a memfd/memptr buffer: this source only
+                // speaks dmabuf (log once, not per frame)
+                if !state.logged_non_dmabuf {
+                    state.logged_non_dmabuf = true;
+                    log::warn!(
+                        "[portal] stream is delivering {:?} buffers, not dmabuf; \
+                         skipping frames (the modifier/Buffers negotiation did not \
+                         get us a dmabuf)",
+                        data.type_()
+                    );
+                }
                 return;
             }
             let fd = data.fd();
@@ -389,9 +464,12 @@ fn pipewire_run(
         .register()
         .context("register pipewire stream listener")?;
 
-    let pod_bytes = enum_format_pod();
-    let pod = Pod::from_bytes(&pod_bytes).ok_or_else(|| anyhow!("invalid EnumFormat pod"))?;
-    let mut params = [pod];
+    let fmt_bytes = enum_format_pod();
+    let buf_bytes = buffers_pod();
+    let fmt_pod =
+        Pod::from_bytes(&fmt_bytes).ok_or_else(|| anyhow!("invalid EnumFormat pod"))?;
+    let buf_pod = Pod::from_bytes(&buf_bytes).ok_or_else(|| anyhow!("invalid Buffers pod"))?;
+    let mut params = [fmt_pod, buf_pod];
     stream
         .connect(
             spa::utils::Direction::Input,
