@@ -187,7 +187,7 @@ nvidia-drm) is in [`DEBUG.md`](DEBUG.md#4-capture-sync--handover-investigation).
 
 ### 5.1 Slots and flow control
 
-The client allocates `--frame-slots` (default 3) receive slots of the codec's
+The client allocates `--frame-slots` (default 5) receive slots of the codec's
 worst-case size, registers them as memory regions, and advertises
 `{rkey, addr, len}` per slot in `Buffers`. The server posts one RDMA WRITE
 (single SGE) per frame into a slot, with the immediate word encoding
@@ -259,21 +259,30 @@ flow-control window (§5.1) is that lever: too small and the pipeline stalls (th
 rate drops below the source); too large and it queues (latency creeps).
 
 The right size is the **bandwidth-delay product counted in frames**. The server
-measures the send -> client-credit *turnaround* (an EMA; it already includes the
-client's decode and its wait for the next present) and the **source** frame
-*period* (the capture cadence), and sets
+measures the send -> client-credit *turnaround* (the **max over the last 16
+credits**; it already includes the client's decode and its wait for the next
+present) and the **source** frame *period* (the capture cadence), and sets
 
 ```
 window = ceil(turnaround / source_period)   # floored at 1, capped at --frame-slots
 ```
 
-The source period is a **low percentile (p25) of a sliding window of capture
-intervals**, not an EMA of them: the raw interval is bimodal — the trace
+The turnaround is a **windowed max, not an EMA**: the window must cover the
+worst case to avoid stalling, but a mean under-reports the tail. The 16-credit
+bound is what keeps a one-off stall (a retransmit, a scheduling hiccup) from
+pinning latency high indefinitely — the same reason the ring jitter target is
+bounded.
+
+The source period is the **minimum of a sliding window of capture intervals**,
+not an EMA or a higher percentile: the raw interval is bimodal — the trace
 reader's scheduling jitter on the short side, and the compositor's
 damage-driven idle gaps on the long side — so an EMA wobbled between ~16 and
-~155 ms and made the window oscillate 1..3. The percentile rejects both tails
-and tracks the *active* frame period (the rate the pipeline must sustain during
-a burst).
+~155 ms and made the window oscillate 1..3. A higher percentile instead follows
+the *achieved* cadence, which is self-limiting. The minimum is the fastest flip,
+i.e. the display period, which is the right denominator. It is then **floored at
+the output's frame period** (`display::Mode::period_us`): a sub-vblank interval
+is a measurement artifact (two `t0` reads close together), not a real flip, and
+letting it through shrinks the period and inflates the window.
 
 The denominator must be the *source* period, **never the send interval**. The
 send interval is a consequence of the window — in steady state

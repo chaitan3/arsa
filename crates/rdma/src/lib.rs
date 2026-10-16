@@ -382,6 +382,11 @@ extern "C" {
     fn ioctl(fd: i32, request: u64, ...) -> i32;
 }
 
+/// How many recent send -> credit turnarounds the windowed max keeps. Bounds
+/// how long a one-off stall (a retransmit, a scheduling hiccup) can hold the
+/// flow-control window — and therefore latency — high.
+const TURNAROUND_WINDOW: usize = 16;
+
 pub struct ServerLink {
     /// credits arrive from the control-reader thread, each timestamped when the
     /// reader received it (so the measured turnaround excludes our own loop
@@ -412,8 +417,12 @@ pub struct ServerLink {
     inflight: usize,
     /// send time (unix µs) of each un-credited frame, FIFO-paired with credits
     send_times: VecDeque<u64>,
-    /// EMA of the send -> credit turnaround (µs): how long the client takes to
-    /// consume a frame and release it (link + decode + present + link)
+    /// recent send -> credit turnarounds (µs), FIFO-bounded to
+    /// `TURNAROUND_WINDOW`; the *max* over this window sizes the flow-control
+    /// window (worst case, but bounded so one stall cannot pin latency forever)
+    turnaround_recent: VecDeque<u64>,
+    /// max of `turnaround_recent` (µs): how long the client takes to consume a
+    /// frame and release it (link + decode + present + link); 0 until measured
     turnaround_us: u64,
     /// EMA of the interval between sends (µs): the source frame period
     send_interval_us: u64,
@@ -635,6 +644,7 @@ impl ServerLink {
             inflight: 0,
             send_times: VecDeque::new(),
             turnaround_us: 0,
+            turnaround_recent: VecDeque::new(),
             send_interval_us: 0,
             last_send_us: 0,
             last_sent_bytes: 0,
@@ -682,9 +692,12 @@ impl ServerLink {
         self.window
     }
 
-    /// EMA of the send -> credit turnaround (µs); 0 until measured. That is how
-    /// long the client takes to consume a frame and release it, so it already
-    /// contains the client's decode and its wait for the next present.
+    /// Max send -> credit turnaround over the last `TURNAROUND_WINDOW` credits
+    /// (µs); 0 until measured. That is how long the client takes to consume a
+    /// frame and release it, so it already contains the client's decode and its
+    /// wait for the next present. The *max* (not a mean) is what the window must
+    /// cover to avoid stalling, and the window bound keeps a one-off stall from
+    /// inflating latency indefinitely.
     pub fn turnaround_us(&self) -> u64 {
         self.turnaround_us
     }
@@ -749,7 +762,15 @@ impl ServerLink {
         }
         self.inflight = self.inflight.saturating_sub(1);
         if let Some(t0) = self.send_times.pop_front() {
-            self.turnaround_us = ema(self.turnaround_us, at_us.saturating_sub(t0));
+            let dt = at_us.saturating_sub(t0);
+            if dt > 0 {
+                self.turnaround_recent.push_back(dt);
+                while self.turnaround_recent.len() > TURNAROUND_WINDOW {
+                    self.turnaround_recent.pop_front();
+                }
+                self.turnaround_us =
+                    self.turnaround_recent.iter().copied().max().unwrap_or(0);
+            }
         }
     }
 

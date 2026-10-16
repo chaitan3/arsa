@@ -63,6 +63,17 @@ impl Mode {
             format!("{}x{}", self.w, self.h)
         }
     }
+
+    /// The frame period in µs (0 when the refresh is unknown). This is the
+    /// fastest the output can flip, i.e. the floor for any measured capture
+    /// cadence — a sub-vblank interval is physically impossible.
+    pub fn period_us(&self) -> u64 {
+        if self.refresh_mhz > 0 {
+            1_000_000_000 / self.refresh_mhz as u64
+        } else {
+            0
+        }
+    }
 }
 
 /// A compositor's output control. One instance targets one output: the first

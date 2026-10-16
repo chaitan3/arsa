@@ -26,7 +26,7 @@ fn main() -> Result<()> {
     // explicit server address (flag or first positional); None => 127.0.0.1
     let mut server: Option<String> = None;
     let mut device: Option<String> = None;
-    let mut slots: usize = 3;
+    let mut slots: usize = 5;
     let mut dump: Option<String> = None;
     let mut seconds: Option<u64> = None;
     let mut slot_mem: String = "host".to_string();
@@ -137,10 +137,10 @@ fn main() -> Result<()> {
                 };
             }
             "--help" | "-h" => {
-                println!("usage: rdma-display-client [HOST[:PORT]] [--device mlx5_0] [--frame-slots 3] [--dump frame.ppm] [--seconds N]");
+                println!("usage: rdma-display-client [HOST[:PORT]] [--device mlx5_0] [--frame-slots 5] [--dump frame.ppm] [--seconds N]");
                 println!("  HOST[:PORT]           server address, given as the first positional argument (default host 127.0.0.1; :{DEFAULT_PORT} assumed when the port is omitted)");
                 println!("  -s, --server HOST[:PORT]  same as the positional HOST[:PORT] (either form may be used)");
-                println!("  --frame-slots N       receive slots, each holding one coded frame: sets the receive-buffer pool and the maximum flow-control window (default 3; --slots is accepted as an alias)");
+                println!("  --frame-slots N       receive slots, each holding one coded frame: sets the receive-buffer pool and the maximum flow-control window (default 5; --slots is accepted as an alias)");
                 println!("  --slot-mem host|cuda  receive slots: host = pinned RAM (default); cuda = dormant GPU path");
                 println!("  --cuda-device N       CUDA device ordinal for --slot-mem cuda (default 0)");
                 println!("  --output egl|none     egl = present in a Wayland window (default; needs --slot-mem host); none = headless (e.g. with --dump)");

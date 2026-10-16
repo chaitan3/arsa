@@ -206,7 +206,7 @@ both ends.
 | `--display-output NAME` | DRM connector name for the resolution request (default: the compositor's primary output). Capture picks the first bound plane. |
 | `--audio` / `--no-audio` / `--audio-device SRC` | Audio side-channel (default on; `@DEFAULT_MONITOR@` = default sink). |
 | `--gpu-power off\|p5\|p0\|max\|<sm>[,<mem>]` | Floor NVIDIA clocks (needs root). |
-| `--frame-slots N` | Receive/staging slots, each holding one coded frame; sets the receive-buffer pool and the maximum flow-control window (default 3; `--slots` accepted as an alias). |
+| `--frame-slots N` | Receive/staging slots, each holding one coded frame; sets the receive-buffer pool and the maximum flow-control window (default 5; `--slots` accepted as an alias). |
 | `--idle-metrics N` | Log RSS/CPU every N seconds. |
 | `-v`, `--verbose` | Debug-level logging for the project's crates (per-frame/per-event detail). `RUST_LOG` overrides. |
 

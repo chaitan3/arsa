@@ -84,7 +84,7 @@ fn main() -> Result<()> {
     let mut device: Option<String> = None;
     // the listen address: `--listen ADDR:PORT` or the first positional argument
     let mut listen: Option<String> = None;
-    let mut slots: usize = 3;
+    let mut slots: usize = 5;
     let mut fps: u64 = 0;
     let mut source = "drm".to_string();
     let mut input: Option<String> = None; // None = paired default for the source
@@ -218,7 +218,7 @@ fn main() -> Result<()> {
             }
             "-v" | "--verbose" => verbose = true,
             "--help" | "-h" => {
-                println!("usage: rdma-display-server [ADDR[:PORT]] [--mode capture|testcard] [--device mlx5_0] [--listen 0.0.0.0:4791] [--frame-slots 3] [--fps N]\n  \
+                println!("usage: rdma-display-server [ADDR[:PORT]] [--mode capture|testcard] [--device mlx5_0] [--listen 0.0.0.0:4791] [--frame-slots 5] [--fps N]\n  \
   ADDR[:PORT]  listen address, the same as --listen (default 0.0.0.0:4791; the port defaults to 4791 when omitted)\n  \
   defaults: --mode capture --source drm --fps 0 --codec auto --audio on --capture-sync auto --pace auto (a bare command is a root KMS capture of the host)\n  \
 capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS capture, the host — requires sudo/CAP_SYS_ADMIN, kernel >= 5.8; portal = XDG Desktop Portal ScreenCast over PipeWire — needs a session bus and a portal backend, and needs no root)\n  \
@@ -238,7 +238,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
   --display-control auto|hyprctl|kscreen|none  apply the client's pre-session resolution request (--native / --set-mode) to this compositor's output before capture starts, so the scanout and the session slots match (--source drm; default auto = Hyprland via hyprctl, KDE via kscreen-doctor).\n  \
   --display-output NAME  DRM connector name (e.g. DP-1, HDMI-A-1, eDP-1) to capture and to apply the client's resolution request to (default: the compositor's primary output; with no compositor backend, the first active output).\n  \
   --fps N (capture): pacing cap; 0 = uncapped, consumer-paced by client credits (default 0).\n  \
-  --frame-slots N  receive/staging slots, each holding one coded frame: sets the client's receive-buffer pool and the maximum flow-control window (default 3; --slots is accepted as an alias).\n  \
+  --frame-slots N  receive/staging slots, each holding one coded frame: sets the client's receive-buffer pool and the maximum flow-control window (default 5; --slots is accepted as an alias).\n  \
   --audio | --no-audio [--audio-device my-sink.monitor]  audio side-channel (default on; --no-audio disables): capture the named source's PCM through the pipewire-pulse\n  \
   compat socket (XDG_RUNTIME_DIR must point at the user's session when running under sudo; '@DEFAULT_MONITOR@' = default sink).");
                 return Ok(());
@@ -704,6 +704,11 @@ struct SourcePeriod {
     recent: std::collections::VecDeque<u64>,
     /// low percentile of `recent` (µs); 0 until measured
     estimate_us: u64,
+    /// known output frame period (µs) from the display mode; 0 = unknown. The
+    /// estimate is floored at this: an interval shorter than a vblank is a
+    /// measurement artifact (two `t0` reads close together), not a real flip,
+    /// and letting it through inflates the flow-control window.
+    floor_us: u64,
 }
 
 impl SourcePeriod {
@@ -714,8 +719,14 @@ impl SourcePeriod {
     /// follows the *achieved* cadence, which is self-limiting: a throttled
     /// pipeline reports long intervals, those shrink the flow-control window,
     /// which throttles it further. The minimum floors the window at the display
-    /// period and breaks that loop.
+    /// period and breaks that loop. It is then clamped up to `floor_us` so the
+    /// artifact tail (sub-vblank intervals) cannot shrink the period.
     const PCT: usize = 0;
+
+    /// New estimator anchored on the output's frame period (0 = unknown).
+    fn new(floor_us: u64) -> Self {
+        SourcePeriod { floor_us, ..SourcePeriod::default() }
+    }
 
     /// Feed one captured frame's `t0`.
     fn observe(&mut self, t0: u64) {
@@ -728,7 +739,8 @@ impl SourcePeriod {
                 while self.recent.len() > Self::WINDOW {
                     self.recent.pop_front();
                 }
-                self.estimate_us = Self::percentile(&self.recent, Self::PCT);
+                self.estimate_us =
+                    Self::percentile(&self.recent, Self::PCT).max(self.floor_us);
             }
         }
         self.last_t0 = t0;
@@ -978,14 +990,20 @@ fn run_capture(
     // the mode the session changed away from, put back on disconnect (and on
     // SIGINT/SIGTERM via the shared signal watcher)
     let mut original_mode: Option<display::Mode> = None;
+    // output frame period (µs) from the current mode: the floor for the
+    // measured source period (0 = unknown, e.g. portal/guest sources)
+    let mut mode_period_us: u64 = 0;
     if let Some(c) = display_ctl.as_deref() {
         match c.current() {
-            Ok(m) => log::info!(
-                "[display] {} backend (output {}), current {}",
-                c.name(),
-                c.output().unwrap_or_else(|_| "?".into()),
-                m.label()
-            ),
+            Ok(m) => {
+                mode_period_us = m.period_us();
+                log::info!(
+                    "[display] {} backend (output {}), current {}",
+                    c.name(),
+                    c.output().unwrap_or_else(|_| "?".into()),
+                    m.label()
+                )
+            }
             Err(e) => log::warn!("[display] {} backend; probe failed: {e:#}", c.name()),
         }
         display::install_restore_watcher();
@@ -1109,8 +1127,9 @@ fn run_capture(
     let started = std::time::Instant::now();
     // source frame period, measured from the capture t0s: the denominator for
     // the flow-control window (independent of the window, unlike the send
-    // interval)
-    let mut src_period = SourcePeriod::default();
+    // interval). Floored at the output's frame period so a sub-vblank artifact
+    // cannot shrink it.
+    let mut src_period = SourcePeriod::new(mode_period_us);
     // judder diagnostics: coded bytes of recently sent frames (bounded window)
     let mut coded_sizes: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
     // whether the connected client asked for metrics (Hello::CAP_METRICS); when
@@ -3154,7 +3173,33 @@ mod codec_resolve_tests {
 
 #[cfg(test)]
 mod pace_tests {
-    use super::{pace_window, Pace};
+    use super::{pace_window, Pace, SourcePeriod};
+
+    /// A sub-vblank interval (two `t0` reads close together) must not shrink
+    /// the source period below the output's frame period.
+    #[test]
+    fn source_period_is_floored_at_the_display_period() {
+        let mut sp = SourcePeriod::new(16_667);
+        let mut t0 = 1_000_000u64;
+        sp.observe(t0);
+        t0 += 16_667; // a real 60 Hz flip
+        sp.observe(t0);
+        t0 += 3_000; // a back-to-back artifact
+        sp.observe(t0);
+        t0 += 16_667;
+        sp.observe(t0);
+        assert_eq!(sp.period_us(), 16_667, "artifact must not shrink the period");
+
+        // with no known mode period the raw minimum (the artifact) shows through
+        let mut sp = SourcePeriod::new(0);
+        let mut t0 = 1_000_000u64;
+        sp.observe(t0);
+        t0 += 16_667;
+        sp.observe(t0);
+        t0 += 3_000;
+        sp.observe(t0);
+        assert_eq!(sp.period_us(), 3_000);
+    }
 
     #[test]
     fn latency_mode_is_present_paced() {
