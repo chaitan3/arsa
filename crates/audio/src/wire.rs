@@ -28,13 +28,12 @@ pub const PACKET_BYTES: usize = PACKET_FRAMES as usize * BYTES_PER_FRAME;
 pub const FORMAT_LEN: usize = 20;
 pub const PACKET_HDR_LEN: usize = 16;
 /// Client playout buffer depth (also the pulse `tlength`/`prebuf` target).
-/// This is the *jitter* buffer: it must absorb the link's packet-to-packet
-/// jitter (5 ms packets, ~40-50 ms p95 on a LAN), so a single packet (5 ms)
-/// underruns on any jitter. 50 ms is ~10 packets — enough to ride out the
-/// jitter without adding meaningful latency next to the sink's own buffer
-/// (which is typically far larger). Raise it (or pass `--audio-buffer-ms`) on a
-/// noisier link.
-pub const BUFFER_MS: u32 = 50;
+/// The audio is a separate steady ~200 pkt/s TCP stream, *not* subject to the
+/// video flow-control, so its arrival jitter is small and one packet (5 ms) has
+/// proven sufficient (`ring drops 0` across runs). Note this is not where the
+/// playout latency lives: the sink's own buffer dominates it by an order of
+/// magnitude. Raise it (or pass `--audio-buffer-ms`) only if you hear dropouts.
+pub const BUFFER_MS: u32 = 5;
 
 /// One PCM packet on the wire.
 pub struct AudioPacket {
