@@ -11,9 +11,10 @@
 //!     the bursty write-blocking and keeps TCP drained.
 //!
 //! Under `--metrics` an `Arc<AudioStats>` is threaded through: the reader keeps
-//! each packet's server stamp and the audio thread records the packet's age
-//! when it reaches the sink (see [`super::stats`]). Without it the ring holds
-//! only payloads and no per-packet timing work happens.
+//! each packet's server stamp and the client clock at receive, and the audio
+//! thread records the packet's age when it reaches the sink (see
+//! [`super::stats`]), split into wire (`transport`) and pre-sink backlog
+//! (`ring`). Without it the ring does no per-packet timing work.
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -27,46 +28,82 @@ use super::pulse::{Pulse, SampleSpec};
 use super::stats::AudioStats;
 use super::wire;
 
-/// How much audio the ring holds before it starts dropping the oldest packet.
-/// This is a safety valve for a stalled sink, not the jitter buffer (that is
-/// the pulse `tlength`); it only has to cover the bursty blocking of
-/// `pa_simple_write`, so a few hundred ms is plenty.
-const RING_TARGET_MS: u64 = 200;
+/// The ring's convergence target: after a transient (the server's startup
+/// burst, a scheduling stall) leaves a standing backlog, the playout trims the
+/// oldest packets back to this depth. The ring is the *only* jitter buffer
+/// (the pulse `tlength` is one packet), so a small target still absorbs the
+/// steady ~200 pkt/s arrival; anything deeper is pure added A/V offset.
+const RING_TARGET_MS: u64 = 40;
+/// Hard cap: at this depth the reader starts dropping the oldest packet. It is
+/// a stall guard, never the steady state.
+const RING_MAX_MS: u64 = 200;
+/// Only trim once the backlog exceeds target + this slack, so ordinary jitter
+/// does not cause repeated trims.
+const RING_SLACK_MS: u64 = 20;
+
+fn packets_for(ms: u64) -> usize {
+    let packet_ms = (wire::PACKET_FRAMES as u64 * 1000 / wire::RATE as u64).max(1);
+    (ms / packet_ms).max(1) as usize
+}
 
 fn ring_cap() -> usize {
-    let packet_ms = (wire::PACKET_FRAMES as u64 * 1000 / wire::RATE as u64).max(1);
-    (RING_TARGET_MS / packet_ms).max(8) as usize
+    packets_for(RING_MAX_MS).max(8)
+}
+
+fn ring_target() -> usize {
+    packets_for(RING_TARGET_MS).max(2)
 }
 
 /// Bounded packet queue shared between the socket reader and the audio thread.
-/// Each entry is `(server packetize stamp, PCM payload)`; the stamp is only
-/// consumed under `--metrics`.
+/// Each entry is `(server packetize stamp, client receive stamp, PCM payload)`;
+/// the stamps are only consumed under `--metrics`.
 struct Ring {
-    q: VecDeque<(u64, Vec<u8>)>,
+    q: VecDeque<(u64, u64, Vec<u8>)>,
     /// Set by the reader when the connection ends; the error to surface.
     closed: Option<String>,
     dropped: u64,
+    trimmed: u64,
 }
 
 impl Ring {
     fn new() -> Self {
-        Ring { q: VecDeque::new(), closed: None, dropped: 0 }
+        Ring { q: VecDeque::new(), closed: None, dropped: 0, trimmed: 0 }
     }
 
     /// Push a packet, dropping the oldest when full. Returns true if a packet
     /// was dropped, so the caller can log/count it.
-    fn push(&mut self, host_unix_us: u64, pkt: Vec<u8>) -> bool {
+    fn push(&mut self, host_unix_us: u64, recv_us: u64, pkt: Vec<u8>) -> bool {
         let dropped = self.q.len() >= ring_cap();
         if dropped {
             self.q.pop_front();
             self.dropped += 1;
         }
-        self.q.push_back((host_unix_us, pkt));
+        self.q.push_back((host_unix_us, recv_us, pkt));
         dropped
     }
 
-    fn pop(&mut self) -> Option<(u64, Vec<u8>)> {
+    fn pop(&mut self) -> Option<(u64, u64, Vec<u8>)> {
         self.q.pop_front()
+    }
+
+    /// Converge a standing backlog back to the target: once the queue is deeper
+    /// than target + slack, drop the oldest packets down to the target. The
+    /// playout owns the consumer side, so this is where the offset accumulated
+    /// by a startup burst or a stall is paid back. Returns how many were
+    /// trimmed (0 in steady state).
+    fn trim(&mut self) -> u64 {
+        let limit = ring_target() + packets_for(RING_SLACK_MS);
+        if self.q.len() <= limit {
+            return 0;
+        }
+        let target = ring_target();
+        let mut n = 0;
+        while self.q.len() > target {
+            self.q.pop_front();
+            self.trimmed += 1;
+            n += 1;
+        }
+        n
     }
 
     fn close(&mut self, reason: String) {
@@ -145,9 +182,12 @@ fn reader(
         }
         last_seq = Some(seq);
 
+        // client receive stamp for the e2e split (only under --metrics)
+        let recv_us = if stats.is_some() { wire::unix_now_us() } else { 0 };
+
         let (lock, cv) = &*shared;
         let mut g = lock.lock().unwrap();
-        if g.push(host_us, payload) {
+        if g.push(host_us, recv_us, payload) {
             let d = g.dropped;
             if d == 1 || d % 1000 == 0 {
                 log::debug!("[audio] playback ring overflow: dropped {d} packets");
@@ -230,15 +270,28 @@ fn session(
     // drift instead of on a constant sink latency.
     let mut latency_floor_us: u64 = 0; // 0 = not measured yet
     loop {
-        let (host_us, payload) = {
+        let (host_us, recv_us, payload) = {
             let (lock, cv) = &*shared;
             let mut g = lock.lock().unwrap();
             loop {
-                if let Some(p) = g.pop() {
-                    break p;
-                }
                 if let Some(reason) = g.closed.clone() {
                     return Err(anyhow::anyhow!(reason));
+                }
+                // converge a standing backlog (startup burst / stall) back to
+                // the ring target before taking the next packet
+                let n = g.trim();
+                if n > 0 {
+                    let (d, t) = (g.dropped, g.trimmed);
+                    log::debug!(
+                        "[audio] trimmed {n} packets to converge the ring \
+                         ({t} trimmed, {d} overflow-dropped)"
+                    );
+                    if let Some(s) = &stats {
+                        s.set_trimmed(t);
+                    }
+                }
+                if let Some(p) = g.pop() {
+                    break p;
                 }
                 // 10 s of silence is a warning, not a failure
                 let (g2, _) = cv
@@ -249,16 +302,18 @@ fn session(
         };
         stream.write_all(&payload)?;
         if let Some(s) = &stats {
-            s.record(host_us, wire::unix_now_us());
+            s.record(host_us, recv_us, wire::unix_now_us());
         }
         if Instant::now() > next_report {
             next_report += Duration::from_secs(5);
-            let drops = {
+            let (drops, trimmed) = {
                 let (lock, _) = &*shared;
-                lock.lock().unwrap().dropped
+                let g = lock.lock().unwrap();
+                (g.dropped, g.trimmed)
             };
             if let Some(s) = &stats {
                 s.set_dropped(drops);
+                s.set_trimmed(trimmed);
             }
             match stream.latency_us() {
                 Ok(us) => {
@@ -276,7 +331,7 @@ fn session(
                     if drift_us > 150_000 {
                         log::debug!(
                             "[audio] playout latency {} ms, {} ms above the {}-ms floor, \
-                             flushing to resync (ring drops {drops})",
+                             flushing to resync (ring drops {drops} trims {trimmed})",
                             us / 1000,
                             drift_us / 1000,
                             latency_floor_us / 1000
@@ -286,7 +341,7 @@ fn session(
                     } else {
                         log::debug!(
                             "[audio] playout latency ~{} ms ({} ms above the {}-ms floor; \
-                             ring drops {drops})",
+                             ring drops {drops} trims {trimmed})",
                             us / 1000,
                             drift_us / 1000,
                             latency_floor_us / 1000

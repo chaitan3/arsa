@@ -56,9 +56,11 @@
 //! Audio (`--audio`, the default) is the one stage that cannot be assembled
 //! from same-host spans: the playout thread ages each packet against the
 //! server's stamp using the ping/pong clock offset, so its e2e carries that
-//! estimate's ±rtt/2 error. It is reported next to the video e2e and the
-//! difference — `av` — is the A/V offset to watch (positive = audio lags
-//! video). Both are inert unless metrics are on (see `audio::stats`).
+//! estimate's ±rtt/2 error. The age is split into `xfer` (the wire, carries the
+//! offset error) and `ring` (the client's pre-sink backlog, client-clock only,
+//! so offset-independent); `av` = audio_e2e − video_e2e is the A/V offset to
+//! watch (positive = audio lags video). All inert unless metrics are on (see
+//! `audio::stats`).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -78,8 +80,8 @@ const PRES_ZERO_COPY: u32 = 0x8;
 /// old UI in each dimension), `COLS` columns, `LINES` lines.
 const FONT_SCALE: usize = 2;
 const COLS: usize = 50;
-/// 13 video/session lines + 2 audio lines (e2e + sink/av).
-const LINES: usize = 15;
+/// 13 video/session lines + 3 audio lines (e2e + xfer/ring/sink + av).
+const LINES: usize = 16;
 pub const OVERLAY_W: u32 = ((COLS * 8 + 8) * FONT_SCALE) as u32;
 pub const OVERLAY_H: u32 = ((LINES * 8 + 8) * FONT_SCALE) as u32;
 /// Milliseconds between overlay text refreshes.
@@ -609,26 +611,35 @@ impl Metrics {
             None => format!("session      skipped {}   clock syncing", self.skipped),
         };
         t.push_str(&format!("\n{}", clk));
-        // audio playout: e2e is "server packetize -> speaker" (see audio::stats)
-        // and `av` = audio_e2e - video_e2e (positive = audio lags the video).
-        // Always reserve two lines so the raster size does not shift when
+        // audio playout: e2e is "server packetize -> speaker" (see audio::stats),
+        // split into the wire (`xfer`) and the client's pre-sink backlog
+        // (`ring`); `av` = audio_e2e - video_e2e (positive = audio lags video).
+        // Always reserve three lines so the raster size does not shift when
         // audio is off.
         if let Some(a) = &self.audio {
             let (am, ap) = a.e2e_p50_p95();
             let (aud_m, aud_p) = (am as f64 / 1000.0, ap as f64 / 1000.0);
+            let (xm, rm) = a.split_p50();
             t.push_str(&format!(
                 "\naudio        p50 {:>6.2}   p95 {:>6.2} ms",
                 aud_m, aud_p
             ));
             t.push_str(&format!(
-                "\n  sink {:>5.2}  av {:+7.2} ms  drops {}",
-                a.sink_us() as f64 / 1000.0,
+                "\n  xfer {:>5.2}  ring {:>5.2}  sink {:>5.2}",
+                xm as f64 / 1000.0,
+                rm as f64 / 1000.0,
+                a.sink_us() as f64 / 1000.0
+            ));
+            t.push_str(&format!(
+                "\n  av {:+7.2} ms  drops {}  trim {}",
                 aud_m - e2e_m,
-                a.dropped()
+                a.dropped(),
+                a.trimmed()
             ));
         } else {
             t.push_str("\naudio        (off)");
-            t.push_str("\n  sink    n/a  av     n/a ms");
+            t.push_str("\n  xfer    n/a  ring    n/a  sink    n/a");
+            t.push_str("\n  av     n/a ms  drops 0  trim 0");
         }
         // pad to the line budget so the raster size is stable
         while t.matches('\n').count() < LINES - 1 {
@@ -989,17 +1000,22 @@ mod tests {
         let a = Arc::new(AudioStats::new());
         a.set_clock_offset(0);
         a.set_sink_us(20_000);
-        // 30 ms in flight + 20 ms sink => 50 ms audio e2e
+        // 15 ms wire + 15 ms ring + 20 ms sink => 50 ms audio e2e
         for i in 0..8u64 {
-            a.record(1_000_000 + i, 1_030_000 + i);
+            a.record(1_000_000 + i, 1_015_000 + i, 1_030_000 + i);
         }
         a.set_dropped(21);
+        a.set_trimmed(4);
         m.set_audio_stats(a);
         // one video frame: server span + client span = 4.55 ms
         m.record(1, 10_000, 10_200, 10_500, None);
         m.on_control(ControlEvent::Stamp(stamp(1)));
         let t = m.refresh().expect("text changed");
         assert!(t.contains("audio        p50"), "{t}");
+        // the e2e split: 15 ms on the wire, 15 ms of pre-sink backlog
+        assert!(t.contains("xfer 15.00"), "{t}");
+        assert!(t.contains("ring 15.00"), "{t}");
+        assert!(t.contains("trim 4"), "{t}");
         // audio (50.00) lags the video (4.55): a positive offset
         assert!(t.contains("av  +45.45"), "{t}");
         for line in t.split('\n') {

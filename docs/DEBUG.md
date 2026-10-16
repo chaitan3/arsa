@@ -63,14 +63,24 @@ analogue of the video's `t0`); the server's capture → packetize latency is the
 one sliver not carried on the wire.
 
 ```
-audio e2e = (write_client - (host_unix_us - clock_offset)) + sink_latency
+transport = recv_client - (host_unix_us - clock_offset)   (the wire)
+ring      = write_client - recv_client                    (pre-sink backlog)
+audio e2e = transport + ring + sink_latency
 av        = audio e2e - video e2e        (positive = audio lags the video)
 ```
 
-Both render in the overlay under `audio` (e2e p50/p95) and `sink` + `av` (sink
-latency, A/V offset, ring drops), and in the 5 s `[metrics]` dump. The whole
-measurement is inert unless `--metrics` is on: the playout thread takes an
-`Option<Arc<AudioStats>>` and does no per-packet work when it is `None`.
+`transport` carries the ping/pong offset error; `ring` is measured on the
+client clock only, so it is offset-independent — the honest pre-sink backlog.
+They render in the overlay under `audio` (e2e p50/p95), `xfer` + `ring` + `sink`,
+and `av` (A/V offset, ring drops and convergence trims), and in the 5 s
+`[metrics]` dump. The whole measurement is inert unless `--metrics` is on: the
+playout thread takes an `Option<Arc<AudioStats>>` and does no per-packet work
+when it is `None`.
+
+Independently of `--metrics`, the playout ring converges to a small target
+(`playback::RING_TARGET_MS`, 40 ms): a transient — the server's startup burst,
+a scheduling stall — that leaves a standing backlog is trimmed back down, so it
+cannot become a permanent A/V offset.
 
 ## 2. Overlays, logs, and diagnostics
 
@@ -82,7 +92,7 @@ user-facing lines — init, connection/disconnect, and feature-disabling failure
 `[tag]` prefix is kept inside the message).
 
 - **`--metrics`** (client): per-stage video latency overlay + clock-sync pings,
-  plus the audio e2e and A/V offset.
+  plus the audio e2e split (xfer/ring/sink) and A/V offset.
 - **`--idle-metrics N`** (server): log RSS/CPU/threads every N seconds.
 - **`--input-test`** (server): synthesize a test input sequence.
 - `RDMA_DISPLAY_LOSSY_DEBUG=1`: verbose lossy dma-buf import diagnostics.
