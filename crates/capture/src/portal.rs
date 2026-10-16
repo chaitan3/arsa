@@ -20,6 +20,7 @@
 //! used, and gamepads are never covered by the portal anyway.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
@@ -77,7 +78,8 @@ pub struct PortalScreenCastSource {
     /// `cursor_mode`; default `CURSOR_EMBEDDED` (the compositor draws the
     /// cursor, matching what the KMS path captures).
     pub cursor_mode: u32,
-    /// A restore token from a previous session (skips the picker dialog).
+    /// An explicit restore token; `None` falls back to the cached one at
+    /// `$XDG_DATA_HOME/rdma-display/portal_token`.
     pub restore_token: Option<String>,
     /// `persist_mode`: 0 = none, 1 = transient, 2 = persistent (default).
     pub persist_mode: u32,
@@ -165,13 +167,20 @@ async fn open_portal_stream(src: &PortalScreenCastSource) -> Result<(u32, OwnedF
         _ => PersistMode::ExplicitlyRevoked,
     };
 
+    // restore a previous selection if we have a token, so the picker only
+    // appears once (an invalid/revoked token is ignored by the portal, which
+    // just shows the dialog again)
+    let restore = src.restore_token.clone().or_else(load_token);
+    if restore.is_some() {
+        log::info!("[portal] restoring the previous ScreenCast selection (cached token)");
+    }
     proxy
         .select_sources(
             &session,
             cursor,
             types,
             false,
-            src.restore_token.as_deref(),
+            restore.as_deref(),
             persist,
         )
         .await
@@ -183,6 +192,10 @@ async fn open_portal_stream(src: &PortalScreenCastSource) -> Result<(u32, OwnedF
         .context("Start")?
         .response()
         .context("Start response")?;
+    // remember the (possibly new) token for the next run
+    if let Some(tok) = response.restore_token() {
+        store_token(tok);
+    }
     let stream = response
         .streams()
         .first()
@@ -196,6 +209,40 @@ async fn open_portal_stream(src: &PortalScreenCastSource) -> Result<(u32, OwnedF
         .context("OpenPipeWireRemote")?;
 
     Ok((node_id, fd, size))
+}
+
+/// Where the ScreenCast restore token is cached between server runs:
+/// `$XDG_DATA_HOME/rdma-display/portal_token` (default `~/.local/share/...`).
+fn token_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
+    Some(base.join("rdma-display").join("portal_token"))
+}
+
+/// The cached restore token, if one was stored and is non-empty.
+fn load_token() -> Option<String> {
+    let p = token_path()?;
+    let s = std::fs::read_to_string(&p).ok()?;
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// Cache the restore token returned by `Start` for the next run (best-effort).
+fn store_token(token: &str) {
+    let Some(p) = token_path() else {
+        return;
+    };
+    if let Some(dir) = p.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            log::debug!("[portal] could not create {}: {e}", dir.display());
+            return;
+        }
+    }
+    match std::fs::write(&p, token) {
+        Ok(()) => log::debug!("[portal] stored the restore token in {}", p.display()),
+        Err(e) => log::debug!("[portal] could not store the restore token: {e}"),
+    }
 }
 
 /// State carried through the PipeWire callbacks (the fixated format + the sink).

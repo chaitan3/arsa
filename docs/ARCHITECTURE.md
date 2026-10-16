@@ -131,8 +131,10 @@ drops its capabilities and calls `prctl(PR_SET_DUMPABLE, 1)` at startup.
 plus a remote fd. The PipeWire stream negotiates raw video and hands us dmabufs,
 wrapped as the same `DmabufScanout` the KMS/QEMU sources produce, so the
 materializer, codecs and transport are unchanged. The compositor draws the
-cursor (`cursor_mode = Embedded`). `restore_token` / `persist_mode` remember the
-user's monitor/window choice so the picker dialog only appears once.
+cursor (`cursor_mode = Embedded`). The `restore_token` returned by `Start` is
+cached in `$XDG_DATA_HOME/rdma-display/portal_token` and replayed on the next
+run (with `persist_mode`), so the picker dialog only appears once — or again
+whenever the token is revoked or the source changes.
 
 It needs a session bus and a portal backend (GNOME, KDE,
 `xdg-desktop-portal-wlr`, `xdg-desktop-portal-hyprland`). The `portal` feature
