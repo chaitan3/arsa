@@ -525,7 +525,8 @@ into an audio e2e and an A/V offset; it is inert without `--metrics`. The
 playout ring is the jitter buffer: its target adapts to the measured arrival
 jitter (capped at 20 ms), trimming a standing backlog left by a startup burst
 or a stall so it does not become a permanent A/V offset. `--audio-align-ms`
-adds an optional audio-only delay for manual A/V alignment (default 0).
+adds an optional audio-only delay for manual A/V alignment (default 0), and
+`--audio-target-clamp-ms` overrides the 20 ms jitter-target cap.
 
 ## 11. Design decisions and limits
 

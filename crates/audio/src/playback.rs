@@ -33,10 +33,11 @@ use super::wire;
 /// The ring is the client's one jitter buffer (the pulse `tlength` stays one
 /// packet), so its depth adapts to the measured arrival jitter: after each
 /// window the target becomes `jitter peak-to-peak + margin`, clamped into this
-/// band. The cap is the latency ceiling the buffer may add; the floor keeps a
-/// couple of packets of headroom even on a perfect link.
+/// band. The floor keeps a couple of packets of headroom even on a perfect
+/// link; the cap is the default latency ceiling the buffer may add
+/// (`--audio-target-clamp-ms` overrides it).
 const RING_JITTER_FLOOR_MS: u64 = 10;
-const RING_JITTER_CAP_MS: u64 = 20;
+pub const RING_JITTER_CAP_MS: u64 = 20;
 const RING_JITTER_MARGIN_MS: u64 = 5;
 /// Packets per jitter-estimate window (~2.6 s at 200 pkt/s).
 const JITTER_WINDOW: u32 = 512;
@@ -68,6 +69,8 @@ struct Ring {
     trimmed: u64,
     /// manual A/V alignment (ms): extra audio delay on top of the jitter target
     align_ms: u64,
+    /// upper clamp on the adaptive jitter target (ms)
+    clamp_ms: u64,
     /// jitter estimate: running range of (recv_client - host) over the window
     jitter_lo: i64,
     jitter_hi: i64,
@@ -77,19 +80,21 @@ struct Ring {
 }
 
 impl Ring {
-    fn new(align_ms: u64) -> Self {
+    fn new(align_ms: u64, clamp_ms: u64) -> Self {
+        let clamp_ms = clamp_ms.max(RING_JITTER_FLOOR_MS);
         Ring {
             q: VecDeque::new(),
             closed: None,
             dropped: 0,
             trimmed: 0,
             align_ms,
+            clamp_ms,
             jitter_lo: i64::MAX,
             jitter_hi: i64::MIN,
             jitter_n: 0,
             // start at the cap and adapt down, so the first window is never
             // shallower than the link turns out to need
-            jitter_ms: RING_JITTER_CAP_MS,
+            jitter_ms: clamp_ms,
         }
     }
 
@@ -104,7 +109,7 @@ impl Ring {
         if self.jitter_n >= JITTER_WINDOW {
             let p2p_ms = (self.jitter_hi - self.jitter_lo).max(0) as u64 / 1000;
             self.jitter_ms = (p2p_ms + RING_JITTER_MARGIN_MS)
-                .clamp(RING_JITTER_FLOOR_MS, RING_JITTER_CAP_MS);
+                .clamp(RING_JITTER_FLOOR_MS, self.clamp_ms);
             self.jitter_lo = i64::MAX;
             self.jitter_hi = i64::MIN;
             self.jitter_n = 0;
@@ -164,9 +169,15 @@ impl Ring {
 /// Retry loop wrapper — an audio session failure never takes down video;
 /// we log once per failure and reconnect. `stats` is `Some` only under
 /// `--metrics`.
-pub fn run(addr: std::net::SocketAddr, buffer_ms: u32, align_ms: u32, stats: Option<Arc<AudioStats>>) {
+pub fn run(
+    addr: std::net::SocketAddr,
+    buffer_ms: u32,
+    align_ms: u32,
+    clamp_ms: u32,
+    stats: Option<Arc<AudioStats>>,
+) {
     loop {
-        match session(addr, buffer_ms, align_ms, stats.clone()) {
+        match session(addr, buffer_ms, align_ms, clamp_ms, stats.clone()) {
             Ok(()) => unreachable!("audio session loop returned"),
             Err(e) => {
                 log::info!("[audio] session ended: {e:#}; reconnecting in 2 s");
@@ -264,6 +275,7 @@ fn session(
     addr: std::net::SocketAddr,
     buffer_ms: u32,
     align_ms: u32,
+    clamp_ms: u32,
     stats: Option<Arc<AudioStats>>,
 ) -> Result<()> {
     let mut sock = TcpStream::connect(addr).with_context(|| format!("audio connect {addr}"))?;
@@ -295,7 +307,10 @@ fn session(
         buffer_ms
     );
 
-    let shared = Arc::new((Mutex::new(Ring::new(align_ms as u64)), Condvar::new()));
+    let shared = Arc::new((
+        Mutex::new(Ring::new(align_ms as u64, clamp_ms as u64)),
+        Condvar::new(),
+    ));
     let reader_shared = shared.clone();
     let reader_sock = sock.try_clone().context("clone audio socket for the reader")?;
     let reader_stats = stats.clone();
@@ -356,10 +371,10 @@ fn session(
         }
         if Instant::now() > next_report {
             next_report += Duration::from_secs(5);
-            let (drops, trimmed, jitter_ms, align_ms) = {
+            let (drops, trimmed, jitter_ms, align_ms, clamp_ms) = {
                 let (lock, _) = &*shared;
                 let g = lock.lock().unwrap();
-                (g.dropped, g.trimmed, g.jitter_ms, g.align_ms)
+                (g.dropped, g.trimmed, g.jitter_ms, g.align_ms, g.clamp_ms)
             };
             if let Some(s) = &stats {
                 s.set_dropped(drops);
@@ -383,8 +398,8 @@ fn session(
                     if drift_us > 150_000 {
                         log::debug!(
                             "[audio] playout latency {} ms, {} ms above the {}-ms floor, \
-                             flushing to resync (ring jitter {jitter_ms}ms align {align_ms}ms \
-                             drops {drops} trims {trimmed})",
+                             flushing to resync (ring jitter {jitter_ms}ms clamp {clamp_ms}ms \
+                             align {align_ms}ms drops {drops} trims {trimmed})",
                             us / 1000,
                             drift_us / 1000,
                             latency_floor_us / 1000
@@ -394,7 +409,7 @@ fn session(
                     } else {
                         log::debug!(
                             "[audio] playout latency ~{} ms ({} ms above the {}-ms floor; \
-                             ring jitter {jitter_ms}ms align {align_ms}ms drops {drops} trims {trimmed})",
+                             ring jitter {jitter_ms}ms clamp {clamp_ms}ms align {align_ms}ms drops {drops} trims {trimmed})",
                             us / 1000,
                             drift_us / 1000,
                             latency_floor_us / 1000

@@ -82,8 +82,8 @@ its depth adapts to the measured arrival jitter (`recv_client - host_unix`
 peak-to-peak over a ~2.6 s window, `playback::Ring::observe`), clamped to
 10–20 ms, and a transient that leaves a standing backlog is trimmed back to it.
 `--audio-align-ms` adds a manual, audio-only delay on top for A/V alignment
-(default 0); the overlay shows the adaptive target as `jit` and the delay as
-`align`.
+(default 0) and `--audio-target-clamp-ms` overrides the 20 ms cap; the overlay
+shows the adaptive target as `jit` and the delay as `align`.
 
 ## 2. Overlays, logs, and diagnostics
 

@@ -226,6 +226,7 @@ both ends.
 | `--slot-mem host\|cuda` | Receive memory (`host` = pinned RAM, the production path). |
 | `--audio` / `--no-audio` / `--audio-buffer-ms N` | Audio playback (default on). |
 | `--audio-align-ms N` | Extra audio-only delay for manual A/V alignment (default 0; the ring jitter buffer adapts to measured jitter, capped at 20 ms). |
+| `--audio-target-clamp-ms N` | Upper clamp on the adaptive ring jitter target (default 20 ms). |
 | `--no-controller` / `--no-controller-grab` / `--fake-gamepad` | Gamepad forwarding. |
 | `--seconds N` / `--dump FILE` | Headless capture to a PPM for debugging. |
 | `-v`, `--verbose` | Debug-level logging for the project's crates (per-frame/per-event detail). `RUST_LOG` overrides. |
