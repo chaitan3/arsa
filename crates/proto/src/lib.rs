@@ -24,6 +24,10 @@ pub const TAG_VIDEO: u8 = 0x04;
 
 /// `Hello::caps` bit: this side can use an RDMA (ibverbs/RoCE) video transport.
 pub const CAP_RDMA: u8 = 0x01;
+/// `Hello::caps` bit: the client is collecting latency/judder metrics
+/// (`--metrics`), so the server should produce its diagnostic fields too. With
+/// it clear the server does no per-frame diagnostic work at all.
+pub const CAP_METRICS: u8 = 0x02;
 
 /// `Hello::codec_pref` sentinel: the client has no codec preference (the server
 /// picks). A value in `0..=2` is a `rdma_display_codec` id (`raw`/`lossless`/

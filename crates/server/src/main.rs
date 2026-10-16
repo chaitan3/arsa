@@ -394,7 +394,7 @@ fn run_testcard_server(
         let rumble_hub = rdma_display_proto::gamepad::RumbleHub::new();
         // negotiate Hello + the display-mode request, then reply (testcard has
         // a fixed 1280x800 geometry, so a request is a no-op here)
-        let (mut conn, neg, _mode, _codec_pref, _lossy_mbps) = rdma_display_rdma::handshake_server(
+        let (mut conn, neg, _mode, _codec_pref, _lossy_mbps, _client_caps) = rdma_display_rdma::handshake_server(
             stream,
             rdma_display_rdma::random_nonce(),
             transport,
@@ -1109,6 +1109,9 @@ fn run_capture(
     let mut src_period = SourcePeriod::default();
     // judder diagnostics: coded bytes of recently sent frames (bounded window)
     let mut coded_sizes: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    // whether the connected client asked for metrics (Hello::CAP_METRICS); when
+    // false the server does no per-frame diagnostic work at all
+    let mut client_metrics = false;
     // throttle for the periodic pacing log (the turnaround is otherwise only
     // logged when the window changes, so it was invisible after startup)
     let mut last_pace_log = std::time::Instant::now();
@@ -1172,6 +1175,7 @@ fn run_capture(
                 session_connected_at = None;
                 first_scanout_logged = false;
                 coded_sizes.clear();
+                client_metrics = false;
                 log::info!("[server] session ended; pipeline idle");
             }
             // put the display mode back if a session changed it (also covers a
@@ -1204,17 +1208,24 @@ fn run_capture(
                 // judder diagnostics: in-flight count, coded frame size, and the
                 // kernel send-queue depth on the TCP video socket (a growing
                 // sockout ⇒ the link, not the pacing loop, is the bottleneck)
-                let inflight = link.inflight();
-                let (c50, c95) = percentile_kib(&coded_sizes);
-                let sockout = match link.video_outq_bytes() {
-                    Some(b) => format!("{} KiB", b / 1024),
-                    None => "n/a".to_string(),
-                };
-                log::debug!(
-                    "[server] pacing {pace:?}: window {applied} of max {max} \
-                     (turnaround {t} us, source period {src} us, send interval {iv} us) \
-                     | inflight {inflight} | coded p50 {c50} KiB p95 {c95} KiB | sockout {sockout}"
-                );
+                if client_metrics {
+                    let inflight = link.inflight();
+                    let (c50, c95) = percentile_kib(&coded_sizes);
+                    let sockout = match link.video_outq_bytes() {
+                        Some(b) => format!("{} KiB", b / 1024),
+                        None => "n/a".to_string(),
+                    };
+                    log::debug!(
+                        "[server] pacing {pace:?}: window {applied} of max {max} \
+                         (turnaround {t} us, source period {src} us, send interval {iv} us) \
+                         | inflight {inflight} | coded p50 {c50} KiB p95 {c95} KiB | sockout {sockout}"
+                    );
+                } else {
+                    log::debug!(
+                        "[server] pacing {pace:?}: window {applied} of max {max} \
+                         (turnaround {t} us, source period {src} us, send interval {iv} us)"
+                    );
+                }
             }
         }
 
@@ -1416,7 +1427,7 @@ fn run_capture(
                 // no mid-session resize and no reconnect.
                 let peer = stream.peer_addr()?;
                 let nonce = rdma_display_rdma::random_nonce();
-                let (mut conn, neg, mode_req, client_codec_pref, client_lossy_mbps) =
+                let (mut conn, neg, mode_req, client_codec_pref, client_lossy_mbps, client_caps) =
                     match rdma_display_rdma::handshake_server(
                         stream,
                         nonce,
@@ -1439,6 +1450,13 @@ fn run_capture(
                 if let Err(e) = rdma_display_rdma::send_mode_reply(&mut conn, &reply) {
                     log::warn!("[server] mode reply failed ({peer}): {e:#}");
                     continue;
+                }
+                // the client's metrics flag (Hello::CAP_METRICS) gates the
+                // server-side diagnostics, so a normal run does none of the
+                // per-frame diagnostic work
+                client_metrics = client_caps & rdma_display_proto::CAP_METRICS != 0;
+                if client_metrics {
+                    log::debug!("[server] client requested metrics (server diagnostics on)");
                 }
                 // re-probe the DRM scanout so the slots match the mode now in
                 // effect (also catches an external change since preflight). The
@@ -1854,7 +1872,9 @@ fn run_capture(
                     Ok(Some(seq)) => {
                         frame_dirty = false;
                         last_send = Some(std::time::Instant::now());
-                        push_bounded(&mut coded_sizes, link.last_sent_bytes(), 256);
+                        if client_metrics {
+                            push_bounded(&mut coded_sizes, link.last_sent_bytes(), 256);
+                        }
                         log::debug!("[server] frame {} sent", seq);
                         if seq == 0 {
                             log::debug!(
@@ -1937,7 +1957,9 @@ fn run_capture(
                 ) {
                     Ok(Some(seq)) => {
                         last_send = Some(std::time::Instant::now());
-                        push_bounded(&mut coded_sizes, link.last_sent_bytes(), 256);
+                        if client_metrics {
+                            push_bounded(&mut coded_sizes, link.last_sent_bytes(), 256);
+                        }
                         log::debug!("[server] frame {} sent", seq);
                         if seq == 0 {
                             if let Some(t) = session_connected_at {

@@ -187,7 +187,7 @@ fn hello_server<T: std::io::Read + std::io::Write>(
     session_nonce: u64,
     pref: TransportPref,
     server_has_rdma: bool,
-) -> Result<(Transport, u8, u16)> {
+) -> Result<(Transport, u8, u16, u8)> {
     let ch = match conn.recv()? {
         Message::Hello(h) if h.magic == proto::MAGIC => h,
         other => return Err(anyhow!("expected Hello, got {other:?}")),
@@ -223,7 +223,7 @@ fn hello_server<T: std::io::Read + std::io::Write>(
         codec_pref: proto::CODEC_ANY, // ignored in the reply
         lossy_mbps: 0,                // ignored in the reply
     }))?;
-    Ok((transport, ch.codec_pref, ch.lossy_mbps))
+    Ok((transport, ch.codec_pref, ch.lossy_mbps, ch.caps))
 }
 
 fn endpoint_exchange<T: std::io::Read + std::io::Write>(
@@ -338,9 +338,9 @@ pub fn handshake_server(
     session_nonce: u64,
     pref: TransportPref,
     server_has_rdma: bool,
-) -> Result<(Conn<TcpStream>, Transport, proto::ModeRequest, u8, u16)> {
+) -> Result<(Conn<TcpStream>, Transport, proto::ModeRequest, u8, u16, u8)> {
     let mut conn = Conn::new(stream);
-    let (transport, codec_pref, lossy_mbps) =
+    let (transport, codec_pref, lossy_mbps, client_caps) =
         hello_server(&mut conn, session_nonce, pref, server_has_rdma)?;
     log::info!(
         "[rdma] video transport: {}{}",
@@ -354,7 +354,7 @@ pub fn handshake_server(
         Message::SetMode(r) => r,
         other => anyhow::bail!("expected SetMode, got {other:?}"),
     };
-    Ok((conn, transport, req, codec_pref, lossy_mbps))
+    Ok((conn, transport, req, codec_pref, lossy_mbps, client_caps))
 }
 
 /// Send the display-mode result to the client. Called after the mode has been
@@ -1461,6 +1461,7 @@ fn spawn_video_reader(
     frame_tx: mpsc::Sender<(u64, Vec<u8>)>,
     recycle_rx: mpsc::Receiver<Vec<u8>>,
     stats: std::sync::Arc<VideoReaderStats>,
+    metrics: bool,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("video-reader".into())
@@ -1497,8 +1498,11 @@ fn spawn_video_reader(
                 if std::io::Read::read_exact(&mut stream, &mut buf).is_err() {
                     break;
                 }
-                // arrival stamped after the payload lands in memory
-                stats.observe(proto::unix_now_us(), stalled);
+                // arrival stamped after the payload lands in memory (only when
+                // the client is collecting metrics — no per-frame work otherwise)
+                if metrics {
+                    stats.observe(proto::unix_now_us(), stalled);
+                }
                 if frame_tx.send((seq, buf)).is_err() {
                     break;
                 }
@@ -1526,6 +1530,7 @@ impl ClientLink {
             proto::ModeRequest::Keep,
             proto::CODEC_ANY,
             0,
+            false,
         )
     }
 
@@ -1546,6 +1551,7 @@ impl ClientLink {
         mode: proto::ModeRequest,
         codec_pref: u8,
         lossy_mbps: u16,
+        metrics: bool,
     ) -> Result<ClientLink> {
         // split the stream: the frame/metrics reader gets the receive half as
         // its own clone; the link's conn keeps doing client→server sends
@@ -1554,11 +1560,14 @@ impl ClientLink {
         let mut conn = Conn::new(stream);
 
         // handshake: advertise our RDMA capability, learn the server's choice
-        let caps = if pref == TransportPref::Tcp || rdma.is_none() {
+        let mut caps = if pref == TransportPref::Tcp || rdma.is_none() {
             0
         } else {
             proto::CAP_RDMA
         };
+        if metrics {
+            caps |= proto::CAP_METRICS;
+        }
         let (session_nonce, server_caps) = hello_client(&mut conn, caps, codec_pref, lossy_mbps)?;
         let transport = if server_caps & proto::CAP_RDMA != 0 {
             Transport::Rdma
@@ -1727,7 +1736,8 @@ impl ClientLink {
                     .context("send TAG_VIDEO")?;
                 let (frame_tx, frame_rx) = mpsc::channel();
                 let (recycle_tx, recycle_rx) = mpsc::channel();
-                let reader = spawn_video_reader(s, slot_len, slots, frame_tx, recycle_rx, video_reader.clone());
+                let reader =
+                    spawn_video_reader(s, slot_len, slots, frame_tx, recycle_rx, video_reader.clone(), metrics);
                 Rx::Tcp {
                     frame_rx,
                     recycle_tx,
