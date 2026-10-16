@@ -9,6 +9,11 @@
 //!     `pa_simple_write`. The pulse buffer (`tlength`/`prebuf` =
 //!     `--audio-buffer-ms`) remains the jitter buffer; the ring only absorbs
 //!     the bursty write-blocking and keeps TCP drained.
+//!
+//! Under `--metrics` an `Arc<AudioStats>` is threaded through: the reader keeps
+//! each packet's server stamp and the audio thread records the packet's age
+//! when it reaches the sink (see [`super::stats`]). Without it the ring holds
+//! only payloads and no per-packet timing work happens.
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -19,6 +24,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use super::pulse::{Pulse, SampleSpec};
+use super::stats::AudioStats;
 use super::wire;
 
 /// How much audio the ring holds before it starts dropping the oldest packet.
@@ -33,8 +39,10 @@ fn ring_cap() -> usize {
 }
 
 /// Bounded packet queue shared between the socket reader and the audio thread.
+/// Each entry is `(server packetize stamp, PCM payload)`; the stamp is only
+/// consumed under `--metrics`.
 struct Ring {
-    q: VecDeque<Vec<u8>>,
+    q: VecDeque<(u64, Vec<u8>)>,
     /// Set by the reader when the connection ends; the error to surface.
     closed: Option<String>,
     dropped: u64,
@@ -47,17 +55,17 @@ impl Ring {
 
     /// Push a packet, dropping the oldest when full. Returns true if a packet
     /// was dropped, so the caller can log/count it.
-    fn push(&mut self, pkt: Vec<u8>) -> bool {
+    fn push(&mut self, host_unix_us: u64, pkt: Vec<u8>) -> bool {
         let dropped = self.q.len() >= ring_cap();
         if dropped {
             self.q.pop_front();
             self.dropped += 1;
         }
-        self.q.push_back(pkt);
+        self.q.push_back((host_unix_us, pkt));
         dropped
     }
 
-    fn pop(&mut self) -> Option<Vec<u8>> {
+    fn pop(&mut self) -> Option<(u64, Vec<u8>)> {
         self.q.pop_front()
     }
 
@@ -69,10 +77,11 @@ impl Ring {
 }
 
 /// Retry loop wrapper — an audio session failure never takes down video;
-/// we log once per failure and reconnect.
-pub fn run(addr: std::net::SocketAddr, buffer_ms: u32) {
+/// we log once per failure and reconnect. `stats` is `Some` only under
+/// `--metrics`.
+pub fn run(addr: std::net::SocketAddr, buffer_ms: u32, stats: Option<Arc<AudioStats>>) {
     loop {
-        match session(addr, buffer_ms) {
+        match session(addr, buffer_ms, stats.clone()) {
             Ok(()) => unreachable!("audio session loop returned"),
             Err(e) => {
                 log::info!("[audio] session ended: {e:#}; reconnecting in 2 s");
@@ -92,7 +101,11 @@ fn close(shared: &Arc<(Mutex<Ring>, Condvar)>, reason: String) {
 /// Socket reader: read header + payload, check seq order, push to the ring.
 /// It never touches pulse, so it keeps draining TCP even while the audio thread
 /// is blocked inside `pa_simple_write`.
-fn reader(mut sock: TcpStream, shared: Arc<(Mutex<Ring>, Condvar)>) {
+fn reader(
+    mut sock: TcpStream,
+    shared: Arc<(Mutex<Ring>, Condvar)>,
+    stats: Option<Arc<AudioStats>>,
+) {
     let mut hdr = [0u8; wire::PACKET_HDR_LEN];
     let mut last_seq: Option<u32> = None;
     loop {
@@ -107,7 +120,7 @@ fn reader(mut sock: TcpStream, shared: Arc<(Mutex<Ring>, Condvar)>) {
             }
             Err(e) => return close(&shared, format!("audio: read packet header: {e}")),
         }
-        let (seq, _host_us, frames) = wire::decode_packet_header(&hdr);
+        let (seq, host_us, frames) = wire::decode_packet_header(&hdr);
         if let Err(e) = wire::frames_plausible(frames) {
             return close(&shared, format!("{e:#} (framing desync; reconnecting)"));
         }
@@ -134,10 +147,13 @@ fn reader(mut sock: TcpStream, shared: Arc<(Mutex<Ring>, Condvar)>) {
 
         let (lock, cv) = &*shared;
         let mut g = lock.lock().unwrap();
-        if g.push(payload) {
+        if g.push(host_us, payload) {
             let d = g.dropped;
             if d == 1 || d % 1000 == 0 {
                 log::debug!("[audio] playback ring overflow: dropped {d} packets");
+            }
+            if let Some(s) = &stats {
+                s.set_dropped(d);
             }
         }
         cv.notify_one();
@@ -155,7 +171,11 @@ impl Drop for SocketGuard {
     }
 }
 
-fn session(addr: std::net::SocketAddr, buffer_ms: u32) -> Result<()> {
+fn session(
+    addr: std::net::SocketAddr,
+    buffer_ms: u32,
+    stats: Option<Arc<AudioStats>>,
+) -> Result<()> {
     let mut sock = TcpStream::connect(addr).with_context(|| format!("audio connect {addr}"))?;
     sock.set_nodelay(true)?;
     // idle tolerance: a silent monitor delivers nothing for as long as the
@@ -188,21 +208,29 @@ fn session(addr: std::net::SocketAddr, buffer_ms: u32) -> Result<()> {
     let shared = Arc::new((Mutex::new(Ring::new()), Condvar::new()));
     let reader_shared = shared.clone();
     let reader_sock = sock.try_clone().context("clone audio socket for the reader")?;
+    let reader_stats = stats.clone();
     std::thread::Builder::new()
         .name("audio-reader".into())
-        .spawn(move || reader(reader_sock, reader_shared))
+        .spawn(move || reader(reader_sock, reader_shared, reader_stats))
         .context("spawn audio reader thread")?;
     // from here the audio thread owns `sock` only to shut it down on exit
     let _sock_guard = SocketGuard(sock);
 
     let mut next_report = Instant::now() + Duration::from_secs(5);
+    // seed the sink latency so the first e2e window is not biased low (it is
+    // otherwise only refreshed at the report interval below)
+    if let Some(s) = &stats {
+        if let Ok(us) = stream.latency_us() {
+            s.set_sink_us(us);
+        }
+    }
     // The sink's own latency is fixed and can be large (a Bluetooth/USB sink, or
     // a pulse `tsched` buffer); only *growth* means the two clocks are drifting.
     // Track the running minimum as the baseline, so the guard fires on real
     // drift instead of on a constant sink latency.
     let mut latency_floor_us: u64 = 0; // 0 = not measured yet
     loop {
-        let payload = {
+        let (host_us, payload) = {
             let (lock, cv) = &*shared;
             let mut g = lock.lock().unwrap();
             loop {
@@ -220,14 +248,23 @@ fn session(addr: std::net::SocketAddr, buffer_ms: u32) -> Result<()> {
             }
         };
         stream.write_all(&payload)?;
+        if let Some(s) = &stats {
+            s.record(host_us, wire::unix_now_us());
+        }
         if Instant::now() > next_report {
             next_report += Duration::from_secs(5);
             let drops = {
                 let (lock, _) = &*shared;
                 lock.lock().unwrap().dropped
             };
+            if let Some(s) = &stats {
+                s.set_dropped(drops);
+            }
             match stream.latency_us() {
                 Ok(us) => {
+                    if let Some(s) = &stats {
+                        s.set_sink_us(us);
+                    }
                     // drift guard: the playout latency should sit at the sink's
                     // own floor. If it grows well above the floor, the two pulse
                     // streams' clocks are drifting apart — flush and re-baseline

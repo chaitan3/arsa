@@ -45,7 +45,8 @@ boxes on a fast link, not a browser-streaming service.
   output to the client's native mode (`--native`) or an explicit `WxH@R`
   (`--set-mode`) before the session starts.
 - **Latency metrics** end-to-end (capture → send → transfer → upload →
-  present → on-screen), with cross-host clock sync.
+  present → on-screen), with cross-host clock sync, plus the audio e2e and the
+  A/V offset (audio vs video latency).
 
 ## Requirements
 
@@ -219,7 +220,7 @@ both ends.
 | `-g`/`--grab` | Start with the input grab on (same as `Ctrl+Alt+G`). |
 | `--native` / `--set-mode WxH[@R]` | Ask the server to change its output resolution. |
 | `--codec auto\|raw\|lossless\|lossy` | Request a codec (honoured under the server's `--codec auto`). Default `auto`: the server picks. |
-| `--metrics` | Latency overlay + clock-sync pings. |
+| `--metrics` | Latency overlay + clock-sync pings, plus audio e2e / A/V offset. |
 | `--scale-filter auto\|nearest\|linear\|cubic\|area` | Letterbox sampler. |
 | `--transport auto\|rdma\|tcp` | Video transport preference. |
 | `--slot-mem host\|cuda` | Receive memory (`host` = pinned RAM, the production path). |

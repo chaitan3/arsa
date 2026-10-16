@@ -23,6 +23,8 @@
 //! Server side: `capture::start_capture` (one supervisor thread, bound to
 //! a sink monitor) + `capture::serve_connection` per audio connection.
 //! Client side: `playback::run` (connect/retry loop + playout thread).
+//! `stats::AudioStats` carries the client-side playout timing used by the
+//! `--metrics` overlay (A/V offset); it is inert when metrics are off.
 //!
 //! TODO(host-play-off): an opt-in server mode that routes host audio into a
 //! virtual sink (PipeWire/PulseAudio `module-null-sink`, e.g. `rdma-display`)
@@ -40,4 +42,5 @@
 pub mod capture;
 pub mod playback;
 pub mod pulse;
+pub mod stats;
 pub mod wire;

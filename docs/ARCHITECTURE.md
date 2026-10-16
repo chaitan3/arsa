@@ -518,6 +518,9 @@ The server captures a PipeWire/Pulse monitor source (default
 client plays it to the default sink with a configurable buffer depth
 (`--audio-buffer-ms`). Running as root uses a setuid helper; the setcap-as-user
 server captures in-process (it needs `XDG_RUNTIME_DIR` + `WAYLAND_DISPLAY`).
+Under `--metrics` the playout thread also records each packet's end-to-end age
+(against the ping/pong clock offset) in `audio::stats`, which the overlay folds
+into an audio e2e and an A/V offset; it is inert without `--metrics`.
 
 ## 11. Design decisions and limits
 

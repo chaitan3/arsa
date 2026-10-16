@@ -52,9 +52,18 @@
 //! tracked for diagnostics, but no *same-host* stage depends on it. Known
 //! honesty limit: without wp_presentation (`display n/a`) the client span
 //! ends at SwapBuffers return, not scanout.
+//!
+//! Audio (`--audio`, the default) is the one stage that cannot be assembled
+//! from same-host spans: the playout thread ages each packet against the
+//! server's stamp using the ping/pong clock offset, so its e2e carries that
+//! estimate's ±rtt/2 error. It is reported next to the video e2e and the
+//! difference — `av` — is the A/V offset to watch (positive = audio lags
+//! video). Both are inert unless metrics are on (see `audio::stats`).
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
+use rdma_display_audio::stats::AudioStats;
 use rdma_display_proto::{FrameStamp, MatKind, MAT_STAGES};
 use rdma_display_rdma::ControlEvent;
 
@@ -69,7 +78,8 @@ const PRES_ZERO_COPY: u32 = 0x8;
 /// old UI in each dimension), `COLS` columns, `LINES` lines.
 const FONT_SCALE: usize = 2;
 const COLS: usize = 50;
-const LINES: usize = 13;
+/// 13 video/session lines + 2 audio lines (e2e + sink/av).
+const LINES: usize = 15;
 pub const OVERLAY_W: u32 = ((COLS * 8 + 8) * FONT_SCALE) as u32;
 pub const OVERLAY_H: u32 = ((LINES * 8 + 8) * FONT_SCALE) as u32;
 /// Milliseconds between overlay text refreshes.
@@ -131,6 +141,8 @@ pub struct Metrics {
     last_refresh: Option<std::time::Instant>,
     last_ping: Option<std::time::Instant>,
     clock: ClockSync,
+    /// audio playout timing (None when audio is off or metrics are off)
+    audio: Option<Arc<AudioStats>>,
     /// whether the presenter bound wp_presentation (display stage meaningful)
     onscreen: bool,
     /// TCP transport: `xfer` does not include the network transit, so the
@@ -198,6 +210,7 @@ impl Metrics {
             last_refresh: None,
             last_ping: None,
             clock: ClockSync::new(),
+            audio: None,
             onscreen: false,
             tcp: false,
             pres_count: 0,
@@ -214,6 +227,12 @@ impl Metrics {
     /// already includes the transit).
     pub fn set_tcp(&mut self, tcp: bool) {
         self.tcp = tcp;
+    }
+
+    /// Attach the audio playout stats. The metrics pushes the clock offset into
+    /// them (on every pong) and folds their e2e into the overlay.
+    pub fn set_audio_stats(&mut self, stats: Arc<AudioStats>) {
+        self.audio = Some(stats);
     }
 
     /// Count one received frame's bytes — the actual bytes the NIC/TCP moved
@@ -268,7 +287,14 @@ impl Metrics {
                 self.stamps.insert(s.seq, s);
                 self.try_match();
             }
-            ControlEvent::Pong { c0, s1, c2 } => self.clock.add(c0, s1, c2),
+            ControlEvent::Pong { c0, s1, c2 } => {
+                self.clock.add(c0, s1, c2);
+                // keep the playout thread's clock estimate fresh, so its
+                // per-packet aging uses the tightest offset we have
+                if let (Some(a), Some(off)) = (&self.audio, self.clock.offset()) {
+                    a.set_clock_offset(off);
+                }
+            }
             // routed to the gamepad rumble player by the caller before this
             ControlEvent::Rumble(_) => {}
             // handled by the presenter (window/meta apply), not metrics
@@ -583,6 +609,27 @@ impl Metrics {
             None => format!("session      skipped {}   clock syncing", self.skipped),
         };
         t.push_str(&format!("\n{}", clk));
+        // audio playout: e2e is "server packetize -> speaker" (see audio::stats)
+        // and `av` = audio_e2e - video_e2e (positive = audio lags the video).
+        // Always reserve two lines so the raster size does not shift when
+        // audio is off.
+        if let Some(a) = &self.audio {
+            let (am, ap) = a.e2e_p50_p95();
+            let (aud_m, aud_p) = (am as f64 / 1000.0, ap as f64 / 1000.0);
+            t.push_str(&format!(
+                "\naudio        p50 {:>6.2}   p95 {:>6.2} ms",
+                aud_m, aud_p
+            ));
+            t.push_str(&format!(
+                "\n  sink {:>5.2}  av {:+7.2} ms  drops {}",
+                a.sink_us() as f64 / 1000.0,
+                aud_m - e2e_m,
+                a.dropped()
+            ));
+        } else {
+            t.push_str("\naudio        (off)");
+            t.push_str("\n  sink    n/a  av     n/a ms");
+        }
         // pad to the line budget so the raster size is stable
         while t.matches('\n').count() < LINES - 1 {
             t.push('\n');
@@ -929,6 +976,34 @@ mod tests {
         for line in t.split('\n') {
             let n = line.chars().count();
             assert!(n <= COLS, "overlay line {n} > {COLS} cols: {line:?}");
+        }
+        assert_eq!(t.matches('\n').count(), LINES - 1);
+    }
+
+    /// The audio block renders the playout e2e and the A/V offset, and keeps
+    /// the overlay within the grid.
+    #[test]
+    fn audio_lines_render_av_offset() {
+        let mut m = Metrics::new();
+        m.set_onscreen(true);
+        let a = Arc::new(AudioStats::new());
+        a.set_clock_offset(0);
+        a.set_sink_us(20_000);
+        // 30 ms in flight + 20 ms sink => 50 ms audio e2e
+        for i in 0..8u64 {
+            a.record(1_000_000 + i, 1_030_000 + i);
+        }
+        a.set_dropped(21);
+        m.set_audio_stats(a);
+        // one video frame: server span + client span = 4.55 ms
+        m.record(1, 10_000, 10_200, 10_500, None);
+        m.on_control(ControlEvent::Stamp(stamp(1)));
+        let t = m.refresh().expect("text changed");
+        assert!(t.contains("audio        p50"), "{t}");
+        // audio (50.00) lags the video (4.55): a positive offset
+        assert!(t.contains("av  +45.45"), "{t}");
+        for line in t.split('\n') {
+            assert!(line.chars().count() <= COLS, "line too wide: {line:?}");
         }
         assert_eq!(t.matches('\n').count(), LINES - 1);
     }

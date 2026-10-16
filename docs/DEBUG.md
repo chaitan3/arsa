@@ -52,6 +52,26 @@ The `material` span is codec-dependent and labelled by `MatKind`
 (`Raw`/`Lossless`/`Lossy`); every codec has a different set of stages inside
 it, so reporting them under one fixed label was misleading.
 
+### Audio (`--audio`, the default)
+
+Audio is the one stage that cannot be assembled from same-host spans: the
+playout thread ages each packet against the server's stamp using the ping/pong
+clock offset, so its figure carries that estimate's ±rtt/2 error — good for
+spotting a systematic A/V offset, not for sub-millisecond claims.
+`host_unix_us` is stamped when the server's capture read returned (the audio
+analogue of the video's `t0`); the server's capture → packetize latency is the
+one sliver not carried on the wire.
+
+```
+audio e2e = (write_client - (host_unix_us - clock_offset)) + sink_latency
+av        = audio e2e - video e2e        (positive = audio lags the video)
+```
+
+Both render in the overlay under `audio` (e2e p50/p95) and `sink` + `av` (sink
+latency, A/V offset, ring drops), and in the 5 s `[metrics]` dump. The whole
+measurement is inert unless `--metrics` is on: the playout thread takes an
+`Option<Arc<AudioStats>>` and does no per-packet work when it is `None`.
+
 ## 2. Overlays, logs, and diagnostics
 
 Both binaries log through `log` + `env_logger`. By default they print the
@@ -61,7 +81,8 @@ user-facing lines — init, connection/disconnect, and feature-disabling failure
 `RUST_LOG=rdma_display_capture=debug`. Output format is `[LEVEL] message` (the
 `[tag]` prefix is kept inside the message).
 
-- **`--metrics`** (client): per-stage latency overlay + clock-sync pings.
+- **`--metrics`** (client): per-stage video latency overlay + clock-sync pings,
+  plus the audio e2e and A/V offset.
 - **`--idle-metrics N`** (server): log RSS/CPU/threads every N seconds.
 - **`--input-test`** (server): synthesize a test input sequence.
 - `RDMA_DISPLAY_LOSSY_DEBUG=1`: verbose lossy dma-buf import diagnostics.

@@ -314,6 +314,12 @@ fn main() -> Result<()> {
             .context("spawn input thread")?;
     }
 
+    // audio timing stats: produced by the playout thread, consumed by the
+    // metrics overlay (audio e2e + A/V offset). Only allocated under
+    // `--metrics`, so a normal run records nothing per packet.
+    let audio_stats = (metrics_on && audio_on)
+        .then(|| std::sync::Arc::new(rdma_display_audio::stats::AudioStats::new()));
+
     // --metrics collector: consumes server Stamps + Pongs via the control
     // reader, samples t3/t4/t5 around the GL calls, pings every PING_SECS
     let mut metrics = metrics_on.then(|| metrics::Metrics::new());
@@ -324,6 +330,9 @@ fn main() -> Result<()> {
     }
     if let Some(m) = metrics.as_mut() {
         m.set_tcp(link.transport() == rdma_display_rdma::Transport::Tcp);
+        if let Some(s) = &audio_stats {
+            m.set_audio_stats(s.clone());
+        }
     }
     let mut last_overlay = Instant::now();
 
@@ -331,9 +340,10 @@ fn main() -> Result<()> {
     // the thread owns its socket outright and retries on its own schedule —
     // a dead audio path never affects video/input
     if audio_on {
+        let stats = audio_stats.clone();
         std::thread::Builder::new()
             .name("audio".into())
-            .spawn(move || rdma_display_audio::playback::run(addr, audio_buffer_ms))
+            .spawn(move || rdma_display_audio::playback::run(addr, audio_buffer_ms, stats))
             .context("spawn audio thread")?;
         log::info!("[audio] client stream connecting ({addr})");
     }
