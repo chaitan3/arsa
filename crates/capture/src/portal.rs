@@ -229,7 +229,11 @@ fn load_token() -> Option<String> {
 }
 
 /// Cache the restore token returned by `Start` for the next run (best-effort).
+/// Written `0600`: it is a credential for the screencast grant.
 fn store_token(token: &str) {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
     let Some(p) = token_path() else {
         return;
     };
@@ -239,7 +243,17 @@ fn store_token(token: &str) {
             return;
         }
     }
-    match std::fs::write(&p, token) {
+    // `mode` applies only at creation, so also chmod — an older file may have
+    // been written with a looser umask
+    let res = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&p)
+        .and_then(|mut f| f.write_all(token.as_bytes()))
+        .and_then(|()| std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)));
+    match res {
         Ok(()) => log::debug!("[portal] stored the restore token in {}", p.display()),
         Err(e) => log::debug!("[portal] could not store the restore token: {e}"),
     }
