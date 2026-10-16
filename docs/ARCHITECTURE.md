@@ -279,10 +279,11 @@ reader's scheduling jitter on the short side, and the compositor's
 damage-driven idle gaps on the long side — so an EMA wobbled between ~16 and
 ~155 ms and made the window oscillate 1..3. A higher percentile instead follows
 the *achieved* cadence, which is self-limiting. The minimum is the fastest flip,
-i.e. the display period, which is the right denominator. It is then **floored at
-the output's frame period** (`display::Mode::period_us`): a sub-vblank interval
-is a measurement artifact (two `t0` reads close together), not a real flip, and
-letting it through shrinks the period and inflates the window.
+i.e. the display period, which is the right denominator. It is then **clamped to
+`[mode_period, 2 × mode_period]`** (`display::Mode::period_us`): a sub-vblank
+interval is a measurement artifact (two `t0` reads close together), not a real
+flip, and letting it through shrinks the period and inflates the window; the
+upper clamp stops a sustained slow/idle source from halving the window.
 
 The denominator must be the *source* period, **never the send interval**. The
 send interval is a consequence of the window — in steady state

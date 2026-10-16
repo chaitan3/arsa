@@ -705,9 +705,10 @@ struct SourcePeriod {
     /// low percentile of `recent` (µs); 0 until measured
     estimate_us: u64,
     /// known output frame period (µs) from the display mode; 0 = unknown. The
-    /// estimate is floored at this: an interval shorter than a vblank is a
-    /// measurement artifact (two `t0` reads close together), not a real flip,
-    /// and letting it through inflates the flow-control window.
+    /// estimate is floored at this — an interval shorter than a vblank is a
+    /// measurement artifact (two `t0` reads close together), not a real flip —
+    /// and capped at twice it, so a sustained slow/idle source cannot halve the
+    /// flow-control window.
     floor_us: u64,
 }
 
@@ -719,9 +720,12 @@ impl SourcePeriod {
     /// follows the *achieved* cadence, which is self-limiting: a throttled
     /// pipeline reports long intervals, those shrink the flow-control window,
     /// which throttles it further. The minimum floors the window at the display
-    /// period and breaks that loop. It is then clamped up to `floor_us` so the
-    /// artifact tail (sub-vblank intervals) cannot shrink the period.
+    /// period and breaks that loop. It is then clamped into
+    /// `[floor_us, 2 * floor_us]` so neither the artifact tail nor a slow
+    /// stretch can move the period far off the display rate.
     const PCT: usize = 0;
+    /// Upper clamp on the estimate, as a multiple of the output period.
+    const MAX_FACTOR: u64 = 2;
 
     /// New estimator anchored on the output's frame period (0 = unknown).
     fn new(floor_us: u64) -> Self {
@@ -739,8 +743,12 @@ impl SourcePeriod {
                 while self.recent.len() > Self::WINDOW {
                     self.recent.pop_front();
                 }
-                self.estimate_us =
-                    Self::percentile(&self.recent, Self::PCT).max(self.floor_us);
+                let p = Self::percentile(&self.recent, Self::PCT);
+                self.estimate_us = if self.floor_us == 0 {
+                    p
+                } else {
+                    p.clamp(self.floor_us, self.floor_us * Self::MAX_FACTOR)
+                };
             }
         }
         self.last_t0 = t0;
@@ -3189,6 +3197,16 @@ mod pace_tests {
         t0 += 16_667;
         sp.observe(t0);
         assert_eq!(sp.period_us(), 16_667, "artifact must not shrink the period");
+
+        // a sustained slow/idle source is capped at 2x the display period
+        let mut sp = SourcePeriod::new(16_667);
+        let mut t0 = 1_000_000u64;
+        sp.observe(t0);
+        for _ in 0..4 {
+            t0 += 40_000;
+            sp.observe(t0);
+        }
+        assert_eq!(sp.period_us(), 33_334, "slow source must not halve the window");
 
         // with no known mode period the raw minimum (the artifact) shows through
         let mut sp = SourcePeriod::new(0);
