@@ -120,6 +120,12 @@ direct-scanout blank-frame failure mode, no root/`CAP_SYS_ADMIN`, and
 `--capture-sync` does not apply (the `settle`/`fence` machinery exists only
 because the KMS path reads a plane mid-flip).
 
+"no root" has a wrinkle: `install.sh` setcaps the binary for `--source drm`, and
+a process carrying file capabilities runs with `suid_dumpable=0` — **non-dumpable**
+— so the portal, which identifies the caller by opening `/proc/<pid>/root`,
+refuses it ("Unable to open /proc/&lt;pid&gt;/root"). The portal path therefore
+drops its capabilities and calls `prctl(PR_SET_DUMPABLE, 1)` at startup.
+
 `org.freedesktop.portal.ScreenCast` (`CreateSession` → `SelectSources` →
 `Start` → `OpenPipeWireRemote`, driven through `ashpd`) yields a PipeWire node id
 plus a remote fd. The PipeWire stream negotiates raw video and hands us dmabufs,

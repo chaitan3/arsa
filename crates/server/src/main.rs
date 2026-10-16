@@ -768,6 +768,79 @@ fn push_bounded(v: &mut std::collections::VecDeque<usize>, x: usize, cap: usize)
     }
 }
 
+// --- capability drop for --source portal ------------------------------------
+
+/// `_LINUX_CAPABILITY_VERSION_3`.
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+/// `prctl(PR_SET_DUMPABLE)`.
+const PR_SET_DUMPABLE: libc::c_long = 4;
+
+/// `__user_cap_header_struct`.
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: i32,
+}
+
+/// `__user_cap_data_struct`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+/// Make the process look like a plain user process for the portal.
+///
+/// `--source portal` is identified by `xdg-desktop-portal` through
+/// `/proc/<pid>/root`. A binary carrying file capabilities (`install.sh`
+/// setcaps `cap_sys_admin` for `--source drm`) executes with `suid_dumpable=0`
+/// — i.e. **non-dumpable** — so the portal, a plain user process without
+/// `CAP_SYS_PTRACE`, cannot read that path and refuses the request
+/// ("Unable to open /proc/<pid>/root"). The portal path needs no capabilities,
+/// so drop them (`capset` to empty) and restore dumpability.
+fn drop_caps_for_portal() -> Result<()> {
+    let hdr = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let data = [CapData::default(); 2];
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            &hdr as *const CapHeader,
+            data.as_ptr(),
+        )
+    };
+    if rc != 0 {
+        // nothing to drop when the binary carries no file capabilities
+        log::debug!(
+            "[server] capset(clear) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    if unsafe {
+        libc::syscall(
+            libc::SYS_prctl,
+            PR_SET_DUMPABLE,
+            1 as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("prctl(PR_SET_DUMPABLE) for --source portal");
+    }
+    log::info!(
+        "[server] --source portal: dropped capabilities and set dumpable \
+         (so the portal can identify the caller)"
+    );
+    Ok(())
+}
+
 /// Build the configured capture source. `--source portal` (XDG Desktop Portal
 /// screen capture over PipeWire) is behind the `portal` feature, so a default
 /// build has no PipeWire dependency.
@@ -829,6 +902,11 @@ fn run_capture(
 ) -> Result<()> {
     if source_name == "drm" && materialize != "egl" && codec != rdma_display_codec::Codec::Lossy {
         bail!("--source drm requires --materialize egl (KMS capture is dmabuf-only)");
+    }
+    if source_name == "portal" {
+        // the portal identifies the caller via /proc/<pid>/root; a setcap'd
+        // binary is non-dumpable, so shed the caps we don't need here
+        drop_caps_for_portal()?;
     }
     // idle/session resource logger (Phase 3 measurement)
     let session_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
