@@ -38,6 +38,9 @@ fn main() -> Result<()> {
     let mut grab = false;
     let mut audio_on = true;
     let mut audio_buffer_ms: u32 = rdma_display_audio::wire::BUFFER_MS;
+    // manual A/V alignment: extra audio-only delay to match a faster video
+    // path (0 = none; the ring jitter buffer adapts on its own)
+    let mut audio_align_ms: u32 = 0;
     let mut controller_on = true;
     let mut controller_grab = true;
     let mut fake_gamepad = false;
@@ -81,6 +84,9 @@ fn main() -> Result<()> {
             "--no-audio" => audio_on = false,
             "--audio-buffer-ms" => {
                 audio_buffer_ms = args.next().expect("--audio-buffer-ms needs a value").parse()?
+            }
+            "--audio-align-ms" => {
+                audio_align_ms = args.next().expect("--audio-align-ms needs a value").parse()?
             }
             "--no-controller" => controller_on = false,
             "--no-controller-grab" => controller_grab = false,
@@ -134,6 +140,7 @@ fn main() -> Result<()> {
                 println!("  -g, --grab            start with the input grab on (keyboard+mouse for the guest; same as Ctrl+Alt+G); default off");
                 println!("  --audio | --no-audio  play the server's audio side-channel (default sink; server captures its own monitor source). Default on; --no-audio disables");
                 println!("  --audio-buffer-ms N   client playout buffer depth / pulse tlength (default {}; lower = less latency, less jitter headroom)", rdma_display_audio::wire::BUFFER_MS);
+                println!("  --audio-align-ms N    extra audio-only delay for manual A/V alignment (default 0; the ring jitter buffer adapts to measured jitter, capped at 20 ms)");
                 println!("  --metrics             per-stage latency overlay (capture, send, transfer, upload, present, on-screen) + clock-sync pings");
                 println!("  -v, --verbose         debug-level logging (per-frame/per-event detail; RUST_LOG overrides)");
                 println!("  --no-controller       don't forward attached gamepads");
@@ -343,7 +350,7 @@ fn main() -> Result<()> {
         let stats = audio_stats.clone();
         std::thread::Builder::new()
             .name("audio".into())
-            .spawn(move || rdma_display_audio::playback::run(addr, audio_buffer_ms, stats))
+            .spawn(move || rdma_display_audio::playback::run(addr, audio_buffer_ms, audio_align_ms, stats))
             .context("spawn audio thread")?;
         log::info!("[audio] client stream connecting ({addr})");
     }

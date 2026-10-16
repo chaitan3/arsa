@@ -6,15 +6,17 @@
 //!     server's sender never backpressures and its mailbox never drops (which
 //!     is what produced the `seq gap` lines);
 //!   * the audio thread (here) that pops the ring and does the blocking
-//!     `pa_simple_write`. The pulse buffer (`tlength`/`prebuf` =
-//!     `--audio-buffer-ms`) remains the jitter buffer; the ring only absorbs
-//!     the bursty write-blocking and keeps TCP drained.
+//!     `pa_simple_write`. The ring *is* the jitter buffer: its depth adapts to
+//!     the measured arrival jitter ([`Ring::observe`]), and it also keeps TCP
+//!     drained while the write blocks. The pulse buffer (`tlength`/`prebuf` =
+//!     `--audio-buffer-ms`) stays minimal.
 //!
 //! Under `--metrics` an `Arc<AudioStats>` is threaded through: the reader keeps
 //! each packet's server stamp and the client clock at receive, and the audio
 //! thread records the packet's age when it reaches the sink (see
 //! [`super::stats`]), split into wire (`transport`) and pre-sink backlog
-//! (`ring`). Without it the ring does no per-packet timing work.
+//! (`ring`). The receive stamp is taken either way — the jitter estimate needs
+//! it — but the per-packet `record` is skipped when metrics are off.
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -28,18 +30,22 @@ use super::pulse::{Pulse, SampleSpec};
 use super::stats::AudioStats;
 use super::wire;
 
-/// The ring's convergence target: after a transient (the server's startup
-/// burst, a scheduling stall) leaves a standing backlog, the playout trims the
-/// oldest packets back to this depth. The ring is the *only* jitter buffer
-/// (the pulse `tlength` is one packet), so a small target still absorbs the
-/// steady ~200 pkt/s arrival; anything deeper is pure added A/V offset.
-const RING_TARGET_MS: u64 = 40;
+/// The ring is the client's one jitter buffer (the pulse `tlength` stays one
+/// packet), so its depth adapts to the measured arrival jitter: after each
+/// window the target becomes `jitter peak-to-peak + margin`, clamped into this
+/// band. The cap is the latency ceiling the buffer may add; the floor keeps a
+/// couple of packets of headroom even on a perfect link.
+const RING_JITTER_FLOOR_MS: u64 = 10;
+const RING_JITTER_CAP_MS: u64 = 20;
+const RING_JITTER_MARGIN_MS: u64 = 5;
+/// Packets per jitter-estimate window (~2.6 s at 200 pkt/s).
+const JITTER_WINDOW: u32 = 512;
+/// Only trim once the backlog exceeds the target + this slack, so ordinary
+/// jitter does not cause repeated trims.
+const RING_SLACK_MS: u64 = 20;
 /// Hard cap: at this depth the reader starts dropping the oldest packet. It is
 /// a stall guard, never the steady state.
 const RING_MAX_MS: u64 = 200;
-/// Only trim once the backlog exceeds target + this slack, so ordinary jitter
-/// does not cause repeated trims.
-const RING_SLACK_MS: u64 = 20;
 
 fn packets_for(ms: u64) -> usize {
     let packet_ms = (wire::PACKET_FRAMES as u64 * 1000 / wire::RATE as u64).max(1);
@@ -50,29 +56,71 @@ fn ring_cap() -> usize {
     packets_for(RING_MAX_MS).max(8)
 }
 
-fn ring_target() -> usize {
-    packets_for(RING_TARGET_MS).max(2)
-}
-
 /// Bounded packet queue shared between the socket reader and the audio thread.
 /// Each entry is `(server packetize stamp, client receive stamp, PCM payload)`;
-/// the stamps are only consumed under `--metrics`.
+/// the receive stamp also feeds the jitter estimate, and the pair feeds
+/// `--metrics`.
 struct Ring {
     q: VecDeque<(u64, u64, Vec<u8>)>,
     /// Set by the reader when the connection ends; the error to surface.
     closed: Option<String>,
     dropped: u64,
     trimmed: u64,
+    /// manual A/V alignment (ms): extra audio delay on top of the jitter target
+    align_ms: u64,
+    /// jitter estimate: running range of (recv_client - host) over the window
+    jitter_lo: i64,
+    jitter_hi: i64,
+    jitter_n: u32,
+    /// adaptive jitter target (ms), recomputed at each window boundary
+    jitter_ms: u64,
 }
 
 impl Ring {
-    fn new() -> Self {
-        Ring { q: VecDeque::new(), closed: None, dropped: 0, trimmed: 0 }
+    fn new(align_ms: u64) -> Self {
+        Ring {
+            q: VecDeque::new(),
+            closed: None,
+            dropped: 0,
+            trimmed: 0,
+            align_ms,
+            jitter_lo: i64::MAX,
+            jitter_hi: i64::MIN,
+            jitter_n: 0,
+            // start at the cap and adapt down, so the first window is never
+            // shallower than the link turns out to need
+            jitter_ms: RING_JITTER_CAP_MS,
+        }
+    }
+
+    /// Fold one arrival into the jitter estimate. `transit` is
+    /// `recv_client - host_unix`: its *range* over the window is the arrival
+    /// jitter (the constant clock offset cancels), which is exactly the depth
+    /// the buffer must cover. On a full window, recompute the target.
+    fn observe(&mut self, transit: i64) {
+        self.jitter_lo = self.jitter_lo.min(transit);
+        self.jitter_hi = self.jitter_hi.max(transit);
+        self.jitter_n += 1;
+        if self.jitter_n >= JITTER_WINDOW {
+            let p2p_ms = (self.jitter_hi - self.jitter_lo).max(0) as u64 / 1000;
+            self.jitter_ms = (p2p_ms + RING_JITTER_MARGIN_MS)
+                .clamp(RING_JITTER_FLOOR_MS, RING_JITTER_CAP_MS);
+            self.jitter_lo = i64::MAX;
+            self.jitter_hi = i64::MIN;
+            self.jitter_n = 0;
+        }
+    }
+
+    /// Ring depth to converge to: the adaptive jitter target plus the manual
+    /// alignment delay.
+    fn target(&self) -> usize {
+        packets_for(self.jitter_ms + self.align_ms).max(2)
     }
 
     /// Push a packet, dropping the oldest when full. Returns true if a packet
     /// was dropped, so the caller can log/count it.
     fn push(&mut self, host_unix_us: u64, recv_us: u64, pkt: Vec<u8>) -> bool {
+        self.observe(recv_us as i64 - host_unix_us as i64);
         let dropped = self.q.len() >= ring_cap();
         if dropped {
             self.q.pop_front();
@@ -92,11 +140,11 @@ impl Ring {
     /// by a startup burst or a stall is paid back. Returns how many were
     /// trimmed (0 in steady state).
     fn trim(&mut self) -> u64 {
-        let limit = ring_target() + packets_for(RING_SLACK_MS);
+        let limit = self.target() + packets_for(RING_SLACK_MS);
         if self.q.len() <= limit {
             return 0;
         }
-        let target = ring_target();
+        let target = self.target();
         let mut n = 0;
         while self.q.len() > target {
             self.q.pop_front();
@@ -116,9 +164,9 @@ impl Ring {
 /// Retry loop wrapper — an audio session failure never takes down video;
 /// we log once per failure and reconnect. `stats` is `Some` only under
 /// `--metrics`.
-pub fn run(addr: std::net::SocketAddr, buffer_ms: u32, stats: Option<Arc<AudioStats>>) {
+pub fn run(addr: std::net::SocketAddr, buffer_ms: u32, align_ms: u32, stats: Option<Arc<AudioStats>>) {
     loop {
-        match session(addr, buffer_ms, stats.clone()) {
+        match session(addr, buffer_ms, align_ms, stats.clone()) {
             Ok(()) => unreachable!("audio session loop returned"),
             Err(e) => {
                 log::info!("[audio] session ended: {e:#}; reconnecting in 2 s");
@@ -182,8 +230,9 @@ fn reader(
         }
         last_seq = Some(seq);
 
-        // client receive stamp for the e2e split (only under --metrics)
-        let recv_us = if stats.is_some() { wire::unix_now_us() } else { 0 };
+        // client receive stamp: feeds the adaptive jitter estimate (always) and
+        // the --metrics e2e split
+        let recv_us = wire::unix_now_us();
 
         let (lock, cv) = &*shared;
         let mut g = lock.lock().unwrap();
@@ -214,6 +263,7 @@ impl Drop for SocketGuard {
 fn session(
     addr: std::net::SocketAddr,
     buffer_ms: u32,
+    align_ms: u32,
     stats: Option<Arc<AudioStats>>,
 ) -> Result<()> {
     let mut sock = TcpStream::connect(addr).with_context(|| format!("audio connect {addr}"))?;
@@ -245,7 +295,7 @@ fn session(
         buffer_ms
     );
 
-    let shared = Arc::new((Mutex::new(Ring::new()), Condvar::new()));
+    let shared = Arc::new((Mutex::new(Ring::new(align_ms as u64)), Condvar::new()));
     let reader_shared = shared.clone();
     let reader_sock = sock.try_clone().context("clone audio socket for the reader")?;
     let reader_stats = stats.clone();
@@ -306,14 +356,16 @@ fn session(
         }
         if Instant::now() > next_report {
             next_report += Duration::from_secs(5);
-            let (drops, trimmed) = {
+            let (drops, trimmed, jitter_ms, align_ms) = {
                 let (lock, _) = &*shared;
                 let g = lock.lock().unwrap();
-                (g.dropped, g.trimmed)
+                (g.dropped, g.trimmed, g.jitter_ms, g.align_ms)
             };
             if let Some(s) = &stats {
                 s.set_dropped(drops);
                 s.set_trimmed(trimmed);
+                s.set_jitter_ms(jitter_ms);
+                s.set_align_ms(align_ms);
             }
             match stream.latency_us() {
                 Ok(us) => {
@@ -331,7 +383,8 @@ fn session(
                     if drift_us > 150_000 {
                         log::debug!(
                             "[audio] playout latency {} ms, {} ms above the {}-ms floor, \
-                             flushing to resync (ring drops {drops} trims {trimmed})",
+                             flushing to resync (ring jitter {jitter_ms}ms align {align_ms}ms \
+                             drops {drops} trims {trimmed})",
                             us / 1000,
                             drift_us / 1000,
                             latency_floor_us / 1000
@@ -341,7 +394,7 @@ fn session(
                     } else {
                         log::debug!(
                             "[audio] playout latency ~{} ms ({} ms above the {}-ms floor; \
-                             ring drops {drops} trims {trimmed})",
+                             ring jitter {jitter_ms}ms align {align_ms}ms drops {drops} trims {trimmed})",
                             us / 1000,
                             drift_us / 1000,
                             latency_floor_us / 1000

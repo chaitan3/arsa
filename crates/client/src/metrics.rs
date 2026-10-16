@@ -625,21 +625,23 @@ impl Metrics {
                 aud_m, aud_p
             ));
             t.push_str(&format!(
-                "\n  xfer {:>5.2}  ring {:>5.2}  sink {:>5.2}",
+                "\n  xfer {:>5.2}  ring {:>5.2}  jit {:>2}  sink {:>5.2}",
                 xm as f64 / 1000.0,
                 rm as f64 / 1000.0,
+                a.jitter_ms(),
                 a.sink_us() as f64 / 1000.0
             ));
             t.push_str(&format!(
-                "\n  av {:+7.2} ms  drops {}  trim {}",
+                "\n  av {:+7.2} ms  align {}  drops {}  trim {}",
                 aud_m - e2e_m,
+                a.align_ms(),
                 a.dropped(),
                 a.trimmed()
             ));
         } else {
             t.push_str("\naudio        (off)");
-            t.push_str("\n  xfer    n/a  ring    n/a  sink    n/a");
-            t.push_str("\n  av     n/a ms  drops 0  trim 0");
+            t.push_str("\n  xfer    n/a  ring    n/a  jit n/a  sink    n/a");
+            t.push_str("\n  av     n/a ms  align 0  drops 0  trim 0");
         }
         // pad to the line budget so the raster size is stable
         while t.matches('\n').count() < LINES - 1 {
@@ -1006,6 +1008,8 @@ mod tests {
         }
         a.set_dropped(21);
         a.set_trimmed(4);
+        a.set_jitter_ms(15);
+        a.set_align_ms(0);
         m.set_audio_stats(a);
         // one video frame: server span + client span = 4.55 ms
         m.record(1, 10_000, 10_200, 10_500, None);
@@ -1015,6 +1019,9 @@ mod tests {
         // the e2e split: 15 ms on the wire, 15 ms of pre-sink backlog
         assert!(t.contains("xfer 15.00"), "{t}");
         assert!(t.contains("ring 15.00"), "{t}");
+        // the adaptive jitter target and the (default-off) alignment term
+        assert!(t.contains("jit 15"), "{t}");
+        assert!(t.contains("align 0"), "{t}");
         assert!(t.contains("trim 4"), "{t}");
         // audio (50.00) lags the video (4.55): a positive offset
         assert!(t.contains("av  +45.45"), "{t}");

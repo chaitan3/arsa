@@ -71,16 +71,19 @@ av        = audio e2e - video e2e        (positive = audio lags the video)
 
 `transport` carries the ping/pong offset error; `ring` is measured on the
 client clock only, so it is offset-independent — the honest pre-sink backlog.
-They render in the overlay under `audio` (e2e p50/p95), `xfer` + `ring` + `sink`,
-and `av` (A/V offset, ring drops and convergence trims), and in the 5 s
-`[metrics]` dump. The whole measurement is inert unless `--metrics` is on: the
-playout thread takes an `Option<Arc<AudioStats>>` and does no per-packet work
-when it is `None`.
+They render in the overlay under `audio` (e2e p50/p95), `xfer` + `ring` + `jit` +
+`sink`, and `av` (A/V offset, `align`, drops and convergence trims), and in the
+5 s `[metrics]` dump. The whole measurement is inert unless `--metrics` is on:
+the playout thread takes an `Option<Arc<AudioStats>>` and does no per-packet
+work when it is `None`.
 
-Independently of `--metrics`, the playout ring converges to a small target
-(`playback::RING_TARGET_MS`, 40 ms): a transient — the server's startup burst,
-a scheduling stall — that leaves a standing backlog is trimmed back down, so it
-cannot become a permanent A/V offset.
+Independently of `--metrics`, the playout ring is the client's jitter buffer:
+its depth adapts to the measured arrival jitter (`recv_client - host_unix`
+peak-to-peak over a ~2.6 s window, `playback::Ring::observe`), clamped to
+10–20 ms, and a transient that leaves a standing backlog is trimmed back to it.
+`--audio-align-ms` adds a manual, audio-only delay on top for A/V alignment
+(default 0); the overlay shows the adaptive target as `jit` and the delay as
+`align`.
 
 ## 2. Overlays, logs, and diagnostics
 

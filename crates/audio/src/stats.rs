@@ -56,6 +56,10 @@ pub struct AudioStats {
     dropped: AtomicU64,
     /// convergence trims the playout has performed (cumulative)
     trimmed: AtomicU64,
+    /// adaptive ring jitter target (ms), mirrored from the playout
+    jitter_ms: AtomicU64,
+    /// manual A/V alignment delay (ms), mirrored from the playout
+    align_ms: AtomicU64,
     samples: Mutex<VecDeque<AudioSample>>,
 }
 
@@ -67,6 +71,8 @@ impl AudioStats {
             packets: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             trimmed: AtomicU64::new(0),
+            jitter_ms: AtomicU64::new(0),
+            align_ms: AtomicU64::new(0),
             samples: Mutex::new(VecDeque::with_capacity(WINDOW)),
         }
     }
@@ -91,6 +97,16 @@ impl AudioStats {
     /// Cumulative convergence trims, mirrored from the playout.
     pub fn set_trimmed(&self, total: u64) {
         self.trimmed.store(total, Ordering::Relaxed);
+    }
+
+    /// Adaptive jitter target (ms), mirrored from the playout.
+    pub fn set_jitter_ms(&self, ms: u64) {
+        self.jitter_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Manual A/V alignment delay (ms), mirrored from the playout.
+    pub fn set_align_ms(&self, ms: u64) {
+        self.align_ms.store(ms, Ordering::Relaxed);
     }
 
     /// Record one packet handed to the sink: its server stamp, the client clock
@@ -119,6 +135,14 @@ impl AudioStats {
 
     pub fn trimmed(&self) -> u64 {
         self.trimmed.load(Ordering::Relaxed)
+    }
+
+    pub fn jitter_ms(&self) -> u64 {
+        self.jitter_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn align_ms(&self) -> u64 {
+        self.align_ms.load(Ordering::Relaxed)
     }
 
     pub fn sink_us(&self) -> u64 {
