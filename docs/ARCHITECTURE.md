@@ -343,8 +343,11 @@ Intra-only GPU codec. The server imports the scanout dmabuf into a Vulkan image
 and runs PyroWave's `encode_gpu_scaled_synchronous` (RGB → YCbCr + scale), then
 packetizes the bitstream into the staging slot — no GL, no full-frame readback.
 The client decodes on the GPU into Y/U/V planes and converts to BGRA. Because
-it is intra-only there is no reference-chain invariant and no CRC. `--lossy-budget`
-caps the bitstream bytes per frame (default 1 MB; slot = budget + 1 MiB);
+it is intra-only there is no reference-chain invariant and no CRC.
+`--lossy-bitrate MBPS` sets the bitstream budget in Mbit/s, which the server
+converts to PyroWave's per-frame byte cap at a nominal 60 fps
+(`MBPS * 1e6 / 8 / 60`; slot = cap + 1 MiB). The client can request its own
+value in `Hello` (`--lossy-bitrate`), which overrides the server's default.
 `--lossy-chroma 420|444` picks subsampling. The `.so` is `dlopen`ed from beside
 the binaries (`$ORIGIN` rpath); build it against the lab's glibc with
 `scripts/build-pyrowave-docker.sh`.

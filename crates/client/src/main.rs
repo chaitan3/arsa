@@ -49,6 +49,9 @@ fn main() -> Result<()> {
     let mut set_mode: Option<String> = None;
     // codec preference sent to the server (CODEC_ANY = let the server pick)
     let mut codec_pref: u8 = rdma_display_proto::CODEC_ANY;
+    // lossy bitstream budget to request from the server, in Mbit/s
+    // (0 = no preference; use the server's default)
+    let mut lossy_mbps: u16 = 0;
     // lossy: force the CPU download+upload path instead of the all-GPU
     // Vulkan->GL dma-buf interop (also honours RDMA_DISPLAY_LOSSY_CPU=1)
     let mut lossy_cpu = std::env::var_os("RDMA_DISPLAY_LOSSY_CPU").is_some();
@@ -101,6 +104,13 @@ fn main() -> Result<()> {
                 };
             }
             "--lossy-cpu" => lossy_cpu = true,
+            "--lossy-bitrate" => {
+                lossy_mbps = args
+                    .next()
+                    .expect("--lossy-bitrate needs a value")
+                    .parse()
+                    .with_context(|| "--lossy-bitrate must be Mbit/s (e.g. 100)")?
+            }
             "--native" => native = true,
             "--set-mode" => set_mode = Some(args.next().expect("--set-mode needs a value")),
             "--codec" => {
@@ -135,6 +145,7 @@ fn main() -> Result<()> {
                 println!("  --set-mode WxH[@R]    ask the server to set its output to this size/refresh before the session starts (R in Hz; omitted = any)");
                 println!("  --codec auto|raw|lossless|lossy  codec to request from the server (honoured under the server's --codec auto). Default auto: the server picks");
                 println!("  --lossy-cpu           lossy: decode + download + upload on the CPU instead of the all-GPU Vulkan->GL dma-buf interop (default all-GPU, with an automatic fallback when the interop is unavailable)");
+                println!("  --lossy-bitrate MBPS  lossy: ask the server for this bitstream budget in Mbit/s (e.g. 100); 0 = use the server's default. The server converts it to a per-frame byte cap at a nominal 60 fps");
                 println!("  RDMA_DISPLAY_LOSSY_DEBUG=1  lossy: verbose dma-buf import diagnostics (extension strings, importable formats/modifiers, every import attempt)");
                 println!("  Ctrl+Alt+G            (--output egl) grab keyboard+mouse for the guest: the local compositor's");
                 println!("                        own shortcuts (alt-f4, alt-tab, alt-f1, ...) reach the guest too; Ctrl+Alt+G again");
@@ -212,6 +223,7 @@ fn main() -> Result<()> {
         mem,
         mode_req,
         codec_pref,
+        lossy_mbps,
     )?;
     if link.slots_gpu_only() {
         log::info!("[client] GPU slots without CPU mapping: content checks use the verification-only device->host copy (the render path itself stays zero-copy)");

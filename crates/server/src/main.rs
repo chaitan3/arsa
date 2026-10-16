@@ -105,7 +105,10 @@ fn main() -> Result<()> {
     // `--codec auto` (default): honour the client's codec preference, falling
     // back to `codec` when the client has none. A specific `--codec` forces it.
     let mut codec_auto = true;
-    let mut lossy_budget: usize = 1_000_000;
+    // lossy bitstream budget in Mbit/s; the encoder only takes a per-frame byte
+    // cap, so it is converted at a nominal 60 fps (see `lossy_budget_bytes`).
+    // The client may override it via its Hello preference.
+    let mut lossy_mbps: u16 = 480;
     let mut lossy_chroma444 = false;
     let mut transport = rdma_display_rdma::TransportPref::Auto;
     let mut gpu_power = GpuPower::Off;
@@ -173,11 +176,15 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            "--lossy-budget" => {
-                lossy_budget = args
+            "--lossy-bitrate" => {
+                lossy_mbps = args
                     .next()
-                    .expect("--lossy-budget needs a value")
-                    .parse()?;
+                    .expect("--lossy-bitrate needs a value")
+                    .parse()
+                    .with_context(|| "--lossy-bitrate must be Mbit/s (e.g. 100)")?;
+                if lossy_mbps == 0 {
+                    bail!("--lossy-bitrate must be > 0 Mbit/s");
+                }
             }
             "--lossy-chroma" => {
                 let v = args.next().expect("--lossy-chroma needs a value");
@@ -222,7 +229,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
   --capture-sync auto|settle[:ms]|fence  (drm) when to capture, on top of the 1 ms poll that emits only when the plane's fb changes: auto (default) and fence read the current frame when the compositor's per-frame completion fence signals (tracefs; ~1 ms, tear-free, needs root), falling back to settle:2ms while the watch calibrates or if tracefs is unavailable; settle[:ms] = emit the current fb ms after its commit (default 2 ms; usually complete, but frames whose render outlasts the window tear)\n  \
   --pace auto|latency|smooth  frame pacing: the server's flow-control window — how many frames it keeps in flight ahead of the client's display. The client credits one frame per present, which paces both TCP and RDMA. auto (default) sizes the window from the measured link (ceil(turnaround / source frame period): keeps the pipe full without queueing); latency = 1 (present-paced, lowest latency, may stall if the link is slower than the display); smooth = the transport maximum (smoothest cadence, highest latency).\n  \
   --codec auto|raw|lossless|lossy  frame coding for the whole session (default auto = honour the client's Hello preference, else lossless). raw = unchanged wire; lossless = v2 tile-delta against the previous frame (desktop-friendly); lossy = PyroWave intra-only GPU codec (needs libpyrowave-shared.so). A non-auto value forces the codec. Build server and client together (lossless v2 is a wire-format version).\n  \
-  --lossy-budget BYTES  lossy: max bitstream bytes per frame (default 1000000; slot size sent to the client).\n  \
+  --lossy-bitrate MBPS  lossy: bitstream budget in Mbit/s, converted to the encoder's per-frame byte cap at a nominal 60 fps (default 480 ~= the old 1 MB/frame; the slot size sent to the client is derived from it). The client can override it via --lossy-bitrate.\n  \
   --lossy-chroma 420|444  lossy: chroma subsampling (default 420).\n  \
   --gpu-power off|p5|p0|max|<sm>[,<mem>]  floor the NVIDIA GPU clocks with nvidia-smi, still allowing boost above the floor (needs root; warns and continues if unavailable). p5 = the measured fast floor (sm 435 / mem 810 MHz), p0/max = floor at the card's maximum (i.e. pinned), <sm>[,<mem>] = explicit MHz floors. Default off. GeForce cards reject the memory-clock floor.\n  \
   --transport auto|rdma|tcp  video transport (default auto: RDMA/RoCE when available, else TCP). Negotiated with the client; TCP sends length-prefixed coded frames on a TAG_VIDEO connection.\n  \
@@ -295,7 +302,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
         "capture" => run_capture(
             rdma_ref, transport, &source, input.as_deref(), &dbus_socket, console, &drm_card,
             &materialize, rendernode.as_deref(), &listen, slots, fps, input_test, &readback,
-            capture_sync, audio, audio_device.as_deref(), codec, codec_auto, lossy_budget,
+            capture_sync, audio, audio_device.as_deref(), codec, codec_auto, lossy_mbps,
             lossy_chroma444, &display_control, display_output.as_deref(), idle_metrics, pace,
         ),
         other => bail!("mode {other:?} not implemented yet"),
@@ -387,7 +394,7 @@ fn run_testcard_server(
         let rumble_hub = rdma_display_proto::gamepad::RumbleHub::new();
         // negotiate Hello + the display-mode request, then reply (testcard has
         // a fixed 1280x800 geometry, so a request is a no-op here)
-        let (mut conn, neg, _mode, _codec_pref) = rdma_display_rdma::handshake_server(
+        let (mut conn, neg, _mode, _codec_pref, _lossy_mbps) = rdma_display_rdma::handshake_server(
             stream,
             rdma_display_rdma::random_nonce(),
             transport,
@@ -782,7 +789,7 @@ fn run_capture(
     audio_device: Option<&str>,
     codec: rdma_display_codec::Codec,
     codec_auto: bool,
-    lossy_budget: usize,
+    lossy_mbps: u16,
     lossy_chroma444: bool,
     display_control: &str,
     display_output: Option<&str>,
@@ -883,6 +890,9 @@ fn run_capture(
     // startup preflight: validate/probe each element once; the heavy pipeline
     // is (re)started on demand per client (Phase 2). The probed geometry lets
     // a client connect negotiate slots before the first captured frame.
+    // server-default lossy budget (bytes/frame) from the Mbit/s target; a
+    // client may override it per session via its Hello preference
+    let lossy_budget = lossy_budget_bytes(lossy_mbps);
     let mut geometry = preflight(
         source_name,
         input_name,
@@ -914,6 +924,8 @@ fn run_capture(
     // whether the current materializer is the lossy one; raw/lossless share the
     // EGL/plain materializer, so the box is only rebuilt when the family changes
     let mut mat_is_lossy = codec == rdma_display_codec::Codec::Lossy;
+    // the lossy budget baked into the current materializer (rebuild on change)
+    let mut mat_lossy_budget = lossy_budget;
     log::info!("[server] capture materializer: {}", mat.name());
 
     // input: explicit --input wins, else paired default. The capture source
@@ -1296,7 +1308,7 @@ fn run_capture(
                 // no mid-session resize and no reconnect.
                 let peer = stream.peer_addr()?;
                 let nonce = rdma_display_rdma::random_nonce();
-                let (mut conn, neg, mode_req, client_codec_pref) =
+                let (mut conn, neg, mode_req, client_codec_pref, client_lossy_mbps) =
                     match rdma_display_rdma::handshake_server(
                         stream,
                         nonce,
@@ -1343,17 +1355,35 @@ fn run_capture(
                 // the materializer must match the session codec: raw/lossless
                 // share the EGL/plain one, lossy needs its own (rebuild on change)
                 let want_lossy = session_codec == rdma_display_codec::Codec::Lossy;
-                if want_lossy != mat_is_lossy {
+                // the client's Hello preference overrides the server default
+                let eff_mbps = if client_lossy_mbps > 0 {
+                    client_lossy_mbps
+                } else {
+                    lossy_mbps
+                };
+                let eff_budget = lossy_budget_bytes(eff_mbps);
+                if want_lossy != mat_is_lossy || (want_lossy && eff_budget != mat_lossy_budget) {
                     mat = build_materializer(
                         session_codec,
                         materialize,
                         gl.as_ref(),
                         rendernode,
-                        lossy_budget,
+                        eff_budget,
                         lossy_chroma444,
                     )?;
                     mat_is_lossy = want_lossy;
-                    log::info!("[server] materializer for this session: {}", mat.name());
+                    mat_lossy_budget = eff_budget;
+                    log::info!(
+                        "[server] materializer for this session: {} (lossy budget {} B/frame = {} Mbit/s @60fps{})",
+                        mat.name(),
+                        eff_budget,
+                        eff_mbps,
+                        if client_lossy_mbps > 0 {
+                            ", client-requested"
+                        } else {
+                            ""
+                        }
+                    );
                 }
                 // lossy chroma advertised to the client: 0 = 4:2:0, 1 = 4:4:4
                 let session_chroma: u8 = if want_lossy && lossy_chroma444 { 1 } else { 0 };
@@ -1405,7 +1435,7 @@ fn run_capture(
                         meta.stride,
                     );
                     let slot_len = match session_codec {
-                        rdma_display_codec::Codec::Lossy => lossy_budget + (1 << 20),
+                        rdma_display_codec::Codec::Lossy => eff_budget + (1 << 20),
                         _ => session_codec
                             .slot_len(&geom)
                             .expect("implemented codec has a slot size"),
@@ -2482,6 +2512,18 @@ fn apply_mode_request(
             }
         }
     }
+}
+
+/// Nominal frame rate used to convert a lossy bandwidth target into the
+/// encoder's per-frame byte cap.
+const LOSSY_NOMINAL_FPS: usize = 60;
+
+/// The lossy encoder's per-frame bitstream cap (bytes) for a bandwidth target
+/// in Mbit/s, assuming [`LOSSY_NOMINAL_FPS`]: `MBPS * 1e6 / 8 / 60`. PyroWave's
+/// rate control only takes a size cap (there is no target-bitrate field), so
+/// the achieved bitrate is `cap * fps` — at or below the target up to 60 fps.
+fn lossy_budget_bytes(mbps: u16) -> usize {
+    (mbps as usize) * 1_000_000 / 8 / LOSSY_NOMINAL_FPS
 }
 
 /// Build the frame materializer for `codec`: the lossy (PyroWave/Vulkan) one, or

@@ -11,7 +11,7 @@ pub mod gamepad;
 pub mod keymap;
 
 pub const MAGIC: u32 = 0x5244_4453; // "RDDS"
-pub const VERSION: u32 = 14; // v14: Hello carries the client's codec preference
+pub const VERSION: u32 = 15; // v15: Hello carries the client's lossy bitrate; v14: codec preference
 
 /// First byte of every connection, so the server routes by an explicit tag
 /// rather than by guessing protocol bytes. Audio uses
@@ -216,6 +216,11 @@ pub struct Hello {
     /// choice and reports it in the `Codec` message; the field is ignored in
     /// the server's reply.
     pub codec_pref: u8,
+    /// Client → server: the lossy bitstream budget the client would like, in
+    /// Mbit/s (0 = no preference; use the server's default). The server turns it
+    /// into the encoder's per-frame byte cap at a nominal 60 fps and reports the
+    /// resulting slot size in the `Codec` message. Ignored in the reply.
+    pub lossy_mbps: u16,
 }
 
 /// Display format metadata, sent by the server for the current scanout.
@@ -487,12 +492,13 @@ pub fn send_msg<T: Write>(io: &mut T, msg: &Message) -> std::io::Result<()> {
         Message::Hello(h) => (
             MsgType::Hello as u32,
             {
-                let mut v = Vec::with_capacity(18);
+                let mut v = Vec::with_capacity(20);
                 v.extend_from_slice(&h.magic.to_le_bytes());
                 v.extend_from_slice(&h.version.to_le_bytes());
                 v.extend_from_slice(&h.nonce.to_le_bytes());
                 v.push(h.caps);
                 v.push(h.codec_pref);
+                v.extend_from_slice(&h.lossy_mbps.to_le_bytes());
                 v
             },
         ),
@@ -677,6 +683,10 @@ impl<T: Read + Write> Conn<T> {
                 ),
                 caps: *payload.get(16).unwrap_or(&0),
                 codec_pref: *payload.get(17).unwrap_or(&CODEC_ANY),
+                lossy_mbps: payload
+                    .get(18..20)
+                    .map(|b| u16::from_le_bytes(b.try_into().unwrap()))
+                    .unwrap_or(0),
             }),
             t if t == MsgType::Meta as u32 => {
                 let width = u32_at(&payload, 0)?;
@@ -852,6 +862,14 @@ mod tests {
     #[test]
     fn stamp_ping_pong_roundtrip() {
         let msgs = [
+            Message::Hello(Hello {
+                magic: MAGIC,
+                version: VERSION,
+                nonce: 0x0123_4567_89ab_cdef,
+                caps: CAP_RDMA,
+                codec_pref: CODEC_ANY,
+                lossy_mbps: 100,
+            }),
             Message::Meta(DisplayMeta {
                 width: 3840,
                 height: 2160,

@@ -159,6 +159,7 @@ fn hello_client<T: std::io::Read + std::io::Write>(
     conn: &mut Conn<T>,
     caps: u8,
     codec_pref: u8,
+    lossy_mbps: u16,
 ) -> Result<(u64, u8)> {
     conn.send(&Message::Hello(proto::Hello {
         magic: proto::MAGIC,
@@ -166,6 +167,7 @@ fn hello_client<T: std::io::Read + std::io::Write>(
         nonce: 0,
         caps,
         codec_pref,
+        lossy_mbps,
     }))?;
     match conn.recv()? {
         Message::Hello(h) if h.magic == proto::MAGIC => {
@@ -185,7 +187,7 @@ fn hello_server<T: std::io::Read + std::io::Write>(
     session_nonce: u64,
     pref: TransportPref,
     server_has_rdma: bool,
-) -> Result<(Transport, u8)> {
+) -> Result<(Transport, u8, u16)> {
     let ch = match conn.recv()? {
         Message::Hello(h) if h.magic == proto::MAGIC => h,
         other => return Err(anyhow!("expected Hello, got {other:?}")),
@@ -219,8 +221,9 @@ fn hello_server<T: std::io::Read + std::io::Write>(
         nonce: session_nonce,
         caps: if transport == Transport::Rdma { proto::CAP_RDMA } else { 0 },
         codec_pref: proto::CODEC_ANY, // ignored in the reply
+        lossy_mbps: 0,                // ignored in the reply
     }))?;
-    Ok((transport, ch.codec_pref))
+    Ok((transport, ch.codec_pref, ch.lossy_mbps))
 }
 
 fn endpoint_exchange<T: std::io::Read + std::io::Write>(
@@ -335,9 +338,10 @@ pub fn handshake_server(
     session_nonce: u64,
     pref: TransportPref,
     server_has_rdma: bool,
-) -> Result<(Conn<TcpStream>, Transport, proto::ModeRequest, u8)> {
+) -> Result<(Conn<TcpStream>, Transport, proto::ModeRequest, u8, u16)> {
     let mut conn = Conn::new(stream);
-    let (transport, codec_pref) = hello_server(&mut conn, session_nonce, pref, server_has_rdma)?;
+    let (transport, codec_pref, lossy_mbps) =
+        hello_server(&mut conn, session_nonce, pref, server_has_rdma)?;
     log::info!(
         "[rdma] video transport: {}{}",
         match transport {
@@ -350,7 +354,7 @@ pub fn handshake_server(
         Message::SetMode(r) => r,
         other => anyhow::bail!("expected SetMode, got {other:?}"),
     };
-    Ok((conn, transport, req, codec_pref))
+    Ok((conn, transport, req, codec_pref, lossy_mbps))
 }
 
 /// Send the display-mode result to the client. Called after the mode has been
@@ -1521,6 +1525,7 @@ impl ClientLink {
             SlotMem::Host,
             proto::ModeRequest::Keep,
             proto::CODEC_ANY,
+            0,
         )
     }
 
@@ -1540,6 +1545,7 @@ impl ClientLink {
         mem: SlotMem,
         mode: proto::ModeRequest,
         codec_pref: u8,
+        lossy_mbps: u16,
     ) -> Result<ClientLink> {
         // split the stream: the frame/metrics reader gets the receive half as
         // its own clone; the link's conn keeps doing client→server sends
@@ -1553,7 +1559,7 @@ impl ClientLink {
         } else {
             proto::CAP_RDMA
         };
-        let (session_nonce, server_caps) = hello_client(&mut conn, caps, codec_pref)?;
+        let (session_nonce, server_caps) = hello_client(&mut conn, caps, codec_pref, lossy_mbps)?;
         let transport = if server_caps & proto::CAP_RDMA != 0 {
             Transport::Rdma
         } else {
