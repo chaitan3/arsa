@@ -96,7 +96,7 @@ The capture loop polls `plane.fb_id` every 1 ms and emits a scanout only when it
 changes — one frame per flip, silent while the screen is idle. The export
 (`GETFB2` → `PRIME_HANDLE_TO_FD`) runs in the same iteration as the read, so the
 compositor cannot destroy the fb in between. The *sync mode* adds a wait before
-the read (§4.4).
+the read (§4.5).
 
 ### 4.2 QEMU D-Bus source (`crates/capture/src/qemu.rs`)
 
@@ -111,7 +111,37 @@ Connects to QEMU's D-Bus display server (session bus or a private
 The listener thread and the RDMA/send thread communicate over a small mpsc
 channel of frame events.
 
-### 4.3 Frame materialization (`crates/capture/src/{egl,materializer}.rs`)
+### 4.3 Portal ScreenCast source (`crates/capture/src/portal.rs`)
+
+`--source portal` captures through the compositor instead of the KMS scanout.
+It is the source to prefer on a Wayland desktop: the compositor composites, so a
+captured buffer is complete when it is delivered — there is **no**
+direct-scanout blank-frame failure mode, no root/`CAP_SYS_ADMIN`, and
+`--capture-sync` does not apply (the `settle`/`fence` machinery exists only
+because the KMS path reads a plane mid-flip).
+
+`org.freedesktop.portal.ScreenCast` (`CreateSession` → `SelectSources` →
+`Start` → `OpenPipeWireRemote`, driven through `ashpd`) yields a PipeWire node id
+plus a remote fd. The PipeWire stream negotiates raw video and hands us dmabufs,
+wrapped as the same `DmabufScanout` the KMS/QEMU sources produce, so the
+materializer, codecs and transport are unchanged. The compositor draws the
+cursor (`cursor_mode = Embedded`). `restore_token` / `persist_mode` remember the
+user's monitor/window choice so the picker dialog only appears once.
+
+It needs a session bus and a portal backend (GNOME, KDE,
+`xdg-desktop-portal-wlr`, `xdg-desktop-portal-hyprland`). The `portal` feature
+(`ashpd` + PipeWire) is on by default, so there is a single server binary;
+`--no-default-features` builds without PipeWire. The portal has **no mode
+control**, so
+`--set-mode`/`--display-output` do not apply — the stream size is whatever the
+compositor (or the user's picker choice) gives.
+
+The portal covers display capture only. **Audio** stays on the pipewire-pulse
+monitor (§8) and **gamepads** are never covered by the portal (`RemoteDesktop`
+is keyboard/pointer/touchscreen only), so `--input` stays `uinput` and input is
+deliberately not routed through the portal.
+
+### 4.4 Frame materialization (`crates/capture/src/{egl,materializer}.rs`)
 
 The materializer turns a source frame into the linear wire bytes. `--materialize`
 selects:
@@ -131,7 +161,7 @@ the readback path. The wire format is always `XR24`/BGRX bytes, top-first.
 When the GPU lossless codec is active it encodes **straight from the imported
 dmabuf** — no full-frame readback, no re-upload (§6).
 
-### 4.4 Capture sync modes (`--capture-sync`)
+### 4.5 Capture sync modes (`--capture-sync`)
 
 The loop always polls `plane.fb_id` at 1 ms and emits only when it changes. The
 sync mode adds a wait before the read, trading latency against tearing:

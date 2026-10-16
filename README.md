@@ -28,8 +28,9 @@ boxes on a fast link, not a browser-streaming service.
 
 ## Features
 
-- **Two capture sources**: host KMS/DRM scanout (`--source drm`) or a QEMU
-  guest's D-Bus display (`--source qemu`).
+- **Three capture sources**: host KMS/DRM scanout (`--source drm`), a QEMU
+  guest's D-Bus display (`--source qemu`), or the compositor via the XDG Desktop
+  Portal (`--source portal`).
 - **Two transports**: RDMA/RoCE (preferred when a device and a routable GID
   exist) or TCP; negotiated per session, `--transport auto|rdma|tcp`.
 - **Three codecs**: `raw`, `lossless` (tile-delta, GPU-encoded), `lossy`
@@ -191,7 +192,7 @@ both ends.
 
 | Option | Meaning |
 | --- | --- |
-| `--source drm\|qemu` | Capture the host KMS scanout (default) or a QEMU guest. |
+| `--source drm\|qemu\|portal` | Capture the host KMS scanout (default), a QEMU guest, or the compositor via the XDG Desktop Portal. |
 | `--input qemu\|uinput` | Injection sink. Default: paired with the source (`drm`→`uinput`, `qemu`→`qemu-dbus`). |
 | `--listen ADDR:PORT` | Bind address (default `0.0.0.0:4791`). May also be given as the first positional argument, e.g. `rdma-display-server 0.0.0.0:4791`; a bare host gets port 4791. |
 | `--codec auto\|raw\|lossless\|lossy` | Frame coding. `auto` (default) honours the client's requested codec, else lossless; an explicit value forces it. |
@@ -239,6 +240,7 @@ forwarded too. `Ctrl+Alt+G` again is the only way to give control back.
 | `--source drm` | `--input uinput` | `--output none --dump` | Headless/debug. |
 | `--source qemu` | `--input qemu` | `--output egl` | Guest over QEMU's D-Bus display. |
 | `--source qemu` | `--input qemu` | `--output none` | Guest, headless. |
+| `--source portal` | `--input uinput` | `--output egl` | Compositor capture (no root). |
 
 Transport, codec, and presenter are independent axes:
 

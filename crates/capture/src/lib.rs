@@ -17,6 +17,8 @@ pub mod egl;
 mod fence;
 pub mod input;
 pub mod materializer;
+#[cfg(feature = "portal")]
+pub mod portal;
 pub mod qemu;
 
 pub use materializer::FrameMaterializer;
@@ -24,6 +26,8 @@ pub use rdma_display_lifecycle::{sleep_or_stop, Running, Stop};
 pub use egl::{run_readback_bench, EglInitPhases, EglMaterializer, ReadBenchOpts};
 pub use input::{InputSink, QemuDbusInput, UinputSink};
 pub use drm::DrmKmsSource;
+#[cfg(feature = "portal")]
+pub use portal::PortalScreenCastSource;
 pub use qemu::QemuDbusSource;
 
 use anyhow::Result;

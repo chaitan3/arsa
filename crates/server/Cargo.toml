@@ -4,6 +4,12 @@ version = "0.1.0"
 edition.workspace = true
 publish = false
 
+[features]
+# XDG Desktop Portal screen capture (`--source portal`); on by default so there
+# is a single server binary. `--no-default-features` drops PipeWire.
+default = ["portal"]
+portal = ["rdma-display-capture/portal"]
+
 [[bin]]
 name = "reinit-bench"
 path = "src/bin/reinit_bench.rs"

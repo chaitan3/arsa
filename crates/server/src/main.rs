@@ -221,8 +221,8 @@ fn main() -> Result<()> {
                 println!("usage: rdma-display-server [ADDR[:PORT]] [--mode capture|testcard] [--device mlx5_0] [--listen 0.0.0.0:4791] [--frame-slots 3] [--fps N]\n  \
   ADDR[:PORT]  listen address, the same as --listen (default 0.0.0.0:4791; the port defaults to 4791 when omitted)\n  \
   defaults: --mode capture --source drm --fps 0 --codec auto --audio on --capture-sync auto --pace auto (a bare command is a root KMS capture of the host)\n  \
-capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS capture, the host — requires sudo/CAP_SYS_ADMIN, kernel >= 5.8)\n  \
-  --input qemu|uinput (default auto: qemu↔qemu-dbus, drm↔uinput)\n  \
+capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS capture, the host — requires sudo/CAP_SYS_ADMIN, kernel >= 5.8; portal = XDG Desktop Portal ScreenCast over PipeWire — needs a session bus and a portal backend, and needs no root)\n  \
+  --input qemu|uinput (default auto: qemu↔qemu-dbus, drm↔uinput, portal↔uinput)\n  \
   qemu: [--dbus-socket /path/dbus.sock] [--console 0]   drm: [--drm-card /dev/dri/cardN] (default: first card0..card8 with an active scanout)\n  \
   [--materialize egl|plain] [--rendernode /dev/dri/renderD128] [--readback pbo|direct] [--input-test]\n  \
   --materialize egl (default) imports the dmabuf and reads the frame back for raw/lossy and for the CPU/readback lossless fallback; GPU lossless bypasses the readback entirely and encodes straight from the imported dmabuf (no full-frame readback, no re-upload). --readback pbo|direct only affects that readback path.\n  \
@@ -768,6 +768,37 @@ fn push_bounded(v: &mut std::collections::VecDeque<usize>, x: usize, cap: usize)
     }
 }
 
+/// Build the configured capture source. `--source portal` (XDG Desktop Portal
+/// screen capture over PipeWire) is behind the `portal` feature, so a default
+/// build has no PipeWire dependency.
+fn build_source(
+    source_name: &str,
+    dbus_socket: &Option<String>,
+    console: u32,
+    drm_card: &Option<String>,
+    capture_connector: &Option<String>,
+    capture_sync: CaptureSync,
+) -> Result<Box<dyn CaptureSource>> {
+    Ok(match source_name {
+        "qemu" => Box::new(QemuDbusSource::new(dbus_socket.clone(), console)),
+        "drm" => Box::new(DrmKmsSource::with_sync(
+            drm_card.clone(),
+            capture_connector.clone(),
+            capture_sync,
+        )),
+        #[cfg(feature = "portal")]
+        "portal" => Box::new(rdma_display_capture::PortalScreenCastSource::default()),
+        other => bail!(
+            "source {other:?} not implemented (qemu|drm{})",
+            if cfg!(feature = "portal") {
+                "|portal"
+            } else {
+                ""
+            }
+        ),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_capture(
     rdma: Option<(&ibverbs::Context, &ibverbs::ProtectionDomain)>,
@@ -833,7 +864,7 @@ fn run_capture(
 
     // input sink: explicit --input wins, else paired default
     let input_name = input_name.unwrap_or(match source_name {
-        "drm" => "uinput",
+        "drm" | "portal" => "uinput",
         _ => "qemu",
     });
     if input_name == "qemu" && source_name == "drm" {
@@ -942,15 +973,14 @@ fn run_capture(
     // source is started lazily per session.
     let eager_source: Option<rdma_display_capture::Running> = if geometry.is_none() {
         log::info!("[server] no preflight geometry; capturing eagerly to learn it");
-        let source: Box<dyn CaptureSource> = match source_name {
-            "qemu" => Box::new(QemuDbusSource::new(dbus_socket.clone(), console)),
-            "drm" => Box::new(DrmKmsSource::with_sync(
-                drm_card.clone(),
-                capture_connector.clone(),
-                capture_sync,
-            )),
-            other => bail!("source {other:?} not implemented (qemu|drm)"),
-        };
+        let source = build_source(
+            source_name,
+            dbus_socket,
+            console,
+            drm_card,
+            &capture_connector,
+            capture_sync,
+        )?;
         Some(CaptureSource::spawn(source, tx.clone())?)
     } else {
         None
@@ -1403,17 +1433,14 @@ fn run_capture(
                     let source = if eager_source.is_some() {
                         None
                     } else {
-                        let source: Box<dyn CaptureSource> = match source_name {
-                            "qemu" => Box::new(QemuDbusSource::new(dbus_socket.clone(), console)),
-                            "drm" => {
-                                Box::new(DrmKmsSource::with_sync(
-                                    drm_card.clone(),
-                                    capture_connector.clone(),
-                                    capture_sync,
-                                ))
-                            }
-                            other => bail!("source {other:?} not implemented (qemu|drm)"),
-                        };
+                        let source = build_source(
+                            source_name,
+                            dbus_socket,
+                            console,
+                            drm_card,
+                            &capture_connector,
+                            capture_sync,
+                        )?;
                         Some(CaptureSource::spawn(source, tx.clone())?)
                     };
                     log::info!("[server] capture running");
