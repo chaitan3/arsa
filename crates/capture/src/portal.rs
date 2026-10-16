@@ -47,6 +47,15 @@ const SPA_PARAM_BUFFERS_blocks: u32 = 2;
 #[allow(non_upper_case_globals)]
 const SPA_PARAM_BUFFERS_dataType: u32 = 6;
 
+/// `DRM_FORMAT_MOD_INVALID` (0x00ffffffffffffff): "no modifier" — how a producer
+/// signals that a buffer is a MemFd rather than a dmabuf.
+const DRM_FORMAT_MOD_INVALID: i64 = 0x00ff_ffff_ffff_ffff;
+/// `DRM_FORMAT_MOD_LINEAR`.
+const DRM_FORMAT_MOD_LINEAR: i64 = 0;
+/// `DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D` (the modifier nvidia-drm hands out;
+/// the materializer's EGL import already handles it).
+const DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D: i64 = 0x0300_0000_0060_6014;
+
 use crate::{CaptureEvent, CaptureSource, DmabufScanout, FrameFormat, Running, Stop};
 use rdma_display_proto::unix_now_us;
 
@@ -281,9 +290,10 @@ fn enum_format_pod() -> Vec<u8> {
             VideoFormat::RGBx,
             VideoFormat::RGBA
         ),
-        // the modifier property is what makes the producer allocate *dmabuf*
-        // buffers (modifiers only apply to dmabufs); without it XDPH defaults
-        // to MemFd, which the materializer cannot import
+        // the modifier property is what lets the producer allocate *dmabuf*
+        // buffers; without it XDPH defaults to MemFd. Accept any modifier the
+        // producer might use: MOD_INVALID (a MemFd buffer), LINEAR, and the
+        // NVIDIA block-linear modifier the materializer's EGL import handles.
         spa::pod::Property {
             key: FormatProperties::VideoModifier.as_raw(),
             flags: spa::pod::PropertyFlags::MANDATORY
@@ -291,8 +301,12 @@ fn enum_format_pod() -> Vec<u8> {
             value: spa::pod::Value::Choice(spa::pod::ChoiceValue::Long(Choice::<i64>(
                 ChoiceFlags::empty(),
                 ChoiceEnum::<i64>::Enum {
-                    default: 0,
-                    alternatives: vec![0],
+                    default: DRM_FORMAT_MOD_INVALID,
+                    alternatives: vec![
+                        DRM_FORMAT_MOD_INVALID,
+                        DRM_FORMAT_MOD_LINEAR,
+                        DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D,
+                    ],
                 },
             ))),
         },
@@ -329,11 +343,13 @@ fn enum_format_pod() -> Vec<u8> {
     .into_inner()
 }
 
-/// Build the `SPA_PARAM_Buffers` pod, asking for **dmabuf**-backed buffers.
-/// Without it the producer (XDPH) hands out MemFd buffers, which this source
-/// cannot import — the materializer needs a dmabuf.
+/// Build the `SPA_PARAM_Buffers` pod: offer **dmabuf** (preferred) and MemFd.
+/// Without this the producer (XDPH) hands out MemFd buffers, which this source
+/// cannot import — the materializer needs a dmabuf — so MemFd is accepted by
+/// the negotiation only so it can be reported and skipped, not captured.
 fn buffers_pod() -> Vec<u8> {
-    let data_type = 1u32 << DataType::DmaBuf.as_raw();
+    let data_type =
+        (1u32 << DataType::DmaBuf.as_raw()) | (1u32 << DataType::MemFd.as_raw());
     let obj = spa::pod::Object {
         type_: spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
         id: spa::param::ParamType::Buffers.as_raw(),
