@@ -491,7 +491,7 @@ pub enum Message {
 /// Encode + frame one message onto any writer. `Conn::send` is a wrapper;
 /// free-standing so the RDMA layer can push stamps over a cloned stream
 /// without a `Read` half.
-pub fn send_msg<T: Write>(io: &mut T, msg: &Message) -> std::io::Result<()> {
+pub fn encode_msg(msg: &Message) -> std::io::Result<(u32, Vec<u8>)> {
     let (ty, payload): (u32, Vec<u8>) = match msg {
         Message::Hello(h) => (
             MsgType::Hello as u32,
@@ -621,12 +621,27 @@ pub fn send_msg<T: Write>(io: &mut T, msg: &Message) -> std::io::Result<()> {
             "payload too large",
         ));
     }
+    Ok((ty, payload))
+}
+
+/// Encode + write one message in the clear (no stream crypto).
+pub fn send_msg<T: Write>(io: &mut T, msg: &Message) -> std::io::Result<()> {
+    let (ty, payload) = encode_msg(msg)?;
     let mut hdr = Vec::with_capacity(8);
     hdr.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     hdr.extend_from_slice(&ty.to_le_bytes());
     io.write_all(&hdr)?;
     io.write_all(&payload)?;
     io.flush()
+}
+
+/// Per-direction stream cipher used by [`Conn`] when the session is encrypted.
+/// Implemented by the transport layer so `proto` stays crypto-agnostic.
+pub trait StreamCipher: Send {
+    /// Seal `plain`, appending the ciphertext (with tag) to `out`.
+    fn seal(&mut self, plain: &[u8], out: &mut Vec<u8>);
+    /// Open `ct` into `out`; a bad tag/counter is an error.
+    fn open(&mut self, ct: &[u8], out: &mut Vec<u8>) -> std::io::Result<()>;
 }
 
 pub struct Conn<T: Read + Write> {
