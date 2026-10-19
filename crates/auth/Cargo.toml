@@ -1,0 +1,22 @@
+[package]
+name = "rdma-display-auth"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+# Noise (Noise_IK_25519_ChaChaPoly_BLAKE2s) for the authenticated, encrypted
+# transport; SPAKE2 for the one-time PIN pairing (offline-attack resistant).
+snow = "0.10"
+spake2 = "0.4"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+getrandom = "0.2"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
