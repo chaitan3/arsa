@@ -49,7 +49,7 @@ impl VkCore {
             let entry = ash::Entry::load().context("load libvulkan (libvulkan.so.1)")?;
 
             // ---- instance ----
-            let app_name = leak_cstr("rdma-display");
+            let app_name = leak_cstr("arsa");
             let app_info: &'static vk::ApplicationInfo = Box::leak(Box::new(vk::ApplicationInfo {
                 p_application_name: app_name.as_ptr(),
                 application_version: 1,

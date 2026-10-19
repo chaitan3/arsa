@@ -22,7 +22,7 @@ use sha2::Sha256;
 
 use crate::SECRET_LEN;
 
-const INFO: &[u8] = b"rdma-display-stream";
+const INFO: &[u8] = b"arsa-stream";
 
 /// Derive the key for one connection kind (`tag`) and sender direction.
 /// `from_client` is true for client→server, false for server→client.

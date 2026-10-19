@@ -519,8 +519,8 @@ impl Presenter {
             fs_mgr.as_ref().map(|m| m.get_fractional_scale(&surface, &qh, ()));
         let xdg_surface = wmbase.get_xdg_surface(&surface, &qh, ());
         let toplevel = xdg_surface.get_toplevel(&qh, ());
-        toplevel.set_title("rdma-display".into());
-        toplevel.set_app_id("rdma-display-client".into());
+        toplevel.set_title("arsa".into());
+        toplevel.set_app_id("arsa-client".into());
         // 1:1 fixed-size window (resize/renegotiation is M7); fullscreen
         // hands sizing to the compositor instead (configure-driven)
         xdg_surface.set_window_geometry(0, 0, width as i32, height as i32);

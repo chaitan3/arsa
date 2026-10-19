@@ -1,6 +1,6 @@
 //! Minimal EGL dmabuf downloader for the vendored qemu-vnc bridge.
 //!
-//! Trimmed from rdma-display's capture crate (the proven NVIDIA recipe):
+//! Trimmed from arsa's capture crate (the proven NVIDIA recipe):
 //! dlopen libEGL/GLES, a surfaceless (or 1x1 pbuffer) GLES 3.1 context on the
 //! render node, import the QEMU scanout dmabuf with its explicit modifier as
 //! GL_TEXTURE_EXTERNAL_OES, blit into a linear RGBA8 target, and read the

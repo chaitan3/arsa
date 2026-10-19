@@ -2,14 +2,14 @@
 
 use std::path::PathBuf;
 
-/// `$XDG_CONFIG_HOME/rdma-display` (or `~/.config/rdma-display`).
+/// `$XDG_CONFIG_HOME/arsa` (or `~/.config/arsa`).
 pub fn config_dir() -> PathBuf {
     if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
-        PathBuf::from(x).join("rdma-display")
+        PathBuf::from(x).join("arsa")
     } else if let Some(h) = std::env::var_os("HOME") {
-        PathBuf::from(h).join(".config").join("rdma-display")
+        PathBuf::from(h).join(".config").join("arsa")
     } else {
-        PathBuf::from(".rdma-display")
+        PathBuf::from(".arsa")
     }
 }
 

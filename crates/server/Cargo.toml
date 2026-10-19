@@ -11,6 +11,10 @@ default = ["portal"]
 portal = ["rdma-display-capture/portal"]
 
 [[bin]]
+name = "arsa-server"
+path = "src/main.rs"
+
+[[bin]]
 name = "reinit-bench"
 path = "src/bin/reinit_bench.rs"
 

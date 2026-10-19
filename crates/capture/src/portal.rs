@@ -79,7 +79,7 @@ pub struct PortalScreenCastSource {
     /// cursor, matching what the KMS path captures).
     pub cursor_mode: u32,
     /// An explicit restore token; `None` falls back to the cached one at
-    /// `$XDG_DATA_HOME/rdma-display/portal_token`.
+    /// `$XDG_DATA_HOME/arsa/portal_token`.
     pub restore_token: Option<String>,
     /// `persist_mode`: 0 = none, 1 = transient, 2 = persistent (default).
     pub persist_mode: u32,
@@ -212,12 +212,12 @@ async fn open_portal_stream(src: &PortalScreenCastSource) -> Result<(u32, OwnedF
 }
 
 /// Where the ScreenCast restore token is cached between server runs:
-/// `$XDG_DATA_HOME/rdma-display/portal_token` (default `~/.local/share/...`).
+/// `$XDG_DATA_HOME/arsa/portal_token` (default `~/.local/share/...`).
 fn token_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
-    Some(base.join("rdma-display").join("portal_token"))
+    Some(base.join("arsa").join("portal_token"))
 }
 
 /// The cached restore token, if one was stored and is non-empty.
@@ -464,7 +464,7 @@ fn pipewire_run(
 
     let stream = pw::stream::StreamBox::new(
         &core,
-        "rdma-display",
+        "arsa",
         properties! {
             *pw::keys::MEDIA_TYPE => "Video",
             *pw::keys::MEDIA_CATEGORY => "Capture",

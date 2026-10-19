@@ -1,4 +1,4 @@
-# rdma-display — Architecture
+# arsa — Architecture
 
 Design and internals. For the metrics model, measurements, the capture-sync
 investigation, and troubleshooting see [`DEBUG.md`](DEBUG.md). For build/run
@@ -6,7 +6,7 @@ instructions see the top-level [`README.md`](../README.md).
 
 ## 1. Overview
 
-rdma-display moves display frames from a Linux **server** to a Linux
+arsa moves display frames from a Linux **server** to a Linux
 **client** with a short, mostly zero-copy pipeline, and sends input back the
 other way. Two capture sources are supported behind one `CaptureSource`
 trait:
@@ -24,7 +24,7 @@ client frees slots. Input events, audio, and control messages ride separate
 tagged TCP connections to the same server port.
 
 The protocol crate (`rdma-display-proto`) is the single source of truth for
-the wire format and is versioned (`VERSION`, currently 13). **Build the server
+the wire format and is versioned (`VERSION`, currently 17). **Build the server
 and client together** — a mismatch is rejected at `Hello`.
 
 ## 2. Data path
@@ -58,7 +58,7 @@ The client also runs:
 ## 3. Workspace layout
 
 ```
-rdma-display/
+arsa/
 ├── crates/
 │   ├── proto/        # wire structs, framing, MsgType, fourcc, InputEvent, keymap
 │   ├── capture/      # CaptureSource trait; drm + qemu impls; InputSink; materializers
@@ -132,7 +132,7 @@ plus a remote fd. The PipeWire stream negotiates raw video and hands us dmabufs,
 wrapped as the same `DmabufScanout` the KMS/QEMU sources produce, so the
 materializer, codecs and transport are unchanged. The compositor draws the
 cursor (`cursor_mode = Embedded`). The `restore_token` returned by `Start` is
-cached in `$XDG_DATA_HOME/rdma-display/portal_token` and replayed on the next
+cached in `$XDG_DATA_HOME/arsa/portal_token` and replayed on the next
 run (with `persist_mode`), so the picker dialog only appears once — or again
 whenever the token is revoked or the source changes.
 

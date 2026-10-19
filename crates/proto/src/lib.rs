@@ -1,4 +1,4 @@
-//! Control-channel protocol for rdma-display: length-prefixed little-endian
+//! Control-channel protocol for arsa: length-prefixed little-endian
 //! messages over TCP (or Unix sockets for local testing).
 //!
 //! Framing: every message is `u32 payload_len | u32 msg_type | payload`.
@@ -11,7 +11,7 @@ pub mod gamepad;
 pub mod keymap;
 
 pub const MAGIC: u32 = 0x5244_4453; // "RDDS"
-pub const VERSION: u32 = 16; // v16: auth preamble (method byte + handshake) on the control connection; v15: Hello carries the client's lossy bitrate; v14: codec preference
+pub const VERSION: u32 = 17; // v17: arsa rename (protocol/crypto labels); v16: auth preamble (method byte + handshake) on the control connection; v15: Hello carries the client's lossy bitrate; v14: codec preference
 
 /// First byte of every connection, so the server routes by an explicit tag
 /// rather than by guessing protocol bytes. Audio uses

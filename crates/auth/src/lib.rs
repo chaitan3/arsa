@@ -1,4 +1,4 @@
-//! Authentication for rdma-display ("method B": SSH-shaped, asymmetric).
+//! Authentication for arsa ("method B": SSH-shaped, asymmetric).
 //!
 //! Trust is a pair of long-term **X25519 static keys** (one per end), plus a
 //! one-time **PIN pairing** that exchanges them:
@@ -11,7 +11,7 @@
 //!   its paired list — giving mutual authentication, forward secrecy and an
 //!   encrypted channel in one round trip.
 //!
-//! Files (under `~/.config/rdma-display/`):
+//! Files (under `~/.config/arsa/`):
 //!
 //! | end | file | contents |
 //! |-----|------|----------|

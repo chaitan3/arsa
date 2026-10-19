@@ -27,7 +27,7 @@
 //! `--metrics` overlay (A/V offset); it is inert when metrics are off.
 //!
 //! TODO(host-play-off): an opt-in server mode that routes host audio into a
-//! virtual sink (PipeWire/PulseAudio `module-null-sink`, e.g. `rdma-display`)
+//! virtual sink (PipeWire/PulseAudio `module-null-sink`, e.g. `arsa`)
 //! and makes it the default while a session is active, so the host speakers
 //! stay silent and only the client hears the audio; restore the previous
 //! default sink on disconnect and on SIGINT/SIGTERM/SIGQUIT. Off by default —

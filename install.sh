@@ -24,8 +24,8 @@ cd "$(dirname "$(readlink -f "$0")")"
 #   CAPS=cap_sys_admin,cap_dac_override,cap_dac_read_search ./install.sh
 CAPS="${CAPS:-cap_sys_admin,cap_dac_override}"
 
-SERVER=target/release/rdma-display-server
-CLIENT=target/release/rdma-display-client
+SERVER=target/release/arsa-server
+CLIENT=target/release/arsa-client
 LIBS=target/release/libpyrowave-shared.so
 DEST=${1:-/usr/local/bin}
 # SKIP_BUILD=1 forces the cargo build to be skipped (e.g. the binaries were
@@ -107,5 +107,5 @@ else
     echo "         (build it with scripts/build-pyrowave-docker.sh)" >&2
 fi
 
-echo "==> setcap $CAPS+ep $DEST/rdma-display-server"
-sudo "$SETCAP" "$CAPS+ep" "$DEST"/rdma-display-server
+echo "==> setcap $CAPS+ep $DEST/arsa-server"
+sudo "$SETCAP" "$CAPS+ep" "$DEST"/arsa-server

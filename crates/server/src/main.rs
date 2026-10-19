@@ -1,4 +1,4 @@
-//! rdma-display server: captures a display source and streams frames to a
+//! arsa server: captures a display source and streams frames to a
 //! client over RDMA.
 //!
 //! Modes (defaults shown):
@@ -223,7 +223,7 @@ fn main() -> Result<()> {
             }
             "-v" | "--verbose" => verbose = true,
             "--help" | "-h" => {
-                println!("usage: rdma-display-server [ADDR[:PORT]] [--mode capture|testcard] [--device mlx5_0] [--listen 0.0.0.0:4791] [--frame-slots 5] [--fps N]\n  \
+                println!("usage: arsa-server [ADDR[:PORT]] [--mode capture|testcard] [--device mlx5_0] [--listen 0.0.0.0:4791] [--frame-slots 5] [--fps N]\n  \
   ADDR[:PORT]  listen address, the same as --listen (default 0.0.0.0:4791; the port defaults to 4791 when omitted)\n  \
   defaults: --mode capture --source drm --fps 0 --codec auto --audio on --capture-sync auto --pace auto (a bare command is a root KMS capture of the host)\n  \
 capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS capture, the host — requires sudo/CAP_SYS_ADMIN, kernel >= 5.8; portal = XDG Desktop Portal ScreenCast over PipeWire — needs a session bus and a portal backend, and needs no root)\n  \

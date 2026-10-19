@@ -1,4 +1,4 @@
-//! RDMA transport for rdma-display.
+//! RDMA transport for arsa.
 //!
 //! Model: one RC queue pair per session. The *client* allocates N receive
 //! slots (registered host memory), advertises them over the control channel,

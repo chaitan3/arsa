@@ -1,4 +1,4 @@
-//! Lossless frame codecs for rdma-display.
+//! Lossless frame codecs for arsa.
 //!
 //! The server turns the materialized frame (a linear BGRA/XRGB scanout) into a
 //! self-describing coded frame before it is DMA-read into the RDMA staging

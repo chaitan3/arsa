@@ -460,7 +460,7 @@ impl InputSink for UinputSink {
 /// sees the full keysym space (matching what xkb expects).
 fn uinput_keyboard() -> Result<UinputDev> {
     let d = UinputDev { fd: open_uinput(false)? }
-        .setup("rdma-display keyboard", 0, BUS_VIRTUAL, 0x1ab0, 0x5250, 1)?;
+        .setup("arsa keyboard", 0, BUS_VIRTUAL, 0x1ab0, 0x5250, 1)?;
     d.set_evbit(EV_SYN)?;
     d.set_evbit(EV_KEY)?;
     for k in 1..=KEY_MAX {
@@ -475,7 +475,7 @@ fn uinput_keyboard() -> Result<UinputDev> {
 /// motion into pointer-locked games.
 fn uinput_pointer_rel() -> Result<UinputDev> {
     let d = UinputDev { fd: open_uinput(false)? }
-        .setup("rdma-display mouse", 0, BUS_VIRTUAL, 0x1ab0, 0x5250, 1)?;
+        .setup("arsa mouse", 0, BUS_VIRTUAL, 0x1ab0, 0x5250, 1)?;
     d.set_evbit(EV_SYN)?;
     d.set_evbit(EV_KEY)?;
     d.set_evbit(EV_REL)?;
@@ -515,7 +515,7 @@ impl UinputMouse {
 /// buttons + wheel + ABS X/Y over the giant fixed ranges. No REL_X/REL_Y.
 fn uinput_pointer_abs() -> Result<UinputDev> {
     let d = UinputDev { fd: open_uinput(false)? }
-        .setup("rdma-display mouse (absolute)", 0, BUS_VIRTUAL, 0x1ab0, 0x5250, 1)?;
+        .setup("arsa mouse (absolute)", 0, BUS_VIRTUAL, 0x1ab0, 0x5250, 1)?;
     d.set_propbit(INPUT_PROP_POINTER)?;
     d.set_evbit(EV_SYN)?;
     d.set_evbit(EV_KEY)?;
@@ -551,7 +551,7 @@ fn uinput_pointer_abs() -> Result<UinputDev> {
 fn uinput_gamepad() -> Result<UinputDev> {
     const BUS_USB: u16 = 0x03;
     let d = UinputDev { fd: open_uinput(true)? }.setup(
-        "rdma-display X-Box One (virtual) pad",
+        "arsa X-Box One (virtual) pad",
         4,
         BUS_USB,
         0x045e,

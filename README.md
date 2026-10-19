@@ -1,4 +1,4 @@
-# rdma-display
+# arsa
 
 A low-latency remote display system for Linux. A **server** captures a
 display (either the host's own KMS scanout or a QEMU guest's D-Bus display),
@@ -82,7 +82,7 @@ Manual equivalent:
 
 ```bash
 cargo build --release -p rdma-display-server -p rdma-display-client
-sudo setcap cap_sys_admin+ep target/release/rdma-display-server
+sudo setcap cap_sys_admin+ep target/release/arsa-server
 ```
 
 Widen the capability set if you use the root-only features (see the comments
@@ -101,10 +101,10 @@ CAPS=cap_sys_admin,cap_dac_override,cap_dac_read_search ./install.sh
 
 ```bash
 # host KMS capture, uinput injection, everything auto (the default)
-./target/release/rdma-display-server
+./target/release/arsa-server
 
 # explicit, with the common knobs
-./target/release/rdma-display-server \
+./target/release/arsa-server \
     --source drm --input uinput \
     --codec lossless --transport auto \
     --listen 0.0.0.0:4791
@@ -118,20 +118,20 @@ resolution backend, and `--gpu-power` all need the session environment.
 For a QEMU guest instead of the host:
 
 ```bash
-./target/release/rdma-display-server --source qemu --dbus-socket /run/.../dbus.sock
+./target/release/arsa-server --source qemu --dbus-socket /run/.../dbus.sock
 ```
 
 ### Client
 
 ```bash
 # Wayland window, fullscreen, grab from the start
-./target/release/rdma-display-client 192.168.1.10 -f -g
+./target/release/arsa-client 192.168.1.10 -f -g
 
 # headless sanity check: 10 seconds to a PPM
-./target/release/rdma-display-client 192.168.1.10 --output none --seconds 10 --dump out.ppm
+./target/release/arsa-client 192.168.1.10 --output none --seconds 10 --dump out.ppm
 
 # ask the server to match this monitor's resolution before starting
-./target/release/rdma-display-client 192.168.1.10 -f --native
+./target/release/arsa-client 192.168.1.10 -f --native
 ```
 
 The host is the first positional argument (`HOST` or `HOST:PORT`; port 4791 is
@@ -195,7 +195,7 @@ both ends.
 | --- | --- |
 | `--source drm\|qemu\|portal` | Capture the host KMS scanout (default), a QEMU guest, or the compositor via the XDG Desktop Portal. |
 | `--input qemu\|uinput` | Injection sink. Default: paired with the source (`drm`→`uinput`, `qemu`→`qemu-dbus`). |
-| `--listen ADDR:PORT` | Bind address (default `0.0.0.0:4791`). May also be given as the first positional argument, e.g. `rdma-display-server 0.0.0.0:4791`; a bare host gets port 4791. |
+| `--listen ADDR:PORT` | Bind address (default `0.0.0.0:4791`). May also be given as the first positional argument, e.g. `arsa-server 0.0.0.0:4791`; a bare host gets port 4791. |
 | `--codec auto\|raw\|lossless\|lossy` | Frame coding. `auto` (default) honours the client's requested codec, else lossless; an explicit value forces it. |
 | `--transport auto\|rdma\|tcp` | Video transport (default `auto`: RDMA when possible). |
 | `--fps N` | Pacing cap; `0` = consumer-paced by client credits (default). |
@@ -236,8 +236,8 @@ both ends.
 ### Authentication
 
 Auth is **required**. On first run the server generates a long-term X25519 key
-(`~/.config/rdma-display/host.key`) and only admits clients listed in
-`~/.config/rdma-display/authorized_clients`. **Pairing is automatic**: the first
+(`~/.config/arsa/host.key`) and only admits clients listed in
+`~/.config/arsa/authorized_clients`. **Pairing is automatic**: the first
 time a client connects it has no pinned key for that server, so it asks to pair,
 the server prints a 6-digit PIN, and the client prompts for it.
 
@@ -245,11 +245,11 @@ the server prints a 6-digit PIN, and the client prompts for it.
 # server (already running, no restart needed)
   [auth] new client "laptop" wants to pair — enter PIN 483102 on the client
 # client
-rdma-display-client HOST
+arsa-client HOST
   enter the pairing PIN shown on the server: 483102
 ```
 
-After pairing the client keeps its key in `~/.config/rdma-display/id.key` and
+After pairing the client keeps its key in `~/.config/arsa/id.key` and
 the server's key in `known_servers`; later connections authenticate with a Noise
 `IK` handshake (no PIN). Pairing uses SPAKE2, so a recorded pairing cannot be
 brute-forced offline, and a wrong PIN is rejected. The control connection is

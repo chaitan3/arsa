@@ -19,8 +19,8 @@
 //! S→C  server_static_pub(32), server_name, msg_b        (server prints the PIN)
 //! C→S  msg_a                                            (client prompts for the PIN)
 //!      (both) K = SPAKE2.finish(peer msg)
-//! C→S  mac_c = HMAC(K, "rdma-display-pair-c" ‖ transcript)
-//! S→C  mac_s = HMAC(K, "rdma-display-pair-s" ‖ transcript)
+//! C→S  mac_c = HMAC(K, "arsa-pair-c" ‖ transcript)
+//! S→C  mac_s = HMAC(K, "arsa-pair-s" ‖ transcript)
 //! ```
 
 use std::io::{Read, Write};
@@ -36,8 +36,8 @@ use crate::stream::{read_frame, write_frame};
 type HmacSha256 = Hmac<Sha256>;
 
 /// SPAKE2 role identities (fixed strings bind the exchange to this protocol).
-const PAKE_CLIENT: &[u8] = b"rdma-display-client";
-const PAKE_SERVER: &[u8] = b"rdma-display-server";
+const PAKE_CLIENT: &[u8] = b"arsa-client";
+const PAKE_SERVER: &[u8] = b"arsa-server";
 
 /// What the client learns from a successful pairing.
 #[derive(Debug)]
@@ -89,12 +89,12 @@ pub fn pair_client<S: Read + Write>(
         name.as_bytes(),
         &server_name,
     );
-    let mac_c = mac(&key, b"rdma-display-pair-c", &transcript);
+    let mac_c = mac(&key, b"arsa-pair-c", &transcript);
     write_frame(&mut stream, &mac_c).context("send confirm")?;
 
     let mut mac_s = Vec::new();
     read_frame(&mut stream, &mut mac_s).context("read server confirm")?;
-    let want = mac(&key, b"rdma-display-pair-s", &transcript);
+    let want = mac(&key, b"arsa-pair-s", &transcript);
     if !constant_time_eq(&mac_s, &want) {
         bail!("server failed to confirm the PIN (wrong PIN?)");
     }
@@ -155,11 +155,11 @@ pub fn pair_server<S: Read + Write>(
     );
     let mut mac_c = Vec::new();
     read_frame(&mut stream, &mut mac_c).context("read client confirm")?;
-    let want_c = mac(&key, b"rdma-display-pair-c", &transcript);
+    let want_c = mac(&key, b"arsa-pair-c", &transcript);
     if !constant_time_eq(&mac_c, &want_c) {
         bail!("client failed to confirm the PIN (wrong PIN?)");
     }
-    let mac_s = mac(&key, b"rdma-display-pair-s", &transcript);
+    let mac_s = mac(&key, b"arsa-pair-s", &transcript);
     write_frame(&mut stream, &mac_s).context("send server confirm")?;
 
     Ok((stream, client_name, client_pub))

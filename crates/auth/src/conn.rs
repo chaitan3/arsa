@@ -3,7 +3,7 @@
 //! The video/input/audio sockets are opened after the authenticated control
 //! handshake. Rather than send the session secret (a sniffable, replayable
 //! bearer token), the server sends a fresh nonce and the client answers with
-//! `HMAC(secret, "rdma-display-conn" ‖ tag ‖ nonce)`. The `tag` binds the proof
+//! `HMAC(secret, "arsa-conn" ‖ tag ‖ nonce)`. The `tag` binds the proof
 //! to the socket kind, so an input proof can't be replayed onto the video
 //! socket.
 
@@ -22,7 +22,7 @@ const PROOF_LEN: usize = 32;
 
 fn proof(secret: &[u8; SECRET_LEN], tag: u8, nonce: &[u8]) -> Vec<u8> {
     let mut m = HmacSha256::new_from_slice(secret).expect("hmac accepts any key length");
-    m.update(b"rdma-display-conn");
+    m.update(b"arsa-conn");
     m.update(&[tag]);
     m.update(nonce);
     m.finalize().into_bytes().to_vec()

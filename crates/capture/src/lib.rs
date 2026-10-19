@@ -1,4 +1,4 @@
-//! Capture backends for rdma-display.
+//! Capture backends for arsa.
 //!
 //! A `CaptureSource` produces two kinds of events:
 //!   * `Scanout` — a new scanout appeared (resolution/format changed). The

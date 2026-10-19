@@ -1,4 +1,4 @@
-# rdma-display — Debugging & Performance
+# arsa — Debugging & Performance
 
 Measurements, the capture-sync/handover investigation, and troubleshooting.
 For design and architecture see [`ARCHITECTURE.md`](ARCHITECTURE.md).
@@ -276,7 +276,7 @@ and triple buffering: expect ~1–2 frames (8–16 ms at 120 Hz). To reduce it:
 **Server capture fails / "drm capture needs root".** KMS capture needs
 `CAP_SYS_ADMIN` and an active scanout. Re-run `install.sh` after every rebuild
 (file capabilities live on the inode). Confirm with `getcap
-target/release/rdma-display-server`.
+target/release/arsa-server`.
 
 **Video freezes or goes black when a fullscreen app/game starts (audio keeps
 playing).** Under **direct scanout** the compositor points the plane at the
@@ -326,23 +326,23 @@ ends (`[rdma] no routable GID`). Check `RLIMIT_MEMLOCK` covers the pinned pages
 and that the QP uses `PERMISSIVE` access. Force `--transport tcp` to isolate.
 
 **Handshake rejects the peer.** The wire format is versioned
-(`VERSION`, currently 13). Rebuild the server and client together.
+(`VERSION`, currently 17). Rebuild the server and client together.
 
 ## 8. Useful commands
 
 ```bash
 # what capability the server binary actually has
-getcap target/release/rdma-display-server
+getcap target/release/arsa-server
 
 # 10 s headless capture to a PPM (no compositor needed)
-./target/release/rdma-display-client HOST --output none --seconds 10 --dump out.ppm
+./target/release/arsa-client HOST --output none --seconds 10 --dump out.ppm
 
 # latency overlay + clock sync
-./target/release/rdma-display-client HOST -f --metrics
+./target/release/arsa-client HOST -f --metrics
 
 # which sync mode the server chose and why
-./target/release/rdma-display-server --capture-sync auto   # watch [capture-drm] lines
+./target/release/arsa-server --capture-sync auto   # watch [capture-drm] lines
 
 # advertise the current monitor mode to the server
-./target/release/rdma-display-client HOST -f --native
+./target/release/arsa-client HOST -f --native
 ```

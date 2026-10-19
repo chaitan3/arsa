@@ -4,6 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 publish = false
 
+[[bin]]
+name = "arsa-client"
+path = "src/main.rs"
+
 [dev-dependencies]
 tempfile = "3"
 

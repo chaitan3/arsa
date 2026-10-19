@@ -9,7 +9,7 @@ publish = false
 #    with gl=on guests, where QEMU never sends plain updates
 #  - keysym->qnum mapping generated in-tree (keycodemap's full crate is not
 #    vendored; see src/keymap.rs)
-# No dependencies on the other rdma-display crates: the EGL import path is a
+# No dependencies on the other arsa crates: the EGL import path is a
 # trimmed copy of the capture crate's proven EGL/GL recipe, but standalone.
 
 [dependencies]

@@ -144,7 +144,7 @@ impl Pulse {
             server,
             PA_STREAM_RECORD,
             Some(dev),
-            "rdma-display-capture",
+            "arsa-capture",
             spec,
             BufferAttr {
                 // (uint32)-1 = "server default": pipewire-pulse clamps a
@@ -185,7 +185,7 @@ impl Pulse {
             server,
             PA_STREAM_PLAYBACK,
             None, // default sink
-            "rdma-display",
+            "arsa",
             spec,
             BufferAttr {
                 maxlength: tlength.saturating_mul(4),

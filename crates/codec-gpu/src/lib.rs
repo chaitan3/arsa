@@ -1,4 +1,4 @@
-//! GPU (GLES 3.1 compute) encoder/decoder for the rdma-display lossless
+//! GPU (GLES 3.1 compute) encoder/decoder for the arsa lossless
 //! frame codec. Produces and consumes exactly the byte format defined by
 //! `rdma-display-codec`, so a GPU-coded frame is decodable by the CPU
 //! reference decoder and vice versa.

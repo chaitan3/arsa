@@ -2491,6 +2491,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "log 0.4.34",
+ "rdma-display-proto",
  "sha2",
  "snow",
  "spake2",

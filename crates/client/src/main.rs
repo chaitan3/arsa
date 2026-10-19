@@ -1,4 +1,4 @@
-//! rdma-display client: connects to an rdma-display server over the control
+//! arsa client: connects to an arsa server over the control
 //! channel, receives frames via RDMA WRITE into registered slots, and either
 //! presents them on Wayland (`--output egl`, default: the slots themselves are
 //! wl_buffers, credits pace on compositor release) or runs headless
@@ -142,7 +142,7 @@ fn main() -> Result<()> {
                 };
             }
             "--help" | "-h" => {
-                println!("usage: rdma-display-client [HOST[:PORT]] [--device mlx5_0] [--frame-slots 5] [--dump frame.ppm] [--seconds N]");
+                println!("usage: arsa-client [HOST[:PORT]] [--device mlx5_0] [--frame-slots 5] [--dump frame.ppm] [--seconds N]");
                 println!("  HOST[:PORT]           server address, given as the first positional argument (default host 127.0.0.1; :{DEFAULT_PORT} assumed when the port is omitted)");
                 println!("  -s, --server HOST[:PORT]  same as the positional HOST[:PORT] (either form may be used)");
                 println!("  --frame-slots N       receive slots, each holding one coded frame: sets the receive-buffer pool and the maximum flow-control window (default 5; --slots is accepted as an alias)");
