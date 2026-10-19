@@ -646,11 +646,23 @@ pub trait StreamCipher: Send {
 
 pub struct Conn<T: Read + Write> {
     io: T,
+    tx: Option<Box<dyn StreamCipher>>,
+    rx: Option<Box<dyn StreamCipher>>,
 }
 
 impl<T: Read + Write> Conn<T> {
     pub fn new(io: T) -> Self {
-        Self { io }
+        Self { io, tx: None, rx: None }
+    }
+
+    /// A connection whose messages are sealed/opened by the given ciphers
+    /// (None on a side keeps that direction in the clear).
+    pub fn encrypted(
+        io: T,
+        tx: Option<Box<dyn StreamCipher>>,
+        rx: Option<Box<dyn StreamCipher>>,
+    ) -> Self {
+        Self { io, tx, rx }
     }
 
     pub fn into_inner(self) -> T {
@@ -658,24 +670,66 @@ impl<T: Read + Write> Conn<T> {
     }
 
     pub fn send(&mut self, msg: &Message) -> std::io::Result<()> {
-        send_msg(&mut self.io, msg)
+        let Some(c) = self.tx.as_mut() else {
+            return send_msg(&mut self.io, msg);
+        };
+        let (ty, payload) = encode_msg(msg)?;
+        let mut body = Vec::with_capacity(4 + payload.len());
+        body.extend_from_slice(&ty.to_le_bytes());
+        body.extend_from_slice(&payload);
+        let mut ct = Vec::with_capacity(body.len() + 16);
+        c.seal(&body, &mut ct);
+        self.io.write_all(&(ct.len() as u32).to_le_bytes())?;
+        self.io.write_all(&ct)?;
+        self.io.flush()
+    }
+
+    /// Read one message body: plaintext `[u32 len][u32 type][payload]`, or
+    /// encrypted `[u32 ct_len][ct]` → `[u32 type][payload]`.
+    fn read_body(&mut self) -> std::io::Result<(u32, Vec<u8>)> {
+        if self.rx.is_some() {
+            let mut hdr = [0u8; 4];
+            self.io.read_exact(&mut hdr)?;
+            let n = u32::from_le_bytes(hdr) as usize;
+            if n > MAX_PAYLOAD + 4 + 16 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "encrypted message too large",
+                ));
+            }
+            let mut ct = vec![0u8; n];
+            self.io.read_exact(&mut ct)?;
+            let mut body = Vec::with_capacity(n);
+            self.rx.as_mut().unwrap().open(&ct, &mut body)?;
+            if body.len() < 4 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "short decrypted message",
+                ));
+            }
+            let ty = u32::from_le_bytes(body[0..4].try_into().unwrap());
+            Ok((ty, body[4..].to_vec()))
+        } else {
+            let mut hdr = [0u8; 8];
+            self.io.read_exact(&mut hdr)?;
+            let len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
+            let ty = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
+            if len > MAX_PAYLOAD {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "payload too large",
+                ));
+            }
+            let mut payload = vec![0u8; len];
+            if len > 0 {
+                self.io.read_exact(&mut payload)?;
+            }
+            Ok((ty, payload))
+        }
     }
 
     pub fn recv(&mut self) -> std::io::Result<Message> {
-        let mut hdr = [0u8; 8];
-        self.io.read_exact(&mut hdr)?;
-        let len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
-        let ty = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
-        if len > MAX_PAYLOAD {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "payload too large",
-            ));
-        }
-        let mut payload = vec![0u8; len];
-        if len > 0 {
-            self.io.read_exact(&mut payload)?;
-        }
+        let (ty, payload) = self.read_body()?;
 
         fn u32_at(p: &[u8], o: usize) -> std::io::Result<u32> {
             let b = p

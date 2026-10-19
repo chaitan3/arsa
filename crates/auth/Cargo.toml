@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 log.workspace = true
+rdma-display-proto.workspace = true
 # Noise (Noise_IK_25519_ChaChaPoly_BLAKE2s) for the authenticated, encrypted
 # transport; SPAKE2 for the one-time PIN pairing (offline-attack resistant).
 snow = "0.10"

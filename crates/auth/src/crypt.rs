@@ -104,6 +104,26 @@ impl Open {
     }
 }
 
+impl rdma_display_proto::StreamCipher for Seal {
+    fn seal(&mut self, plain: &[u8], out: &mut Vec<u8>) {
+        Seal::seal(self, plain, out);
+    }
+    fn open(&mut self, _ct: &[u8], _out: &mut Vec<u8>) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "seal-only cipher",
+        ))
+    }
+}
+
+impl rdma_display_proto::StreamCipher for Open {
+    fn seal(&mut self, _plain: &[u8], _out: &mut Vec<u8>) {}
+    fn open(&mut self, ct: &[u8], out: &mut Vec<u8>) -> std::io::Result<()> {
+        Open::open(self, ct, out)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

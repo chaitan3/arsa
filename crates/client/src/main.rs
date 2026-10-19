@@ -365,7 +365,7 @@ fn main() -> Result<()> {
         let secret = session_secret;
         std::thread::Builder::new()
             .name("input".into())
-            .spawn(move || input_thread(addr, secret, input_rx))
+            .spawn(move || input_thread(addr, secret, stream_encrypt, input_rx))
             .context("spawn input thread")?;
     }
 
@@ -811,6 +811,7 @@ fn prompt_pin() -> anyhow::Result<String> {
 fn input_thread(
     addr: std::net::SocketAddr,
     secret: [u8; rdma_display_auth::SECRET_LEN],
+    encrypt: bool,
     rx: std::sync::mpsc::Receiver<rdma_display_proto::InputEvent>,
 ) {
     use std::io::Write as _;
@@ -841,7 +842,16 @@ fn input_thread(
         }
         log::info!("[input] connected ({addr})");
         backoff = std::time::Duration::from_millis(200);
-        let mut conn = Conn::new(sock);
+        let mut conn = if encrypt {
+            let key = rdma_display_auth::derive_stream_key(
+                &secret,
+                rdma_display_proto::TAG_INPUT,
+                true,
+            );
+            Conn::encrypted(sock, Some(Box::new(rdma_display_auth::Seal::new(&key))), None)
+        } else {
+            Conn::new(sock)
+        };
         loop {
             match rx.recv() {
                 Ok(ev) => {

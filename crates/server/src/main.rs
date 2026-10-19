@@ -1458,10 +1458,14 @@ fn run_capture(
                 }
                 match workers.as_ref() {
                     Some(w) => {
+                        let (enc, sec) = match *session_secret.lock().unwrap() {
+                            Some(s) => (!no_encrypt, s),
+                            None => (false, [0u8; rdma_display_auth::SECRET_LEN]),
+                        };
                         let input_tx = w.input_tx.clone();
                         let _ = std::thread::Builder::new()
                             .name("input-reader".into())
-                            .spawn(move || serve_input(stream, input_tx, addr));
+                            .spawn(move || serve_input(stream, enc, sec, input_tx, addr));
                     }
                     None => log::warn!(
                         "[input] input connection with no active session: dropped ({addr})"
@@ -2534,11 +2538,19 @@ fn gpu_clocks() -> String {
 
 fn serve_input(
     stream: std::net::TcpStream,
+    encrypt: bool,
+    secret: [u8; rdma_display_auth::SECRET_LEN],
     input_tx: mpsc::Sender<rdma_display_proto::InputEvent>,
     addr: std::net::SocketAddr,
 ) {
     log::info!("[input] client input stream connected ({addr})");
-    let mut conn = Conn::new(stream);
+    let mut conn = if encrypt {
+        let key =
+            rdma_display_auth::derive_stream_key(&secret, rdma_display_proto::TAG_INPUT, true);
+        Conn::encrypted(stream, None, Some(Box::new(rdma_display_auth::Open::new(&key))))
+    } else {
+        Conn::new(stream)
+    };
     let mut keys: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut btns: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut gp_btns: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
