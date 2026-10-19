@@ -495,6 +495,8 @@ pub struct ServerLink {
     /// Shared seal for the control direction (handshake `Conn` + stamp/rumble
     /// writers); None when unencrypted.
     ctrl_seal: Option<std::sync::Arc<std::sync::Mutex<rdma_display_auth::Seal>>>,
+    /// Reused ciphertext scratch for the video seal (avoids one alloc/frame).
+    video_ct: Vec<u8>,
 }
 
 impl ServerLink {
@@ -735,6 +737,7 @@ impl ServerLink {
             last_sent_bytes: 0,
             video_seal: video_key.map(|k| rdma_display_auth::Seal::new(&k)),
             ctrl_seal,
+            video_ct: Vec::new(),
         })
     }
 
@@ -1139,6 +1142,7 @@ impl ServerLink {
         let t1_unix_us = proto::unix_now_us();
         let seq = self.seq;
         let mut seal = self.video_seal.take();
+        let mut scratch = std::mem::take(&mut self.video_ct);
         let (t2_unix_us, t2c_unix_us) = {
             let Tx::Tcp { buf, .. } = &self.tx else {
                 unreachable!()
@@ -1156,13 +1160,14 @@ impl ServerLink {
             }
             match seal.as_mut() {
                 Some(s) => {
-                    let mut ct = Vec::with_capacity(post_len + 16);
-                    s.seal(&buf[..post_len], &mut ct);
-                    w.write_all(&(ct.len() as u32).to_le_bytes())
+                    scratch.clear();
+                    scratch.reserve(post_len + 16);
+                    s.seal(&buf[..post_len], &mut scratch);
+                    w.write_all(&(scratch.len() as u32).to_le_bytes())
                         .context("tcp video frame length")?;
                     w.write_all(&seq.to_le_bytes())
                         .context("tcp video frame seq")?;
-                    w.write_all(&ct).context("tcp video frame")?;
+                    w.write_all(&scratch).context("tcp video frame")?;
                 }
                 None => {
                     w.write_all(&(post_len as u32).to_le_bytes())
@@ -1178,6 +1183,7 @@ impl ServerLink {
             (t2, t2)
         };
         self.video_seal = seal;
+        self.video_ct = scratch;
         self.note_send();
         self.seq += 1;
         self.last_sent_bytes = post_len;

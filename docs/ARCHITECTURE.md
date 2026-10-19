@@ -555,10 +555,10 @@ The handshake yields an authenticated, encrypted channel; the server generates a
 32-byte **session secret** and sends it inside it. The video/input/audio sockets
 then prove possession of that secret by **challenge-response**
 (`HMAC(secret, tag ‖ nonce)`), so the secret never travels and a proof can't be
-replayed onto another socket. The control connection reverts to the clear after
-the preamble (the stream is split across a reader thread and a writer, which a
-single Noise transport can't serve), so **the streams are authenticated but not
-yet encrypted** — channel encryption is a follow-up.
+replayed onto another socket. All four TCP streams are then **AES-256-GCM
+encrypted** with per-connection, per-direction keys derived from the secret (so
+a reader thread and a writer can share a socket without shared mutable state);
+RDMA video stays plaintext, and `--no-encrypt` disables it.
 
 ## 12. Design decisions and limits
 

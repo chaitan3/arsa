@@ -933,6 +933,41 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn encrypted_conn_round_trip() {
+        use std::net::{TcpListener, TcpStream};
+        struct Xor(u8);
+        impl StreamCipher for Xor {
+            fn seal(&mut self, plain: &[u8], out: &mut Vec<u8>) {
+                out.clear();
+                out.extend(plain.iter().map(|b| b ^ self.0));
+                out.push(0xAA);
+            }
+            fn open(&mut self, ct: &[u8], out: &mut Vec<u8>) -> std::io::Result<()> {
+                if ct.last() != Some(&0xAA) {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "tag"));
+                }
+                out.clear();
+                out.extend(ct[..ct.len() - 1].iter().map(|b| b ^ self.0));
+                Ok(())
+            }
+        }
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let c = TcpStream::connect(addr).unwrap();
+        let (s, _) = l.accept().unwrap();
+        let t = std::thread::spawn(move || {
+            let mut conn = Conn::encrypted(s, Some(Box::new(Xor(7))), None);
+            conn.send(&Message::Ping(12345)).unwrap();
+        });
+        let mut conn = Conn::encrypted(c, None, Some(Box::new(Xor(7))));
+        match conn.recv().unwrap() {
+            Message::Ping(n) => assert_eq!(n, 12345),
+            other => panic!("unexpected {other:?}"),
+        }
+        t.join().unwrap();
+    }
+
+    #[test]
     fn stamp_ping_pong_roundtrip() {
         let msgs = [
             Message::Hello(Hello {

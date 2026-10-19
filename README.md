@@ -205,6 +205,7 @@ both ends.
 | `--display-control auto\|hyprctl\|kscreen\|none` | Backend for the client's resolution request (default `auto`). |
 | `--display-output NAME` | DRM connector name for the resolution request (default: the compositor's primary output). Capture picks the first bound plane. |
 | `--audio` / `--no-audio` / `--audio-device SRC` | Audio side-channel (default on; `@DEFAULT_MONITOR@` = default sink). |
+| `--no-encrypt` | Leave the TCP streams in the clear (default: AES-256-GCM). RDMA video is always unencrypted. |
 | `--gpu-power off\|p5\|p0\|max\|<sm>[,<mem>]` | Floor NVIDIA clocks (needs root). |
 | `--frame-slots N` | Receive/staging slots, each holding one coded frame; sets the receive-buffer pool and the maximum flow-control window (default 5; `--slots` accepted as an alias). |
 | `--idle-metrics N` | Log RSS/CPU every N seconds. |
@@ -253,8 +254,11 @@ the server's key in `known_servers`; later connections authenticate with a Noise
 `IK` handshake (no PIN). Pairing uses SPAKE2, so a recorded pairing cannot be
 brute-forced offline, and a wrong PIN is rejected. The control connection is
 authenticated, and the video/input/audio sockets prove possession of a
-per-session secret (challenge-response, so the secret never travels); the
-streams themselves are **not yet encrypted** — that is a follow-up.
+per-session secret (challenge-response, so the secret never travels). All four
+TCP streams (control, video, input, audio) are then **AES-256-GCM encrypted**
+with per-connection keys derived from that secret. RDMA video is plaintext (the
+verbs data plane cannot be encrypted without a copy), and `--no-encrypt`
+disables stream encryption on the TCP transport.
 
 **Shortcut:** `Ctrl+Alt+G` (or `-g` at startup) grabs keyboard+mouse for the
 remote side — the local compositor's own shortcuts (Alt+F4, Alt+Tab, …) are
