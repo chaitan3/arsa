@@ -1154,6 +1154,15 @@ fn run_capture(
     let session_secret: std::sync::Arc<
         std::sync::Mutex<Option<[u8; rdma_display_auth::SECRET_LEN]>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(None));
+    // --pair: a one-time PIN, generated now and printed so the user can enter it
+    // on the client (cleared after the first successful pairing)
+    let mut pair_pin: Option<String> = if pair {
+        let p = rdma_display_auth::pair::random_pin(6)?;
+        eprintln!("\n  [auth] pairing armed — on the client run with --pair and enter PIN {p}\n");
+        Some(p)
+    } else {
+        None
+    };
     let started = std::time::Instant::now();
     // source frame period, measured from the capture t0s: the denominator for
     // the flow-control window (independent of the window, unlike the send
@@ -1512,21 +1521,13 @@ fn run_capture(
                 // session work, and record the session secret for the secondary
                 // sockets.
                 let stream = {
-                    let pin = if pair {
-                        Some(rdma_display_auth::pair::random_pin(6)?)
-                    } else {
-                        None
-                    };
-                    if let Some(p) = &pin {
-                        eprintln!("\n  [auth] pairing armed — enter PIN {p} on the client\n");
-                    }
                     match rdma_display_auth::server_auth(
                         stream,
                         &host_identity,
                         &mut authorized,
                         "server",
                         pair,
-                        pin.as_deref(),
+                        pair_pin.as_deref(),
                     ) {
                         Ok((stream, auth)) => {
                             if auth.newly_paired {
@@ -1536,6 +1537,7 @@ fn run_capture(
                                     auth.client_name,
                                     rdma_display_auth::fingerprint(&auth.client_public)
                                 );
+                                pair_pin = None; // one-time
                             }
                             log::info!(
                                 "[auth] client {:?} authenticated ({peer})",
