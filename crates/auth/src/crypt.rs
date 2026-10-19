@@ -105,8 +105,12 @@ impl Open {
 }
 
 impl rdma_display_proto::StreamCipher for Seal {
-    fn seal(&mut self, plain: &[u8], out: &mut Vec<u8>) {
-        Seal::seal(self, plain, out);
+    fn write_msg(&mut self, w: &mut dyn std::io::Write, body: &[u8]) -> std::io::Result<()> {
+        let mut ct = Vec::with_capacity(body.len() + 16);
+        self.seal(body, &mut ct);
+        w.write_all(&(ct.len() as u32).to_le_bytes())?;
+        w.write_all(&ct)?;
+        w.flush()
     }
     fn open(&mut self, _ct: &[u8], _out: &mut Vec<u8>) -> std::io::Result<()> {
         Err(std::io::Error::new(
@@ -117,7 +121,12 @@ impl rdma_display_proto::StreamCipher for Seal {
 }
 
 impl rdma_display_proto::StreamCipher for Open {
-    fn seal(&mut self, _plain: &[u8], _out: &mut Vec<u8>) {}
+    fn write_msg(&mut self, _w: &mut dyn std::io::Write, _body: &[u8]) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "open-only cipher",
+        ))
+    }
     fn open(&mut self, ct: &[u8], out: &mut Vec<u8>) -> std::io::Result<()> {
         Open::open(self, ct, out)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))

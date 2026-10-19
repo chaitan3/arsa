@@ -397,8 +397,13 @@ extern "C" {
 struct SharedSeal(std::sync::Arc<std::sync::Mutex<rdma_display_auth::Seal>>);
 
 impl proto::StreamCipher for SharedSeal {
-    fn seal(&mut self, plain: &[u8], out: &mut Vec<u8>) {
-        self.0.lock().unwrap().seal(plain, out);
+    fn write_msg(
+        &mut self,
+        w: &mut dyn std::io::Write,
+        body: &[u8],
+    ) -> std::io::Result<()> {
+        let mut guard = self.0.lock().unwrap();
+        proto::StreamCipher::write_msg(&mut *guard, w, body)
     }
     fn open(&mut self, _ct: &[u8], _out: &mut Vec<u8>) -> std::io::Result<()> {
         Err(std::io::Error::new(
@@ -413,7 +418,16 @@ impl proto::StreamCipher for SharedSeal {
 struct SharedOpen(std::sync::Arc<std::sync::Mutex<rdma_display_auth::Open>>);
 
 impl proto::StreamCipher for SharedOpen {
-    fn seal(&mut self, _plain: &[u8], _out: &mut Vec<u8>) {}
+    fn write_msg(
+        &mut self,
+        _w: &mut dyn std::io::Write,
+        _body: &[u8],
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "open-only cipher",
+        ))
+    }
     fn open(&mut self, ct: &[u8], out: &mut Vec<u8>) -> std::io::Result<()> {
         self.0.lock().unwrap().open(ct, out).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
@@ -434,11 +448,10 @@ fn send_ctrl<W: std::io::Write>(
     let mut body = Vec::with_capacity(4 + payload.len());
     body.extend_from_slice(&ty.to_le_bytes());
     body.extend_from_slice(&payload);
-    let mut ct = Vec::with_capacity(body.len() + 16);
-    seal.lock().unwrap().seal(&body, &mut ct);
-    w.write_all(&(ct.len() as u32).to_le_bytes())?;
-    w.write_all(&ct)?;
-    w.flush()
+    // hold the seal's lock across seal + write, so the on-wire order matches
+    // the nonce order even with several writers
+    let mut guard = seal.lock().unwrap();
+    proto::StreamCipher::write_msg(&mut *guard, w, &body)
 }
 
 /// How many recent send -> credit turnarounds the windowed max keeps. Bounds

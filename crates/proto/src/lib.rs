@@ -638,8 +638,10 @@ pub fn send_msg<T: Write>(io: &mut T, msg: &Message) -> std::io::Result<()> {
 /// Per-direction stream cipher used by [`Conn`] when the session is encrypted.
 /// Implemented by the transport layer so `proto` stays crypto-agnostic.
 pub trait StreamCipher: Send {
-    /// Seal `plain`, appending the ciphertext (with tag) to `out`.
-    fn seal(&mut self, plain: &[u8], out: &mut Vec<u8>);
+    /// Seal `body` and write the framed ciphertext to `w`. Implementations that
+    /// are shared by several writers must hold their lock across the write, so
+    /// the on-wire order matches the nonce order.
+    fn write_msg(&mut self, w: &mut dyn Write, body: &[u8]) -> std::io::Result<()>;
     /// Open `ct` into `out`; a bad tag/counter is an error.
     fn open(&mut self, ct: &[u8], out: &mut Vec<u8>) -> std::io::Result<()>;
 }
@@ -677,11 +679,7 @@ impl<T: Read + Write> Conn<T> {
         let mut body = Vec::with_capacity(4 + payload.len());
         body.extend_from_slice(&ty.to_le_bytes());
         body.extend_from_slice(&payload);
-        let mut ct = Vec::with_capacity(body.len() + 16);
-        c.seal(&body, &mut ct);
-        self.io.write_all(&(ct.len() as u32).to_le_bytes())?;
-        self.io.write_all(&ct)?;
-        self.io.flush()
+        c.write_msg(&mut self.io, &body)
     }
 
     /// Read one message body: plaintext `[u32 len][u32 type][payload]`, or
@@ -937,10 +935,16 @@ mod tests {
         use std::net::{TcpListener, TcpStream};
         struct Xor(u8);
         impl StreamCipher for Xor {
-            fn seal(&mut self, plain: &[u8], out: &mut Vec<u8>) {
-                out.clear();
-                out.extend(plain.iter().map(|b| b ^ self.0));
-                out.push(0xAA);
+            fn write_msg(
+                &mut self,
+                w: &mut dyn std::io::Write,
+                body: &[u8],
+            ) -> std::io::Result<()> {
+                let mut ct: Vec<u8> = body.iter().map(|b| b ^ self.0).collect();
+                ct.push(0xAA);
+                w.write_all(&(ct.len() as u32).to_le_bytes())?;
+                w.write_all(&ct)?;
+                w.flush()
             }
             fn open(&mut self, ct: &[u8], out: &mut Vec<u8>) -> std::io::Result<()> {
                 if ct.last() != Some(&0xAA) {
