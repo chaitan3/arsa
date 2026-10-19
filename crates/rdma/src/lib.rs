@@ -1540,6 +1540,7 @@ impl ClientLink {
         rdma: Option<(&ibverbs::Context, &ibverbs::ProtectionDomain)>,
         addr: Option<std::net::SocketAddr>,
         slots: usize,
+        session_secret: [u8; rdma_display_auth::SECRET_LEN],
     ) -> Result<ClientLink> {
         Self::connect_with(
             conn,
@@ -1552,6 +1553,7 @@ impl ClientLink {
             proto::CODEC_ANY,
             0,
             false,
+            session_secret,
         )
     }
 
@@ -1573,6 +1575,7 @@ impl ClientLink {
         codec_pref: u8,
         lossy_mbps: u16,
         metrics: bool,
+        session_secret: [u8; rdma_display_auth::SECRET_LEN],
     ) -> Result<ClientLink> {
         // split the stream: the frame/metrics reader gets the receive half as
         // its own clone; the link's conn keeps doing client→server sends
@@ -1755,6 +1758,8 @@ impl ClientLink {
                 s.set_nodelay(true)?;
                 std::io::Write::write_all(&mut s, &[proto::TAG_VIDEO])
                     .context("send TAG_VIDEO")?;
+                rdma_display_auth::client_conn_proof(&mut s, &session_secret, proto::TAG_VIDEO)
+                    .context("video: session proof")?;
                 let (frame_tx, frame_rx) = mpsc::channel();
                 let (recycle_tx, recycle_rx) = mpsc::channel();
                 let reader =

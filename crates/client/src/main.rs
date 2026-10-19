@@ -43,6 +43,10 @@ fn main() -> Result<()> {
     let mut audio_align_ms: u32 = 0;
     // upper clamp on the adaptive ring jitter target
     let mut audio_target_clamp_ms: u32 = rdma_display_audio::playback::RING_JITTER_CAP_MS as u32;
+    // --pair: run the PIN pairing instead of using a pinned server key
+    let mut pair = false;
+    // name shown on the server for this client
+    let mut client_name: Option<String> = None;
     let mut controller_on = true;
     let mut controller_grab = true;
     let mut fake_gamepad = false;
@@ -95,6 +99,10 @@ fn main() -> Result<()> {
                     .next()
                     .expect("--audio-target-clamp-ms needs a value")
                     .parse()?
+            }
+            "--pair" => pair = true,
+            "--client-name" => {
+                client_name = Some(args.next().expect("--client-name needs a value"))
             }
             "--no-controller" => controller_on = false,
             "--no-controller-grab" => controller_grab = false,
@@ -150,6 +158,8 @@ fn main() -> Result<()> {
                 println!("  --audio-buffer-ms N   client playout buffer depth / pulse tlength (default {}; lower = less latency, less jitter headroom)", rdma_display_audio::wire::BUFFER_MS);
                 println!("  --audio-align-ms N    extra audio-only delay for manual A/V alignment (default 0; the ring jitter buffer adapts to measured jitter, capped at 20 ms)");
                 println!("  --audio-target-clamp-ms N  upper clamp on the adaptive ring jitter target (default {})", rdma_display_audio::playback::RING_JITTER_CAP_MS);
+                println!("  --pair                pair with the server using the PIN it prints (first connection only)");
+                println!("  --client-name NAME    name shown on the server's paired-clients list (default: hostname)");
                 println!("  --metrics             per-stage latency overlay (capture, send, transfer, upload, present, on-screen) + clock-sync pings");
                 println!("  -v, --verbose         debug-level logging (per-frame/per-event detail; RUST_LOG overrides)");
                 println!("  --no-controller       don't forward attached gamepads");
@@ -203,6 +213,36 @@ fn main() -> Result<()> {
     }
     log::info!("connected to {server} (t={} ms)", t0.elapsed().as_millis());
 
+    // auth preamble: authenticate the control connection and collect the
+    // session secret the secondary sockets (video/input/audio) prove possession
+    // of. Runs before the protocol handshake, on the same socket.
+    let (stream, session_secret) = {
+        let id = rdma_display_auth::Identity::load_or_generate(&rdma_display_auth::paths::id_key())
+            .context("load client identity")?;
+        let mut known =
+            rdma_display_auth::KnownServers::load(&rdma_display_auth::paths::known_servers())?;
+        let name = client_name.clone().unwrap_or_else(default_client_name);
+        let pin = if pair { Some(prompt_pin()?) } else { None };
+        let (stream, auth) =
+            rdma_display_auth::client_auth(stream, &id, &known, &server, &name, pin.as_deref())
+                .context("authentication failed")?;
+        if let Some(paired) = &auth.paired {
+            known.upsert(&server, &paired.public);
+            known.save(&rdma_display_auth::paths::known_servers())?;
+            log::info!(
+                "[auth] paired with {:?} ({})",
+                paired.name,
+                rdma_display_auth::fingerprint(&paired.public)
+            );
+        }
+        log::info!(
+            "[auth] authenticated as {:?} (server {:?})",
+            name,
+            auth.server_name
+        );
+        (stream, auth.secret)
+    };
+
     // video transport: auto prefers RDMA and falls back to TCP (matching the
     // server); with TCP there is no RDMA device to open at all
     let rdma_ctx = match transport {
@@ -241,6 +281,7 @@ fn main() -> Result<()> {
         codec_pref,
         lossy_mbps,
         metrics_on,
+        session_secret,
     )?;
     if link.slots_gpu_only() {
         log::info!("[client] GPU slots without CPU mapping: content checks use the verification-only device->host copy (the render path itself stays zero-copy)");
@@ -323,10 +364,10 @@ fn main() -> Result<()> {
     // the session nonce), so a present or a control burst can never delay a
     // keystroke. Audio does the same on its own connection (tag 0x02).
     {
-        let nonce = link.session_nonce;
+        let secret = session_secret;
         std::thread::Builder::new()
             .name("input".into())
-            .spawn(move || input_thread(addr, nonce, input_rx))
+            .spawn(move || input_thread(addr, secret, input_rx))
             .context("spawn input thread")?;
     }
 
@@ -357,6 +398,7 @@ fn main() -> Result<()> {
     // a dead audio path never affects video/input
     if audio_on {
         let stats = audio_stats.clone();
+        let secret = session_secret;
         std::thread::Builder::new()
             .name("audio".into())
             .spawn(move || {
@@ -365,6 +407,7 @@ fn main() -> Result<()> {
                     audio_buffer_ms,
                     audio_align_ms,
                     audio_target_clamp_ms,
+                    secret,
                     stats,
                 )
             })
@@ -739,13 +782,37 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// The name this client reports to the server (hostname, or "client").
+fn default_client_name() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "client".to_string())
+}
+
+/// Prompt for the pairing PIN on stdin (the server prints it).
+fn prompt_pin() -> anyhow::Result<String> {
+    eprint!("enter the pairing PIN shown on the server: ");
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let pin = line.trim().to_string();
+    anyhow::ensure!(!pin.is_empty(), "no PIN entered");
+    Ok(pin)
+}
+
 /// Input sender thread: owns its own control-port connection (routing tag
-/// `TAG_INPUT` + session nonce) and drains the shared input channel into it.
-/// This keeps user input off both the video present loop and the control
-/// socket. Reconnects with backoff on transient failures.
+/// `TAG_INPUT` + a proof of the session secret) and drains the shared input
+/// channel into it. This keeps user input off both the video present loop and
+/// the control socket. Reconnects with backoff on transient failures.
 fn input_thread(
     addr: std::net::SocketAddr,
-    nonce: u64,
+    secret: [u8; rdma_display_auth::SECRET_LEN],
     rx: std::sync::mpsc::Receiver<rdma_display_proto::InputEvent>,
 ) {
     use std::io::Write as _;
@@ -761,8 +828,14 @@ fn input_thread(
             }
         };
         let _ = sock.set_nodelay(true);
+        let mut sref = &sock;
         if (&sock).write_all(&[rdma_display_proto::TAG_INPUT]).is_err()
-            || (&sock).write_all(&nonce.to_le_bytes()).is_err()
+            || rdma_display_auth::client_conn_proof(
+                &mut sref,
+                &secret,
+                rdma_display_proto::TAG_INPUT,
+            )
+            .is_err()
         {
             std::thread::sleep(backoff);
             backoff = (backoff * 2).min(std::time::Duration::from_secs(2));

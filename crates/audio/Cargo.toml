@@ -9,4 +9,5 @@ anyhow.workspace = true
 libc = "0.2"
 libloading = "0.8"
 rdma-display-lifecycle = { path = "../lifecycle" }
+rdma-display-auth = { path = "../auth" }
 log.workspace = true

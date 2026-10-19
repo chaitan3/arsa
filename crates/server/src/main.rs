@@ -98,6 +98,8 @@ fn main() -> Result<()> {
     let mut audio = true;
     let mut audio_device: Option<String> = None;
     let mut audio_helper = false;
+    // auth: required. `--pair` arms a one-time PIN pairing.
+    let mut pair = false;
     let mut capture_sync = CaptureSync::Auto;
     // frame-pacing policy: how the server sizes its flow-control window
     let mut pace = Pace::Auto;
@@ -203,6 +205,7 @@ fn main() -> Result<()> {
             "--no-audio" => audio = false,
             "--audio-device" => audio_device = Some(args.next().expect("--audio-device needs a value")),
             "--audio-helper" => audio_helper = true,
+            "--pair" => pair = true,
             "--display-control" => {
                 display_control = args.next().expect("--display-control needs a value")
             }
@@ -240,6 +243,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
   --fps N (capture): pacing cap; 0 = uncapped, consumer-paced by client credits (default 0).\n  \
   --frame-slots N  receive/staging slots, each holding one coded frame: sets the client's receive-buffer pool and the maximum flow-control window (default 5; --slots is accepted as an alias).\n  \
   --audio | --no-audio [--audio-device my-sink.monitor]  audio side-channel (default on; --no-audio disables): capture the named source's PCM through the pipewire-pulse\n  \
+  --pair  arm one-time PIN pairing: print a PIN and accept the first client that presents it (auth is otherwise required; clients must be in authorized_clients)\n  \
   compat socket (XDG_RUNTIME_DIR must point at the user's session when running under sudo; '@DEFAULT_MONITOR@' = default sink).");
                 return Ok(());
             }
@@ -304,6 +308,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
             &materialize, rendernode.as_deref(), &listen, slots, fps, input_test, &readback,
             capture_sync, audio, audio_device.as_deref(), codec, codec_auto, lossy_mbps,
             lossy_chroma444, &display_control, display_output.as_deref(), idle_metrics, pace,
+            pair,
         ),
         other => bail!("mode {other:?} not implemented yet"),
     }
@@ -923,6 +928,7 @@ fn run_capture(
     display_output: Option<&str>,
     idle_metrics: u64,
     pace: Pace,
+    pair: bool,
 ) -> Result<()> {
     if source_name == "drm" && materialize != "egl" && codec != rdma_display_codec::Codec::Lossy {
         bail!("--source drm requires --materialize egl (KMS capture is dmabuf-only)");
@@ -1132,6 +1138,22 @@ fn run_capture(
     // input-connection session nonce (0 = no live session); set on control
     // accept and cleared when the session ends
     let session_nonce = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // auth: this server's long-term key + the paired-client list (loaded once),
+    // and the per-session secret the secondary sockets prove possession of.
+    let host_identity = {
+        let id = rdma_display_auth::Identity::load_or_generate(&rdma_display_auth::paths::host_key())?;
+        log::info!(
+            "[auth] required; server key {} (clients must pair, or already be in {})",
+            id.fingerprint(),
+            rdma_display_auth::paths::authorized_clients().display()
+        );
+        id
+    };
+    let mut authorized =
+        rdma_display_auth::AuthorizedClients::load(&rdma_display_auth::paths::authorized_clients())?;
+    let session_secret: std::sync::Arc<
+        std::sync::Mutex<Option<[u8; rdma_display_auth::SECRET_LEN]>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
     let started = std::time::Instant::now();
     // source frame period, measured from the capture t0s: the denominator for
     // the flow-control window (independent of the window, unlike the send
@@ -1195,6 +1217,7 @@ fn run_capture(
                     a.stop();
                 }
                 session_nonce.store(0, std::sync::atomic::Ordering::SeqCst);
+                *session_secret.lock().unwrap() = None;
                 pending_scanout = None;
                 have_frame = false;
                 frame_dirty = false;
@@ -1379,6 +1402,16 @@ fn run_capture(
             if !tag_ok {
                 log::warn!("[server] connection with no routing tag dropped ({addr})");
             } else if tag[0] == rdma_display_audio::wire::TAG_AUDIO {
+                let authed = match *session_secret.lock().unwrap() {
+                    Some(s) => {
+                        rdma_display_auth::server_conn_verify(&mut stream, &s, tag[0]).is_ok()
+                    }
+                    None => false,
+                };
+                if !authed {
+                    log::warn!("[audio] unauthenticated connection dropped ({addr})");
+                    continue;
+                }
                 match audio_capture.as_ref() {
                     Some(mbox) => {
                         if audio_busy
@@ -1408,25 +1441,43 @@ fn run_capture(
                 }
             } else if tag[0] == rdma_display_proto::TAG_INPUT {
                 // input has its own connection + thread, independent of the
-                // video/control path; the nonce binds it to the live session
-                let nonce_cell = session_nonce.clone();
+                // video/control path; a proof of the session secret binds it to
+                // the authenticated session
+                let authed = match *session_secret.lock().unwrap() {
+                    Some(s) => {
+                        rdma_display_auth::server_conn_verify(&mut stream, &s, tag[0]).is_ok()
+                    }
+                    None => false,
+                };
+                if !authed {
+                    log::warn!("[input] unauthenticated connection dropped ({addr})");
+                    continue;
+                }
                 match workers.as_ref() {
                     Some(w) => {
                         let input_tx = w.input_tx.clone();
                         let _ = std::thread::Builder::new()
                             .name("input-reader".into())
-                            .spawn(move || serve_input(stream, nonce_cell, input_tx, addr));
+                            .spawn(move || serve_input(stream, input_tx, addr));
                     }
                     None => log::warn!(
                         "[input] input connection with no active session: dropped ({addr})"
                     ),
                 }
             } else if tag[0] == rdma_display_proto::TAG_VIDEO {
-                // client's TCP video socket (negotiated transport == TCP)
+                // client's TCP video socket (negotiated transport == TCP); it
+                // must prove possession of the session secret
+                let authed = match *session_secret.lock().unwrap() {
+                    Some(s) => {
+                        rdma_display_auth::server_conn_verify(&mut stream, &s, tag[0]).is_ok()
+                    }
+                    None => false,
+                };
                 let mut video_attached = false;
                 match session.as_mut() {
                     Some(s)
-                        if s.transport() == rdma_display_rdma::Transport::Tcp
+                        if authed
+                            && s.transport() == rdma_display_rdma::Transport::Tcp
                             && !s.has_video() =>
                     {
                         s.attach_video(stream);
@@ -1457,6 +1508,48 @@ fn run_capture(
                 // capture source starts and the slots are sized, so there is
                 // no mid-session resize and no reconnect.
                 let peer = stream.peer_addr()?;
+                // auth preamble: authenticate (and, if armed, pair) before any
+                // session work, and record the session secret for the secondary
+                // sockets.
+                let stream = {
+                    let pin = if pair {
+                        Some(rdma_display_auth::pair::random_pin(6)?)
+                    } else {
+                        None
+                    };
+                    if let Some(p) = &pin {
+                        eprintln!("\n  [auth] pairing armed — enter PIN {p} on the client\n");
+                    }
+                    match rdma_display_auth::server_auth(
+                        stream,
+                        &host_identity,
+                        &mut authorized,
+                        "server",
+                        pair,
+                        pin.as_deref(),
+                    ) {
+                        Ok((stream, auth)) => {
+                            if auth.newly_paired {
+                                authorized.save(&rdma_display_auth::paths::authorized_clients())?;
+                                log::info!(
+                                    "[auth] paired new client {:?} ({})",
+                                    auth.client_name,
+                                    rdma_display_auth::fingerprint(&auth.client_public)
+                                );
+                            }
+                            log::info!(
+                                "[auth] client {:?} authenticated ({peer})",
+                                auth.client_name
+                            );
+                            *session_secret.lock().unwrap() = Some(auth.secret);
+                            stream
+                        }
+                        Err(e) => {
+                            log::warn!("[auth] rejected {peer}: {e:#}");
+                            continue;
+                        }
+                    }
+                };
                 let nonce = rdma_display_rdma::random_nonce();
                 let (mut conn, neg, mode_req, client_codec_pref, client_lossy_mbps, client_caps) =
                     match rdma_display_rdma::handshake_server(
@@ -1701,6 +1794,7 @@ fn run_capture(
                         Err(e) => {
                             log::warn!("[server] session setup failed: {e:#}");
                             session_nonce.store(0, std::sync::atomic::Ordering::SeqCst);
+                *session_secret.lock().unwrap() = None;
                         }
                     }
                 }
@@ -2426,21 +2520,10 @@ fn gpu_clocks() -> String {
 }
 
 fn serve_input(
-    mut stream: std::net::TcpStream,
-    nonce_cell: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stream: std::net::TcpStream,
     input_tx: mpsc::Sender<rdma_display_proto::InputEvent>,
     addr: std::net::SocketAddr,
 ) {
-    let mut nb = [0u8; 8];
-    if std::io::Read::read_exact(&mut stream, &mut nb).is_err() {
-        return;
-    }
-    let nonce = u64::from_le_bytes(nb);
-    let expect = nonce_cell.load(std::sync::atomic::Ordering::SeqCst);
-    if expect == 0 || nonce != expect {
-        log::warn!("[input] rejected input connection with stale/invalid nonce ({addr})");
-        return;
-    }
     log::info!("[input] client input stream connected ({addr})");
     let mut conn = Conn::new(stream);
     let mut keys: std::collections::HashSet<u32> = std::collections::HashSet::new();

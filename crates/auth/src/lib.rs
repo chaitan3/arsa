@@ -24,6 +24,7 @@
 //! (a TCP stream here), and [`EncryptedStream`] wraps one with the Noise
 //! transport (length-framed, chunked to the Noise message size).
 
+pub mod conn;
 pub mod identity;
 pub mod noise;
 pub mod pair;
@@ -32,6 +33,7 @@ pub mod session;
 pub mod stream;
 pub mod trust;
 
+pub use conn::{client_conn_proof, server_conn_verify};
 pub use identity::Identity;
 pub use noise::{client_handshake, server_handshake};
 pub use pair::{pair_client, pair_server};

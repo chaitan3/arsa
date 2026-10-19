@@ -174,10 +174,11 @@ pub fn run(
     buffer_ms: u32,
     align_ms: u32,
     clamp_ms: u32,
+    secret: [u8; rdma_display_auth::SECRET_LEN],
     stats: Option<Arc<AudioStats>>,
 ) {
     loop {
-        match session(addr, buffer_ms, align_ms, clamp_ms, stats.clone()) {
+        match session(addr, buffer_ms, align_ms, clamp_ms, secret, stats.clone()) {
             Ok(()) => unreachable!("audio session loop returned"),
             Err(e) => {
                 log::info!("[audio] session ended: {e:#}; reconnecting in 2 s");
@@ -276,6 +277,7 @@ fn session(
     buffer_ms: u32,
     align_ms: u32,
     clamp_ms: u32,
+    secret: [u8; rdma_display_auth::SECRET_LEN],
     stats: Option<Arc<AudioStats>>,
 ) -> Result<()> {
     let mut sock = TcpStream::connect(addr).with_context(|| format!("audio connect {addr}"))?;
@@ -288,6 +290,10 @@ fn session(
     sock.set_read_timeout(Some(Duration::from_secs(10)))?;
     use std::io::Write;
     sock.write_all(&[wire::TAG_AUDIO]).context("audio: send tag")?;
+    // prove possession of the session secret so this socket is bound to the
+    // authenticated session
+    rdma_display_auth::client_conn_proof(&mut sock, &secret, wire::TAG_AUDIO)
+        .context("audio: session proof")?;
 
     let mut fmt = [0u8; wire::FORMAT_LEN];
     sock.read_exact(&mut fmt).context("audio: read format record")?;

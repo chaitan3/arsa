@@ -10,6 +10,7 @@ tempfile = "3"
 [dependencies]
 rdma-display-proto.workspace = true
 rdma-display-rdma = { path = "../rdma" }
+rdma-display-auth = { path = "../auth" }
 rdma-display-vkcore = { path = "../vkcore" }
 rdma-display-codec = { path = "../codec" }
 rdma-display-codec-gpu = { path = "../codec-gpu" }

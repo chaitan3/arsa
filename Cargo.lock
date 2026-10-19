@@ -2474,6 +2474,7 @@ dependencies = [
  "libc",
  "libloading",
  "log 0.4.34",
+ "rdma-display-auth",
  "rdma-display-lifecycle",
 ]
 
@@ -2523,6 +2524,7 @@ dependencies = [
  "libloading",
  "log 0.4.34",
  "rdma-display-audio",
+ "rdma-display-auth",
  "rdma-display-codec",
  "rdma-display-codec-gpu",
  "rdma-display-proto",
@@ -2577,6 +2579,7 @@ dependencies = [
  "ibverbs",
  "libloading",
  "log 0.4.34",
+ "rdma-display-auth",
  "rdma-display-codec",
  "rdma-display-proto",
 ]
@@ -2591,6 +2594,7 @@ dependencies = [
  "libc",
  "log 0.4.34",
  "rdma-display-audio",
+ "rdma-display-auth",
  "rdma-display-capture",
  "rdma-display-codec",
  "rdma-display-codec-gpu",

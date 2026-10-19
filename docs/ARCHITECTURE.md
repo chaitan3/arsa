@@ -538,7 +538,29 @@ or a stall so it does not become a permanent A/V offset. `--audio-align-ms`
 adds an optional audio-only delay for manual A/V alignment (default 0), and
 `--audio-target-clamp-ms` overrides the 20 ms jitter-target cap.
 
-## 11. Design decisions and limits
+## 11. Authentication (`crates/auth`)
+
+Auth is required. Each end has a long-term **X25519 static key** (server
+`host.key`, client `id.key`); the server keeps an `authorized_clients` list and
+the client a `known_servers` pin list (both `name key` text files).
+
+A preamble runs on the control connection *before* `Hello`: one method byte,
+then either a Noise `IK` handshake (an already-paired client, whose static key
+the server checks) or a one-time **PIN pairing** — a SPAKE2 exchange keyed by a
+PIN the server prints, which authenticates the PIN without exposing it to an
+offline dictionary attack, and MAC-binds the two static public keys. Pairing is
+followed by the same Noise handshake on the same socket.
+
+The handshake yields an authenticated, encrypted channel; the server generates a
+32-byte **session secret** and sends it inside it. The video/input/audio sockets
+then prove possession of that secret by **challenge-response**
+(`HMAC(secret, tag ‖ nonce)`), so the secret never travels and a proof can't be
+replayed onto another socket. The control connection reverts to the clear after
+the preamble (the stream is split across a reader thread and a writer, which a
+single Noise transport can't serve), so **the streams are authenticated but not
+yet encrypted** — channel encryption is a follow-up.
+
+## 12. Design decisions and limits
 
 - **Copy path is the default**; zero-copy dmabuf-MR is implemented but only
   viable with a cooperative exporter (see §5.3).
