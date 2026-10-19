@@ -1424,10 +1424,22 @@ fn run_capture(
                             log::info!("[audio] client stream connected ({addr})");
                             let mbox = mbox.mailbox.clone();
                             let busy = audio_busy.clone();
+                            let audio_seal = if no_encrypt {
+                                None
+                            } else {
+                                (*session_secret.lock().unwrap()).map(|s| {
+                                    let key = rdma_display_auth::derive_stream_key(
+                                        &s,
+                                        rdma_display_audio::wire::TAG_AUDIO,
+                                        false,
+                                    );
+                                    rdma_display_auth::Seal::new(&key)
+                                })
+                            };
                             std::thread::spawn(move || {
-                                if let Err(e) =
-                                    rdma_display_audio::capture::serve_connection(stream, &mbox)
-                                {
+                                if let Err(e) = rdma_display_audio::capture::serve_connection(
+                                    stream, &mbox, audio_seal,
+                                ) {
                                     log::info!("[audio] stream ended: {e:#}");
                                 }
                                 busy.store(false, std::sync::atomic::Ordering::SeqCst);

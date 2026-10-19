@@ -469,7 +469,11 @@ fn open_capture_stream(pulse: &Pulse, dev: &str) -> Result<super::pulse::Simple>
 /// game starts playing, packets resume and the client hears them. So the
 /// stream idles open indefinitely, warning only (the old 500 ms idle kill
 /// caused the "reset by peer" reconnect loop on silent monitors).
-pub fn serve_connection(mut stream: TcpStream, mbox: &Mailbox) -> Result<()> {
+pub fn serve_connection(
+    mut stream: TcpStream,
+    mbox: &Mailbox,
+    mut seal: Option<rdma_display_auth::Seal>,
+) -> Result<()> {
     stream
         .write_all(&wire::encode_format())
         .and_then(|_| stream.flush())
@@ -480,10 +484,25 @@ pub fn serve_connection(mut stream: TcpStream, mbox: &Mailbox) -> Result<()> {
             Some(pkt) => {
                 warned = false;
                 let hdr = wire::encode_packet_header(pkt.seq, pkt.host_unix_us, pkt.frames);
-                stream
-                    .write_all(&hdr)
-                    .and_then(|_| stream.write_all(&pkt.data))
-                    .map_err(|e| anyhow::anyhow!("audio socket write failed: {e}"))?;
+                match seal.as_mut() {
+                    Some(s) => {
+                        let mut body = Vec::with_capacity(hdr.len() + pkt.data.len());
+                        body.extend_from_slice(&hdr);
+                        body.extend_from_slice(&pkt.data);
+                        let mut ct = Vec::with_capacity(body.len() + 16);
+                        s.seal(&body, &mut ct);
+                        stream
+                            .write_all(&(ct.len() as u32).to_le_bytes())
+                            .and_then(|_| stream.write_all(&ct))
+                            .map_err(|e| anyhow::anyhow!("audio socket write failed: {e}"))?;
+                    }
+                    None => {
+                        stream
+                            .write_all(&hdr)
+                            .and_then(|_| stream.write_all(&pkt.data))
+                            .map_err(|e| anyhow::anyhow!("audio socket write failed: {e}"))?;
+                    }
+                }
             }
             None => {
                 if !warned {

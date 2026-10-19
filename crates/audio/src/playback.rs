@@ -175,10 +175,11 @@ pub fn run(
     align_ms: u32,
     clamp_ms: u32,
     secret: [u8; rdma_display_auth::SECRET_LEN],
+    encrypt: bool,
     stats: Option<Arc<AudioStats>>,
 ) {
     loop {
-        match session(addr, buffer_ms, align_ms, clamp_ms, secret, stats.clone()) {
+        match session(addr, buffer_ms, align_ms, clamp_ms, secret, encrypt, stats.clone()) {
             Ok(()) => unreachable!("audio session loop returned"),
             Err(e) => {
                 log::info!("[audio] session ended: {e:#}; reconnecting in 2 s");
@@ -202,39 +203,84 @@ fn reader(
     mut sock: TcpStream,
     shared: Arc<(Mutex<Ring>, Condvar)>,
     stats: Option<Arc<AudioStats>>,
+    mut open: Option<rdma_display_auth::Open>,
 ) {
-    let mut hdr = [0u8; wire::PACKET_HDR_LEN];
     let mut last_seq: Option<u32> = None;
     loop {
-        match sock.read_exact(&mut hdr) {
-            Ok(()) => {}
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                log::warn!("[audio] no packets for 10 s (silent capture — nothing playing into the server's sink?); still waiting");
-                continue;
+        let (seq, host_us, payload) = if let Some(o) = open.as_mut() {
+            // encrypted: [u32 ct_len][ct] -> [hdr][pcm]
+            let mut l = [0u8; 4];
+            match sock.read_exact(&mut l) {
+                Ok(()) => {}
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    log::warn!("[audio] no packets for 10 s; still waiting");
+                    continue;
+                }
+                Err(e) => return close(&shared, format!("audio: read packet length: {e}")),
             }
-            Err(e) => return close(&shared, format!("audio: read packet header: {e}")),
-        }
-        let (seq, host_us, frames) = wire::decode_packet_header(&hdr);
-        if let Err(e) = wire::frames_plausible(frames) {
-            return close(&shared, format!("{e:#} (framing desync; reconnecting)"));
-        }
-        let mut payload = vec![0u8; wire::payload_len(frames).unwrap_or(0)];
-        match sock.read_exact(&mut payload) {
-            Ok(()) => {}
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                return close(
-                    &shared,
-                    "audio: payload read timed out mid-frame (framing desync; reconnecting)".into(),
-                );
+            let n = u32::from_le_bytes(l) as usize;
+            if n > wire::PACKET_BYTES * 11 + 16 {
+                return close(&shared, "audio: encrypted packet too large".into());
             }
-            Err(e) => return close(&shared, format!("audio: read packet payload: {e}")),
-        }
+            let mut ct = vec![0u8; n];
+            if let Err(e) = sock.read_exact(&mut ct) {
+                return close(&shared, format!("audio: read ciphertext: {e}"));
+            }
+            let mut body = Vec::with_capacity(n);
+            if let Err(e) = o.open(&ct, &mut body) {
+                return close(&shared, format!("audio: decrypt failed: {e:#}"));
+            }
+            if body.len() < wire::PACKET_HDR_LEN {
+                return close(&shared, "audio: short decrypted packet".into());
+            }
+            let (h, p) = body.split_at(wire::PACKET_HDR_LEN);
+            let h: &[u8; wire::PACKET_HDR_LEN] = h.try_into().unwrap();
+            let (seq, host_us, frames) = wire::decode_packet_header(h);
+            if let Err(e) = wire::frames_plausible(frames) {
+                return close(&shared, format!("{e:#} (framing desync; reconnecting)"));
+            }
+            if p.len() != wire::payload_len(frames).unwrap_or(0) {
+                return close(&shared, "audio: decrypted length mismatch".into());
+            }
+            (seq, host_us, p.to_vec())
+        } else {
+            let mut hdr = [0u8; wire::PACKET_HDR_LEN];
+            match sock.read_exact(&mut hdr) {
+                Ok(()) => {}
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    log::warn!("[audio] no packets for 10 s (silent capture — nothing playing into the server's sink?); still waiting");
+                    continue;
+                }
+                Err(e) => return close(&shared, format!("audio: read packet header: {e}")),
+            }
+            let (seq, host_us, frames) = wire::decode_packet_header(&hdr);
+            if let Err(e) = wire::frames_plausible(frames) {
+                return close(&shared, format!("{e:#} (framing desync; reconnecting)"));
+            }
+            let mut payload = vec![0u8; wire::payload_len(frames).unwrap_or(0)];
+            match sock.read_exact(&mut payload) {
+                Ok(()) => {}
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return close(
+                        &shared,
+                        "audio: payload read timed out mid-frame (framing desync; reconnecting)"
+                            .into(),
+                    );
+                }
+                Err(e) => return close(&shared, format!("audio: read packet payload: {e}")),
+            }
+            (seq, host_us, payload)
+        };
+
         if let Some(prev) = last_seq {
             if seq != prev.wrapping_add(1) {
                 log::debug!("[audio] seq gap {} -> {}", prev, seq);
@@ -278,6 +324,7 @@ fn session(
     align_ms: u32,
     clamp_ms: u32,
     secret: [u8; rdma_display_auth::SECRET_LEN],
+    encrypt: bool,
     stats: Option<Arc<AudioStats>>,
 ) -> Result<()> {
     let mut sock = TcpStream::connect(addr).with_context(|| format!("audio connect {addr}"))?;
@@ -317,12 +364,18 @@ fn session(
         Mutex::new(Ring::new(align_ms as u64, clamp_ms as u64)),
         Condvar::new(),
     ));
+    let audio_open = if encrypt {
+        let key = rdma_display_auth::derive_stream_key(&secret, wire::TAG_AUDIO, false);
+        Some(rdma_display_auth::Open::new(&key))
+    } else {
+        None
+    };
     let reader_shared = shared.clone();
     let reader_sock = sock.try_clone().context("clone audio socket for the reader")?;
     let reader_stats = stats.clone();
     std::thread::Builder::new()
         .name("audio-reader".into())
-        .spawn(move || reader(reader_sock, reader_shared, reader_stats))
+        .spawn(move || reader(reader_sock, reader_shared, reader_stats, audio_open))
         .context("spawn audio reader thread")?;
     // from here the audio thread owns `sock` only to shut it down on exit
     let _sock_guard = SocketGuard(sock);

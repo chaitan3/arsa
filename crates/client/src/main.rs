@@ -406,6 +406,7 @@ fn main() -> Result<()> {
                     audio_align_ms,
                     audio_target_clamp_ms,
                     secret,
+                    stream_encrypt,
                     stats,
                 )
             })
