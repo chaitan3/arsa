@@ -43,8 +43,6 @@ fn main() -> Result<()> {
     let mut audio_align_ms: u32 = 0;
     // upper clamp on the adaptive ring jitter target
     let mut audio_target_clamp_ms: u32 = rdma_display_audio::playback::RING_JITTER_CAP_MS as u32;
-    // --pair: run the PIN pairing instead of using a pinned server key
-    let mut pair = false;
     // name shown on the server for this client
     let mut client_name: Option<String> = None;
     let mut controller_on = true;
@@ -100,7 +98,6 @@ fn main() -> Result<()> {
                     .expect("--audio-target-clamp-ms needs a value")
                     .parse()?
             }
-            "--pair" => pair = true,
             "--client-name" => {
                 client_name = Some(args.next().expect("--client-name needs a value"))
             }
@@ -158,7 +155,6 @@ fn main() -> Result<()> {
                 println!("  --audio-buffer-ms N   client playout buffer depth / pulse tlength (default {}; lower = less latency, less jitter headroom)", rdma_display_audio::wire::BUFFER_MS);
                 println!("  --audio-align-ms N    extra audio-only delay for manual A/V alignment (default 0; the ring jitter buffer adapts to measured jitter, capped at 20 ms)");
                 println!("  --audio-target-clamp-ms N  upper clamp on the adaptive ring jitter target (default {})", rdma_display_audio::playback::RING_JITTER_CAP_MS);
-                println!("  --pair                pair with the server using the PIN it prints (first connection only)");
                 println!("  --client-name NAME    name shown on the server's paired-clients list (default: hostname)");
                 println!("  --metrics             per-stage latency overlay (capture, send, transfer, upload, present, on-screen) + clock-sync pings");
                 println!("  -v, --verbose         debug-level logging (per-frame/per-event detail; RUST_LOG overrides)");
@@ -222,9 +218,9 @@ fn main() -> Result<()> {
         let mut known =
             rdma_display_auth::KnownServers::load(&rdma_display_auth::paths::known_servers())?;
         let name = client_name.clone().unwrap_or_else(default_client_name);
-        let pin = if pair { Some(prompt_pin()?) } else { None };
+        // not pinned yet? client_auth auto-pairs, prompting via prompt_pin
         let (stream, auth) =
-            rdma_display_auth::client_auth(stream, &id, &known, &server, &name, pin.as_deref())
+            rdma_display_auth::client_auth(stream, &id, &known, &server, &name, prompt_pin)
                 .context("authentication failed")?;
         if let Some(paired) = &auth.paired {
             known.upsert(&server, &paired.public);

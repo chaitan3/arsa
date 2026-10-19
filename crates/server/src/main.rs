@@ -98,8 +98,6 @@ fn main() -> Result<()> {
     let mut audio = true;
     let mut audio_device: Option<String> = None;
     let mut audio_helper = false;
-    // auth: required. `--pair` arms a one-time PIN pairing.
-    let mut pair = false;
     let mut capture_sync = CaptureSync::Auto;
     // frame-pacing policy: how the server sizes its flow-control window
     let mut pace = Pace::Auto;
@@ -205,7 +203,6 @@ fn main() -> Result<()> {
             "--no-audio" => audio = false,
             "--audio-device" => audio_device = Some(args.next().expect("--audio-device needs a value")),
             "--audio-helper" => audio_helper = true,
-            "--pair" => pair = true,
             "--display-control" => {
                 display_control = args.next().expect("--display-control needs a value")
             }
@@ -243,7 +240,6 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
   --fps N (capture): pacing cap; 0 = uncapped, consumer-paced by client credits (default 0).\n  \
   --frame-slots N  receive/staging slots, each holding one coded frame: sets the client's receive-buffer pool and the maximum flow-control window (default 5; --slots is accepted as an alias).\n  \
   --audio | --no-audio [--audio-device my-sink.monitor]  audio side-channel (default on; --no-audio disables): capture the named source's PCM through the pipewire-pulse\n  \
-  --pair  arm one-time PIN pairing: print a PIN and accept the first client that presents it (auth is otherwise required; clients must be in authorized_clients)\n  \
   compat socket (XDG_RUNTIME_DIR must point at the user's session when running under sudo; '@DEFAULT_MONITOR@' = default sink).");
                 return Ok(());
             }
@@ -308,7 +304,6 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
             &materialize, rendernode.as_deref(), &listen, slots, fps, input_test, &readback,
             capture_sync, audio, audio_device.as_deref(), codec, codec_auto, lossy_mbps,
             lossy_chroma444, &display_control, display_output.as_deref(), idle_metrics, pace,
-            pair,
         ),
         other => bail!("mode {other:?} not implemented yet"),
     }
@@ -928,7 +923,6 @@ fn run_capture(
     display_output: Option<&str>,
     idle_metrics: u64,
     pace: Pace,
-    pair: bool,
 ) -> Result<()> {
     if source_name == "drm" && materialize != "egl" && codec != rdma_display_codec::Codec::Lossy {
         bail!("--source drm requires --materialize egl (KMS capture is dmabuf-only)");
@@ -1154,15 +1148,6 @@ fn run_capture(
     let session_secret: std::sync::Arc<
         std::sync::Mutex<Option<[u8; rdma_display_auth::SECRET_LEN]>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(None));
-    // --pair: a one-time PIN, generated now and printed so the user can enter it
-    // on the client (cleared after the first successful pairing)
-    let mut pair_pin: Option<String> = if pair {
-        let p = rdma_display_auth::pair::random_pin(6)?;
-        eprintln!("\n  [auth] pairing armed — on the client run with --pair and enter PIN {p}\n");
-        Some(p)
-    } else {
-        None
-    };
     let started = std::time::Instant::now();
     // source frame period, measured from the capture t0s: the denominator for
     // the flow-control window (independent of the window, unlike the send
@@ -1526,8 +1511,13 @@ fn run_capture(
                         &host_identity,
                         &mut authorized,
                         "server",
-                        pair,
-                        pair_pin.as_deref(),
+                        |client_name| {
+                            let pin = rdma_display_auth::pair::random_pin(6)?;
+                            eprintln!(
+                                "\n  [auth] new client {client_name:?} wants to pair — enter PIN {pin} on the client\n"
+                            );
+                            Ok(pin)
+                        },
                     ) {
                         Ok((stream, auth)) => {
                             if auth.newly_paired {
@@ -1537,7 +1527,6 @@ fn run_capture(
                                     auth.client_name,
                                     rdma_display_auth::fingerprint(&auth.client_public)
                                 );
-                                pair_pin = None; // one-time
                             }
                             log::info!(
                                 "[auth] client {:?} authenticated ({peer})",

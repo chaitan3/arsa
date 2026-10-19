@@ -205,7 +205,6 @@ both ends.
 | `--display-control auto\|hyprctl\|kscreen\|none` | Backend for the client's resolution request (default `auto`). |
 | `--display-output NAME` | DRM connector name for the resolution request (default: the compositor's primary output). Capture picks the first bound plane. |
 | `--audio` / `--no-audio` / `--audio-device SRC` | Audio side-channel (default on; `@DEFAULT_MONITOR@` = default sink). |
-| `--pair` | Arm one-time PIN pairing: print a PIN and accept the next client that presents it. Auth is otherwise **required** — clients must already be in `authorized_clients`. |
 | `--gpu-power off\|p5\|p0\|max\|<sm>[,<mem>]` | Floor NVIDIA clocks (needs root). |
 | `--frame-slots N` | Receive/staging slots, each holding one coded frame; sets the receive-buffer pool and the maximum flow-control window (default 5; `--slots` accepted as an alias). |
 | `--idle-metrics N` | Log RSS/CPU every N seconds. |
@@ -226,7 +225,6 @@ both ends.
 | `--transport auto\|rdma\|tcp` | Video transport preference. |
 | `--slot-mem host\|cuda` | Receive memory (`host` = pinned RAM, the production path). |
 | `--audio` / `--no-audio` / `--audio-buffer-ms N` | Audio playback (default on). |
-| `--pair` | Pair with the server using the PIN it prints (first connection only), then pin its key. |
 | `--client-name NAME` | Name shown on the server's paired-clients list (default: hostname). |
 | `--audio-align-ms N` | Extra audio-only delay for manual A/V alignment (default 0; the ring jitter buffer adapts to measured jitter, capped at 20 ms). |
 | `--audio-target-clamp-ms N` | Upper clamp on the adaptive ring jitter target (default 20 ms). |
@@ -238,13 +236,16 @@ both ends.
 
 Auth is **required**. On first run the server generates a long-term X25519 key
 (`~/.config/rdma-display/host.key`) and only admits clients listed in
-`~/.config/rdma-display/authorized_clients`. Pair once:
+`~/.config/rdma-display/authorized_clients`. **Pairing is automatic**: the first
+time a client connects it has no pinned key for that server, so it asks to pair,
+the server prints a 6-digit PIN, and the client prompts for it.
 
 ```bash
-# on the server
-rdma-display-server --pair          # prints a 6-digit PIN
-# on the client (another machine)
-rdma-display-client HOST --pair     # prompts for the PIN, then pins the server
+# server (already running, no restart needed)
+  [auth] new client "laptop" wants to pair — enter PIN 483102 on the client
+# client
+rdma-display-client HOST
+  enter the pairing PIN shown on the server: 483102
 ```
 
 After pairing the client keeps its key in `~/.config/rdma-display/id.key` and

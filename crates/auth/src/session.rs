@@ -42,20 +42,32 @@ pub struct ServerAuth {
     pub newly_paired: bool,
 }
 
-/// Client: run the preamble. `pair_pin` selects pairing (the caller prompts the
-/// user); otherwise the server must already be pinned in `known`.
+/// Client: run the preamble. If the server is already pinned we authenticate
+/// with Noise; otherwise we pair (prompting for the PIN the server prints).
 pub fn client_auth<S: Read + Write>(
     mut stream: S,
     identity: &Identity,
     known: &TrustFile,
     server_name: &str,
     client_name: &str,
-    pair_pin: Option<&str>,
+    prompt_pin: impl FnOnce() -> Result<String>,
 ) -> Result<(S, ClientAuth)> {
-    match pair_pin {
-        Some(pin) => {
+    match known.get(server_name) {
+        Some(peer) => {
+            let public = peer.public.clone();
+            let name = peer.name.clone();
+            write_method(&mut stream, AuthMethod::Noise)?;
+            let mut enc = client_handshake(stream, identity, &public)?;
+            let secret = read_secret(&mut enc)?;
+            Ok((
+                enc.into_inner(),
+                ClientAuth { secret, server_name: name, paired: None },
+            ))
+        }
+        None => {
+            log::info!("[auth] {server_name} is not pinned yet; pairing");
             write_method(&mut stream, AuthMethod::Pair)?;
-            let (stream, paired) = pair_client(stream, identity, client_name, pin)
+            let (stream, paired) = pair_client(stream, identity, client_name, prompt_pin)
                 .context("PIN pairing")?;
             // we now hold the server's key: authenticate with Noise and collect
             // the session secret on the same connection
@@ -67,32 +79,17 @@ pub fn client_auth<S: Read + Write>(
                 ClientAuth { secret, server_name, paired: Some(paired) },
             ))
         }
-        None => {
-            let peer = known.get(server_name).with_context(|| {
-                format!("no pinned key for {server_name}; run the client with --pair first")
-            })?;
-            let public = peer.public.clone();
-            write_method(&mut stream, AuthMethod::Noise)?;
-            let mut enc = client_handshake(stream, identity, &public)?;
-            let secret = read_secret(&mut enc)?;
-            let server_name = peer.name.clone();
-            Ok((
-                enc.into_inner(),
-                ClientAuth { secret, server_name, paired: None },
-            ))
-        }
     }
 }
 
-/// Server: run the preamble. `allow_pair` gates pairing; `pair_pin` is the PIN
-/// to use when the client asks to pair (the caller displays it).
+/// Server: run the preamble. A pairing request from a new client prints a PIN
+/// (via `make_pin`) and, on success, adds the client to `authorized`.
 pub fn server_auth<S: Read + Write>(
     mut stream: S,
     identity: &Identity,
     authorized: &mut TrustFile,
     server_name: &str,
-    allow_pair: bool,
-    pair_pin: Option<&str>,
+    make_pin: impl FnOnce(&str) -> Result<String>,
 ) -> Result<(S, ServerAuth)> {
     let method = read_method(&mut stream)?;
     match method {
@@ -115,12 +112,8 @@ pub fn server_auth<S: Read + Write>(
             ))
         }
         AuthMethod::Pair => {
-            if !allow_pair {
-                bail!("pairing is disabled on this server");
-            }
-            let pin = pair_pin.context("no PIN available for pairing")?;
             let (stream, client_name, client_public) =
-                pair_server(stream, identity, server_name, pin).context("PIN pairing")?;
+                pair_server(stream, identity, server_name, make_pin).context("PIN pairing")?;
             authorized.upsert(&client_name, &client_public);
             // the client now runs the Noise handshake; collect the secret
             let (mut enc, got) = server_handshake(stream, identity)?;
@@ -188,21 +181,20 @@ mod tests {
 
         let (mut ct, mut st) = pair();
         let st2 = std::thread::spawn(move || {
-            let (_s, auth) = server_auth(
-                &mut st,
-                &server,
-                &mut authorized,
-                "desk",
-                false,
-                None,
-            )
-            .unwrap();
+            // already paired: the client uses Noise, so the PIN maker is unused
+            let (_s, auth) =
+                server_auth(&mut st, &server, &mut authorized, "desk", |_| {
+                    Ok("unused".to_string())
+                })
+                .unwrap();
             assert_eq!(auth.client_name, "laptop");
             auth.secret
         });
 
-        let (_s, auth) =
-            client_auth(&mut ct, &client, &known, "desk", "laptop", None).unwrap();
+        let (_s, auth) = client_auth(&mut ct, &client, &known, "desk", "laptop", || {
+            Ok("unused".to_string())
+        })
+        .unwrap();
         assert!(auth.paired.is_none());
         assert_eq!(auth.secret, st2.join().unwrap(), "both derive the same secret");
     }
@@ -218,19 +210,22 @@ mod tests {
         let (mut ct, mut st) = pair();
         std::thread::spawn(move || {
             let mut authorized = TrustFile::default();
-            let _ = server_auth(&mut st, &server, &mut authorized, "desk", false, None);
+            let _ = server_auth(&mut st, &server, &mut authorized, "desk", |_| {
+                Ok("unused".to_string())
+            });
         });
 
-        let err = match client_auth(&mut ct, &client, &known, "desk", "laptop", None) {
+        let err = match client_auth(&mut ct, &client, &known, "desk", "laptop", || {
+            Ok("unused".to_string())
+        }) {
             Ok(_) => panic!("unpaired client unexpectedly authenticated"),
             Err(e) => e,
         };
-        // the server drops the connection, so the client sees a read error
-        let _ = err;
+        let _ = err; // the server drops the connection; the client sees a read error
     }
 
     #[test]
-    fn pairing_then_handshake() {
+    fn unpinned_client_auto_pairs() {
         let server = Identity::generate().unwrap();
         let client = Identity::generate().unwrap();
         let spub = server.public().to_vec();
@@ -241,16 +236,20 @@ mod tests {
         let (mut ct, mut st) = pair();
         let st2 = std::thread::spawn(move || {
             let (_s, auth) =
-                server_auth(&mut st, &server, &mut authorized, "desk", true, Some("123456"))
-                    .unwrap();
+                server_auth(&mut st, &server, &mut authorized, "desk", |_| {
+                    Ok("123456".to_string())
+                })
+                .unwrap();
             assert!(auth.newly_paired);
             assert_eq!(auth.client_name, "laptop");
             assert!(authorized.contains_key(&cpub));
             auth.secret
         });
 
-        let (_s, auth) =
-            client_auth(&mut ct, &client, &known, "desk", "laptop", Some("123456")).unwrap();
+        let (_s, auth) = client_auth(&mut ct, &client, &known, "desk", "laptop", || {
+            Ok("123456".to_string())
+        })
+        .unwrap();
         let paired = auth.paired.expect("paired");
         assert_eq!(paired.public, spub);
         assert_eq!(auth.secret, st2.join().unwrap());

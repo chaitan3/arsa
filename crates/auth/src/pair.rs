@@ -1,17 +1,23 @@
-//! One-time PIN pairing (the *first* connection).
+//! One-time PIN pairing (a client's *first* connection to a server).
 //!
-//! The server prints a short PIN; the user types it on the client. Both run a
-//! **SPAKE2** exchange keyed by that PIN — which authenticates the PIN *and*
-//! yields a strong shared key without exposing the PIN to an offline dictionary
-//! attack (the reason a plain HMAC/Noise-PSK over a 4–6 digit PIN is unsafe).
-//! The two long-term static public keys are then exchanged and MAC-bound to the
-//! PAKE transcript, so a wrong PIN or a tampering relay is detected.
+//! The client asks to pair; the server prints a short PIN for the user to enter
+//! on the client; both run a **SPAKE2** exchange keyed by that PIN — which
+//! authenticates the PIN *and* yields a strong shared key without exposing the
+//! PIN to an offline dictionary attack (the reason a plain HMAC/Noise-PSK over
+//! a 4–6 digit PIN is unsafe). The two long-term static public keys are then
+//! exchanged and MAC-bound to the PAKE transcript, so a wrong PIN or a
+//! tampering relay is detected.
 //!
-//! Wire (after the control tag and the `AuthMethod::Pair` byte):
+//! The PIN is obtained *after* the first message, so the server can print it
+//! (on receiving the request) and the client can then prompt — no pre-shared
+//! PIN, no restart.
+//!
+//! Wire:
 //!
 //! ```text
-//! C→S  client_name, client_static_pub(32), msg_a
-//! S→C  server_static_pub(32), server_name, msg_b
+//! C→S  client_name, client_static_pub(32)
+//! S→C  server_static_pub(32), server_name, msg_b        (server prints the PIN)
+//! C→S  msg_a                                            (client prompts for the PIN)
 //!      (both) K = SPAKE2.finish(peer msg)
 //! C→S  mac_c = HMAC(K, "rdma-display-pair-c" ‖ transcript)
 //! S→C  mac_s = HMAC(K, "rdma-display-pair-s" ‖ transcript)
@@ -40,27 +46,19 @@ pub struct PairedServer {
     pub public: Vec<u8>,
 }
 
-/// Client side of pairing. `pin` is the short code shown on the server.
-/// Returns the stream (for the Noise handshake that follows) and what we
-/// learned about the server.
+/// Client side of pairing. `prompt_pin` is called after the server has been
+/// asked (so the user can read the PIN the server printed).
 pub fn pair_client<S: Read + Write>(
     mut stream: S,
     identity: &Identity,
     name: &str,
-    pin: &str,
+    prompt_pin: impl FnOnce() -> Result<String>,
 ) -> Result<(S, PairedServer)> {
-    let (state, msg_a) = Spake2::<Ed25519Group>::start_a(
-        &Password::new(pin.as_bytes()),
-        &PakeId::new(PAKE_CLIENT),
-        &PakeId::new(PAKE_SERVER),
-    );
-
-    // C→S: name, our static public key, SPAKE2 msg_a
+    // C→S: name + our static key (no SPAKE2 message yet)
     write_frame(&mut stream, name.as_bytes()).context("send name")?;
     write_frame(&mut stream, identity.public()).context("send client pubkey")?;
-    write_frame(&mut stream, &msg_a).context("send spake2 msg_a")?;
 
-    // S→C: server static public key, server name, SPAKE2 msg_b
+    // S→C: server static key, server name, SPAKE2 msg_b
     let mut server_pub = Vec::new();
     let mut server_name = Vec::new();
     let mut msg_b = Vec::new();
@@ -70,6 +68,14 @@ pub fn pair_client<S: Read + Write>(
     if server_pub.len() != 32 {
         bail!("server static key is not 32 bytes");
     }
+
+    let pin = prompt_pin()?;
+    let (state, msg_a) = Spake2::<Ed25519Group>::start_a(
+        &Password::new(pin.as_bytes()),
+        &PakeId::new(PAKE_CLIENT),
+        &PakeId::new(PAKE_SERVER),
+    );
+    write_frame(&mut stream, &msg_a).context("send spake2 msg_a")?;
 
     let key = state
         .finish(&msg_b)
@@ -83,10 +89,9 @@ pub fn pair_client<S: Read + Write>(
         name.as_bytes(),
         &server_name,
     );
-    // C→S: confirm
     let mac_c = mac(&key, b"rdma-display-pair-c", &transcript);
     write_frame(&mut stream, &mac_c).context("send confirm")?;
-    // S→C: server confirm
+
     let mut mac_s = Vec::new();
     read_frame(&mut stream, &mut mac_s).context("read server confirm")?;
     let want = mac(&key, b"rdma-display-pair-s", &transcript);
@@ -103,25 +108,25 @@ pub fn pair_client<S: Read + Write>(
     ))
 }
 
-/// Server side of pairing. Returns the stream, the client's name, and its
-/// static public key.
+/// Server side of pairing. `make_pin` is called with the client's name to
+/// produce (and, in the caller, print) the PIN.
 pub fn pair_server<S: Read + Write>(
     mut stream: S,
     identity: &Identity,
     name: &str,
-    pin: &str,
+    make_pin: impl FnOnce(&str) -> Result<String>,
 ) -> Result<(S, String, Vec<u8>)> {
     // C→S
     let mut client_name = Vec::new();
     let mut client_pub = Vec::new();
-    let mut msg_a = Vec::new();
     read_frame(&mut stream, &mut client_name).context("read client name")?;
     read_frame(&mut stream, &mut client_pub).context("read client pubkey")?;
-    read_frame(&mut stream, &mut msg_a).context("read spake2 msg_a")?;
     if client_pub.len() != 32 {
         bail!("client static key is not 32 bytes");
     }
+    let client_name = String::from_utf8_lossy(&client_name).into_owned();
 
+    let pin = make_pin(&client_name)?;
     let (state, msg_b) = Spake2::<Ed25519Group>::start_b(
         &Password::new(pin.as_bytes()),
         &PakeId::new(PAKE_CLIENT),
@@ -133,6 +138,9 @@ pub fn pair_server<S: Read + Write>(
     write_frame(&mut stream, name.as_bytes()).context("send server name")?;
     write_frame(&mut stream, &msg_b).context("send spake2 msg_b")?;
 
+    // C→S
+    let mut msg_a = Vec::new();
+    read_frame(&mut stream, &mut msg_a).context("read spake2 msg_a")?;
     let key = state
         .finish(&msg_a)
         .map_err(|e| anyhow::anyhow!("spake2 finish: {e:?}"))?;
@@ -142,21 +150,19 @@ pub fn pair_server<S: Read + Write>(
         &msg_b,
         &client_pub,
         identity.public(),
-        &client_name,
+        client_name.as_bytes(),
         name.as_bytes(),
     );
-    // C→S confirm
     let mut mac_c = Vec::new();
     read_frame(&mut stream, &mut mac_c).context("read client confirm")?;
     let want_c = mac(&key, b"rdma-display-pair-c", &transcript);
     if !constant_time_eq(&mac_c, &want_c) {
         bail!("client failed to confirm the PIN (wrong PIN?)");
     }
-    // S→C confirm
     let mac_s = mac(&key, b"rdma-display-pair-s", &transcript);
     write_frame(&mut stream, &mac_s).context("send server confirm")?;
 
-    Ok((stream, String::from_utf8_lossy(&client_name).into_owned(), client_pub))
+    Ok((stream, client_name, client_pub))
 }
 
 /// The bytes both sides MAC: everything that must be bound together.
@@ -226,12 +232,14 @@ mod tests {
         let (spub, cpub) = (server.public().to_vec(), client.public().to_vec());
 
         let st2 = std::thread::spawn(move || {
-            let (_s, name, pubkey) = pair_server(&mut st, &server, "desk", "483102").unwrap();
+            let (_s, name, pubkey) =
+                pair_server(&mut st, &server, "desk", |_| Ok("483102".into())).unwrap();
             assert_eq!(name, "laptop");
             assert_eq!(pubkey, cpub);
         });
 
-        let (_s, paired) = pair_client(&mut ct, &client, "laptop", "483102").unwrap();
+        let (_s, paired) =
+            pair_client(&mut ct, &client, "laptop", || Ok("483102".into())).unwrap();
         assert_eq!(paired.name, "desk");
         assert_eq!(paired.public, spub);
         st2.join().unwrap();
@@ -244,10 +252,10 @@ mod tests {
         let (mut ct, mut st) = pair();
 
         std::thread::spawn(move || {
-            let _ = pair_server(&mut st, &server, "desk", "111111");
+            let _ = pair_server(&mut st, &server, "desk", |_| Ok("111111".into()));
         });
 
-        let err = match pair_client(&mut ct, &client, "laptop", "999999") {
+        let err = match pair_client(&mut ct, &client, "laptop", || Ok("999999".into())) {
             Ok(_) => panic!("pairing with the wrong PIN unexpectedly succeeded"),
             Err(e) => e,
         };
