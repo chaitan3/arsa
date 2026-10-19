@@ -98,6 +98,10 @@ fn main() -> Result<()> {
     let mut audio = true;
     let mut audio_device: Option<String> = None;
     let mut audio_helper = false;
+    // stream encryption: on by default; --no-encrypt leaves the TCP streams in
+    // the clear (RDMA video is always unencrypted). The server's choice is sent
+    // to the client inside the authenticated preamble.
+    let mut no_encrypt = false;
     let mut capture_sync = CaptureSync::Auto;
     // frame-pacing policy: how the server sizes its flow-control window
     let mut pace = Pace::Auto;
@@ -203,6 +207,7 @@ fn main() -> Result<()> {
             "--no-audio" => audio = false,
             "--audio-device" => audio_device = Some(args.next().expect("--audio-device needs a value")),
             "--audio-helper" => audio_helper = true,
+            "--no-encrypt" => no_encrypt = true,
             "--display-control" => {
                 display_control = args.next().expect("--display-control needs a value")
             }
@@ -240,6 +245,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
   --fps N (capture): pacing cap; 0 = uncapped, consumer-paced by client credits (default 0).\n  \
   --frame-slots N  receive/staging slots, each holding one coded frame: sets the client's receive-buffer pool and the maximum flow-control window (default 5; --slots is accepted as an alias).\n  \
   --audio | --no-audio [--audio-device my-sink.monitor]  audio side-channel (default on; --no-audio disables): capture the named source's PCM through the pipewire-pulse\n  \
+  --no-encrypt  leave the TCP streams in the clear (default: AES-256-GCM). RDMA video is always unencrypted.\n  \
   compat socket (XDG_RUNTIME_DIR must point at the user's session when running under sudo; '@DEFAULT_MONITOR@' = default sink).");
                 return Ok(());
             }
@@ -304,6 +310,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
             &materialize, rendernode.as_deref(), &listen, slots, fps, input_test, &readback,
             capture_sync, audio, audio_device.as_deref(), codec, codec_auto, lossy_mbps,
             lossy_chroma444, &display_control, display_output.as_deref(), idle_metrics, pace,
+            no_encrypt,
         ),
         other => bail!("mode {other:?} not implemented yet"),
     }
@@ -923,6 +930,7 @@ fn run_capture(
     display_output: Option<&str>,
     idle_metrics: u64,
     pace: Pace,
+    no_encrypt: bool,
 ) -> Result<()> {
     if source_name == "drm" && materialize != "egl" && codec != rdma_display_codec::Codec::Lossy {
         bail!("--source drm requires --materialize egl (KMS capture is dmabuf-only)");
@@ -1511,6 +1519,7 @@ fn run_capture(
                         &host_identity,
                         &mut authorized,
                         "server",
+                        !no_encrypt,
                         |client_name| {
                             let pin = rdma_display_auth::pair::random_pin(6)?;
                             eprintln!(

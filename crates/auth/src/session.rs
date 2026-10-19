@@ -27,6 +27,8 @@ pub const SECRET_LEN: usize = 32;
 pub struct ClientAuth {
     /// the session secret (for the secondary sockets)
     pub secret: [u8; SECRET_LEN],
+    /// whether the streams are encrypted (the server's authenticated choice)
+    pub encrypt: bool,
     /// the server's name, as pinned
     pub server_name: String,
     /// set when this connection paired (the caller should persist the pin)
@@ -36,6 +38,7 @@ pub struct ClientAuth {
 /// What the server got out of the preamble.
 pub struct ServerAuth {
     pub secret: [u8; SECRET_LEN],
+    pub encrypt: bool,
     pub client_name: String,
     pub client_public: Vec<u8>,
     /// set when this connection paired (the caller should persist the pin)
@@ -58,10 +61,10 @@ pub fn client_auth<S: Read + Write>(
             let name = peer.name.clone();
             write_method(&mut stream, AuthMethod::Noise)?;
             let mut enc = client_handshake(stream, identity, &public)?;
-            let secret = read_secret(&mut enc)?;
+            let (encrypt, secret) = read_session(&mut enc)?;
             Ok((
                 enc.into_inner(),
-                ClientAuth { secret, server_name: name, paired: None },
+                ClientAuth { secret, encrypt, server_name: name, paired: None },
             ))
         }
         None => {
@@ -72,11 +75,11 @@ pub fn client_auth<S: Read + Write>(
             // we now hold the server's key: authenticate with Noise and collect
             // the session secret on the same connection
             let mut enc = client_handshake(stream, identity, &paired.public)?;
-            let secret = read_secret(&mut enc)?;
+            let (encrypt, secret) = read_session(&mut enc)?;
             let server_name = paired.name.clone();
             Ok((
                 enc.into_inner(),
-                ClientAuth { secret, server_name, paired: Some(paired) },
+                ClientAuth { secret, encrypt, server_name, paired: Some(paired) },
             ))
         }
     }
@@ -89,6 +92,7 @@ pub fn server_auth<S: Read + Write>(
     identity: &Identity,
     authorized: &mut TrustFile,
     server_name: &str,
+    encrypt: bool,
     make_pin: impl FnOnce(&str) -> Result<String>,
 ) -> Result<(S, ServerAuth)> {
     let method = read_method(&mut stream)?;
@@ -105,10 +109,10 @@ pub fn server_auth<S: Read + Write>(
                     fingerprint(&client_public)
                 );
             };
-            let secret = write_secret(&mut enc)?;
+            let secret = write_session(&mut enc, encrypt)?;
             Ok((
                 enc.into_inner(),
-                ServerAuth { secret, client_name, client_public, newly_paired: false },
+                ServerAuth { secret, encrypt, client_name, client_public, newly_paired: false },
             ))
         }
         AuthMethod::Pair => {
@@ -120,10 +124,10 @@ pub fn server_auth<S: Read + Write>(
             if got != client_public {
                 bail!("client key changed between pairing and handshake");
             }
-            let secret = write_secret(&mut enc)?;
+            let secret = write_session(&mut enc, encrypt)?;
             Ok((
                 enc.into_inner(),
-                ServerAuth { secret, client_name, client_public, newly_paired: true },
+                ServerAuth { secret, encrypt, client_name, client_public, newly_paired: true },
             ))
         }
     }
@@ -142,19 +146,26 @@ fn read_method<S: Read>(r: &mut S) -> Result<AuthMethod> {
         .with_context(|| format!("unknown auth method {:#04x}", b[0]))
 }
 
-fn write_secret<S: Write>(w: &mut S) -> Result<[u8; SECRET_LEN]> {
+/// Server → client: the session parameters, inside the encrypted channel.
+fn write_session<S: Write>(w: &mut S, encrypt: bool) -> Result<[u8; SECRET_LEN]> {
     let mut secret = [0u8; SECRET_LEN];
     getrandom::getrandom(&mut secret).map_err(|e| anyhow::anyhow!("randomness: {e}"))?;
-    write_frame(w, &secret).context("send session secret")?;
+    let mut msg = Vec::with_capacity(1 + SECRET_LEN);
+    msg.push(encrypt as u8);
+    msg.extend_from_slice(&secret);
+    write_frame(w, &msg).context("send session info")?;
     Ok(secret)
 }
 
-fn read_secret<S: Read>(r: &mut S) -> Result<[u8; SECRET_LEN]> {
+fn read_session<S: Read>(r: &mut S) -> Result<(bool, [u8; SECRET_LEN])> {
     let mut buf = Vec::new();
-    read_frame(r, &mut buf).context("read session secret")?;
-    buf.as_slice()
-        .try_into()
-        .context("session secret is not 32 bytes")
+    read_frame(r, &mut buf).context("read session info")?;
+    if buf.len() != 1 + SECRET_LEN {
+        bail!("session info is not {} bytes", 1 + SECRET_LEN);
+    }
+    let encrypt = buf[0] != 0;
+    let secret = buf[1..].try_into().expect("length checked");
+    Ok((encrypt, secret))
 }
 
 #[cfg(test)]
@@ -183,7 +194,7 @@ mod tests {
         let st2 = std::thread::spawn(move || {
             // already paired: the client uses Noise, so the PIN maker is unused
             let (_s, auth) =
-                server_auth(&mut st, &server, &mut authorized, "desk", |_| {
+                server_auth(&mut st, &server, &mut authorized, "desk", true, |_| {
                     Ok("unused".to_string())
                 })
                 .unwrap();
@@ -210,7 +221,7 @@ mod tests {
         let (mut ct, mut st) = pair();
         std::thread::spawn(move || {
             let mut authorized = TrustFile::default();
-            let _ = server_auth(&mut st, &server, &mut authorized, "desk", |_| {
+            let _ = server_auth(&mut st, &server, &mut authorized, "desk", true, |_| {
                 Ok("unused".to_string())
             });
         });
@@ -236,7 +247,7 @@ mod tests {
         let (mut ct, mut st) = pair();
         let st2 = std::thread::spawn(move || {
             let (_s, auth) =
-                server_auth(&mut st, &server, &mut authorized, "desk", |_| {
+                server_auth(&mut st, &server, &mut authorized, "desk", true, |_| {
                     Ok("123456".to_string())
                 })
                 .unwrap();

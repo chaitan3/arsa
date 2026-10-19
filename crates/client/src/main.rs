@@ -232,9 +232,10 @@ fn main() -> Result<()> {
             );
         }
         log::info!(
-            "[auth] authenticated as {:?} (server {:?})",
+            "[auth] authenticated as {:?} (server {:?}); stream encryption {}",
             name,
-            auth.server_name
+            auth.server_name,
+            if auth.encrypt { "on" } else { "off" }
         );
         (stream, auth.secret)
     };

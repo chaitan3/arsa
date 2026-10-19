@@ -25,6 +25,7 @@
 //! transport (length-framed, chunked to the Noise message size).
 
 pub mod conn;
+pub mod crypt;
 pub mod identity;
 pub mod noise;
 pub mod pair;
@@ -34,6 +35,7 @@ pub mod stream;
 pub mod trust;
 
 pub use conn::{client_conn_proof, server_conn_verify};
+pub use crypt::{derive as derive_stream_key, Open, Seal};
 pub use identity::Identity;
 pub use noise::{client_handshake, server_handshake};
 pub use pair::{pair_client, pair_server};
