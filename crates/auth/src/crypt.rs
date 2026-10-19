@@ -13,7 +13,8 @@
 //! The RDMA video data plane is *not* encrypted (it is a memory write with no
 //! userspace copy to encrypt); only the TCP sockets use this.
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::generic_array::GenericArray;
+use aes_gcm::aead::{Aead, AeadInPlace, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::Result;
 use hkdf::Hkdf;
@@ -84,15 +85,21 @@ impl Open {
         Ok(())
     }
 
-    /// Open in place: `buf` is `ciphertext || tag`; on success it holds the
-    /// plaintext (same length minus the tag).
+    /// Open in place: `buf` is `ciphertext || tag`; on success it is truncated
+    /// to the plaintext. No allocation (this is the video/audio hot path).
     pub fn open_in_place(&mut self, buf: &mut Vec<u8>) -> Result<()> {
-        let plain = self
-            .cipher
-            .decrypt(&nonce(self.counter), buf.as_slice())
+        let n = buf.len();
+        if n < 16 {
+            anyhow::bail!("short ciphertext");
+        }
+        let ct_len = n - 16;
+        let (ct, tag) = buf.split_at_mut(ct_len);
+        let tag = GenericArray::from_slice(tag);
+        self.cipher
+            .decrypt_in_place_detached(&nonce(self.counter), b"", ct, tag)
             .map_err(|_| anyhow::anyhow!("stream decrypt failed (tamper or key mismatch)"))?;
         self.counter = self.counter.wrapping_add(1);
-        *buf = plain;
+        buf.truncate(ct_len);
         Ok(())
     }
 }

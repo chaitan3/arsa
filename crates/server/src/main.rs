@@ -428,6 +428,7 @@ fn run_testcard_server(
             input_tx,
             None,
             &rumble_hub,
+            None, // testcard: no auth, no encryption
         )?;
         // TCP transport: the client opens its TAG_VIDEO socket right after the
         // codec handshake; grab it before the (blocking) testcard loop starts
@@ -1745,6 +1746,17 @@ fn run_capture(
                     };
                     // client input events join the same channel as the
                     // synthetic --input-test injector -> capture forwarder
+                    let video_key = if no_encrypt {
+                        None
+                    } else {
+                        (*session_secret.lock().unwrap()).map(|s| {
+                            rdma_display_auth::derive_stream_key(
+                                &s,
+                                rdma_display_proto::TAG_VIDEO,
+                                false,
+                            )
+                        })
+                    };
                     match rdma_display_rdma::ServerLink::accept_negotiated(
                         conn,
                         neg,
@@ -1757,6 +1769,7 @@ fn run_capture(
                         input_tx.clone(),
                         external.as_deref(),
                         &rumble_hub,
+                        video_key,
                     ) {
                         Ok(link) => {
                             log::info!("session up: {slots} slots, {} frame bytes", link.frame_bytes());

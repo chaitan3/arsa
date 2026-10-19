@@ -212,7 +212,7 @@ fn main() -> Result<()> {
     // auth preamble: authenticate the control connection and collect the
     // session secret the secondary sockets (video/input/audio) prove possession
     // of. Runs before the protocol handshake, on the same socket.
-    let (stream, session_secret) = {
+    let (stream, session_secret, stream_encrypt) = {
         let id = rdma_display_auth::Identity::load_or_generate(&rdma_display_auth::paths::id_key())
             .context("load client identity")?;
         let mut known =
@@ -237,7 +237,7 @@ fn main() -> Result<()> {
             auth.server_name,
             if auth.encrypt { "on" } else { "off" }
         );
-        (stream, auth.secret)
+        (stream, auth.secret, auth.encrypt)
     };
 
     // video transport: auto prefers RDMA and falls back to TCP (matching the
@@ -279,6 +279,7 @@ fn main() -> Result<()> {
         lossy_mbps,
         metrics_on,
         session_secret,
+        stream_encrypt,
     )?;
     if link.slots_gpu_only() {
         log::info!("[client] GPU slots without CPU mapping: content checks use the verification-only device->host copy (the render path itself stays zero-copy)");

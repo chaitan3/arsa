@@ -430,6 +430,9 @@ pub struct ServerLink {
     last_send_us: u64,
     /// coded bytes of the most recently sent frame (judder instrumentation)
     last_sent_bytes: usize,
+    /// AES-256-GCM seal for the TCP video stream (None for RDMA or
+    /// `--no-encrypt`); the client-side `Open` is created in `connect_with`.
+    video_seal: Option<rdma_display_auth::Seal>,
 }
 
 impl ServerLink {
@@ -450,6 +453,7 @@ impl ServerLink {
         input_tx: mpsc::Sender<proto::InputEvent>,
         external: Option<&[(*mut u8, usize)]>,
         rumble: &proto::gamepad::RumbleHub,
+        video_key: Option<[u8; 32]>,
     ) -> Result<ServerLink> {
         // split the stream: reader thread gets the receive half, the frame
         // send path keeps a write-only clone for per-frame Stamps
@@ -648,6 +652,7 @@ impl ServerLink {
             send_interval_us: 0,
             last_send_us: 0,
             last_sent_bytes: 0,
+            video_seal: video_key.map(|k| rdma_display_auth::Seal::new(&k)),
         })
     }
 
@@ -1051,6 +1056,7 @@ impl ServerLink {
         anyhow::ensure!(post_len <= capacity, "post_len {post_len} > slot {capacity}");
         let t1_unix_us = proto::unix_now_us();
         let seq = self.seq;
+        let mut seal = self.video_seal.take();
         let (t2_unix_us, t2c_unix_us) = {
             let Tx::Tcp { buf, .. } = &self.tx else {
                 unreachable!()
@@ -1066,16 +1072,30 @@ impl ServerLink {
                     );
                 }
             }
-            w.write_all(&(post_len as u32).to_le_bytes())
-                .context("tcp video frame length")?;
-            w.write_all(&seq.to_le_bytes())
-                .context("tcp video frame seq")?;
-            w.write_all(&buf[..post_len]).context("tcp video frame")?;
+            match seal.as_mut() {
+                Some(s) => {
+                    let mut ct = Vec::with_capacity(post_len + 16);
+                    s.seal(&buf[..post_len], &mut ct);
+                    w.write_all(&(ct.len() as u32).to_le_bytes())
+                        .context("tcp video frame length")?;
+                    w.write_all(&seq.to_le_bytes())
+                        .context("tcp video frame seq")?;
+                    w.write_all(&ct).context("tcp video frame")?;
+                }
+                None => {
+                    w.write_all(&(post_len as u32).to_le_bytes())
+                        .context("tcp video frame length")?;
+                    w.write_all(&seq.to_le_bytes())
+                        .context("tcp video frame seq")?;
+                    w.write_all(&buf[..post_len]).context("tcp video frame")?;
+                }
+            }
             let t2 = proto::unix_now_us();
             // no remote-completion signal on TCP: t2c == t2 (the client's t3
             // read-observation is the meaningful receipt stamp)
             (t2, t2)
         };
+        self.video_seal = seal;
         self.note_send();
         self.seq += 1;
         self.last_sent_bytes = post_len;
@@ -1483,6 +1503,7 @@ fn spawn_video_reader(
     recycle_rx: mpsc::Receiver<Vec<u8>>,
     stats: std::sync::Arc<VideoReaderStats>,
     metrics: bool,
+    mut open: Option<rdma_display_auth::Open>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("video-reader".into())
@@ -1510,7 +1531,9 @@ fn spawn_video_reader(
                 }
                 let len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
                 let seq = u64::from_le_bytes(hdr[4..12].try_into().unwrap());
-                if len > slot_len {
+                // encrypted frames carry a 16-byte tag on top of the plaintext
+                let headroom = if open.is_some() { 16 } else { 0 };
+                if len > slot_len + headroom {
                     log::debug!("[tcp] video frame {len} > slot {slot_len}");
                     break;
                 }
@@ -1518,6 +1541,12 @@ fn spawn_video_reader(
                 buf.resize(len, 0);
                 if std::io::Read::read_exact(&mut stream, &mut buf).is_err() {
                     break;
+                }
+                if let Some(o) = open.as_mut() {
+                    if let Err(e) = o.open_in_place(&mut buf) {
+                        log::warn!("[tcp] video decrypt failed: {e:#}");
+                        break;
+                    }
                 }
                 // arrival stamped after the payload lands in memory (only when
                 // the client is collecting metrics — no per-frame work otherwise)
@@ -1554,6 +1583,7 @@ impl ClientLink {
             0,
             false,
             session_secret,
+            false,
         )
     }
 
@@ -1576,6 +1606,7 @@ impl ClientLink {
         lossy_mbps: u16,
         metrics: bool,
         session_secret: [u8; rdma_display_auth::SECRET_LEN],
+        encrypt: bool,
     ) -> Result<ClientLink> {
         // split the stream: the frame/metrics reader gets the receive half as
         // its own clone; the link's conn keeps doing client→server sends
@@ -1684,6 +1715,16 @@ impl ClientLink {
         );
 
         let video_reader = std::sync::Arc::new(VideoReaderStats::default());
+        let video_open = if encrypt {
+            let key = rdma_display_auth::derive_stream_key(
+                &session_secret,
+                proto::TAG_VIDEO,
+                false, // server → client
+            );
+            Some(rdma_display_auth::Open::new(&key))
+        } else {
+            None
+        };
         let rx = match transport {
             Transport::Rdma => {
                 let (qp, _send_cq, recv_cq) = endpoint.expect("rdma endpoint");
@@ -1763,7 +1804,7 @@ impl ClientLink {
                 let (frame_tx, frame_rx) = mpsc::channel();
                 let (recycle_tx, recycle_rx) = mpsc::channel();
                 let reader =
-                    spawn_video_reader(s, slot_len, slots, frame_tx, recycle_rx, video_reader.clone(), metrics);
+                    spawn_video_reader(s, slot_len, slots, frame_tx, recycle_rx, video_reader.clone(), metrics, video_open);
                 Rx::Tcp {
                     frame_rx,
                     recycle_tx,
