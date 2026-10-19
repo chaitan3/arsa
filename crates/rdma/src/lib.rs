@@ -338,8 +338,17 @@ pub fn handshake_server(
     session_nonce: u64,
     pref: TransportPref,
     server_has_rdma: bool,
+    ctrl_seal: Option<std::sync::Arc<std::sync::Mutex<rdma_display_auth::Seal>>>,
+    ctrl_open: Option<std::sync::Arc<std::sync::Mutex<rdma_display_auth::Open>>>,
 ) -> Result<(Conn<TcpStream>, Transport, proto::ModeRequest, u8, u16, u8)> {
-    let mut conn = Conn::new(stream);
+    let mut conn = match (ctrl_seal, ctrl_open) {
+        (Some(seal), Some(open)) => Conn::encrypted(
+            stream,
+            Some(Box::new(SharedSeal(seal))),
+            Some(Box::new(SharedOpen(open))),
+        ),
+        _ => Conn::new(stream),
+    };
     let (transport, codec_pref, lossy_mbps, client_caps) =
         hello_server(&mut conn, session_nonce, pref, server_has_rdma)?;
     log::info!(
@@ -380,6 +389,56 @@ const SIOCOUTQ: u64 = 0x5411;
 
 extern "C" {
     fn ioctl(fd: i32, request: u64, ...) -> i32;
+}
+
+/// A seal shared by the control direction's several writers — the handshake
+/// `Conn` plus the async stamp/rumble writers — so they use one nonce counter
+/// (the client's reader expects a single sequence).
+struct SharedSeal(std::sync::Arc<std::sync::Mutex<rdma_display_auth::Seal>>);
+
+impl proto::StreamCipher for SharedSeal {
+    fn seal(&mut self, plain: &[u8], out: &mut Vec<u8>) {
+        self.0.lock().unwrap().seal(plain, out);
+    }
+    fn open(&mut self, _ct: &[u8], _out: &mut Vec<u8>) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "seal-only cipher",
+        ))
+    }
+}
+
+/// The read half of the same shared control state (the handshake `Conn` and the
+/// control reader thread both read the client->server direction).
+struct SharedOpen(std::sync::Arc<std::sync::Mutex<rdma_display_auth::Open>>);
+
+impl proto::StreamCipher for SharedOpen {
+    fn seal(&mut self, _plain: &[u8], _out: &mut Vec<u8>) {}
+    fn open(&mut self, ct: &[u8], out: &mut Vec<u8>) -> std::io::Result<()> {
+        self.0.lock().unwrap().open(ct, out).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+        })
+    }
+}
+
+/// Write one control message through a shared seal (plaintext when `None`).
+fn send_ctrl<W: std::io::Write>(
+    w: &mut W,
+    msg: &proto::Message,
+    seal: Option<&std::sync::Arc<std::sync::Mutex<rdma_display_auth::Seal>>>,
+) -> std::io::Result<()> {
+    let Some(seal) = seal else {
+        return proto::send_msg(w, msg);
+    };
+    let (ty, payload) = proto::encode_msg(msg)?;
+    let mut body = Vec::with_capacity(4 + payload.len());
+    body.extend_from_slice(&ty.to_le_bytes());
+    body.extend_from_slice(&payload);
+    let mut ct = Vec::with_capacity(body.len() + 16);
+    seal.lock().unwrap().seal(&body, &mut ct);
+    w.write_all(&(ct.len() as u32).to_le_bytes())?;
+    w.write_all(&ct)?;
+    w.flush()
 }
 
 /// How many recent send -> credit turnarounds the windowed max keeps. Bounds
@@ -433,6 +492,9 @@ pub struct ServerLink {
     /// AES-256-GCM seal for the TCP video stream (None for RDMA or
     /// `--no-encrypt`); the client-side `Open` is created in `connect_with`.
     video_seal: Option<rdma_display_auth::Seal>,
+    /// Shared seal for the control direction (handshake `Conn` + stamp/rumble
+    /// writers); None when unencrypted.
+    ctrl_seal: Option<std::sync::Arc<std::sync::Mutex<rdma_display_auth::Seal>>>,
 }
 
 impl ServerLink {
@@ -454,13 +516,25 @@ impl ServerLink {
         external: Option<&[(*mut u8, usize)]>,
         rumble: &proto::gamepad::RumbleHub,
         video_key: Option<[u8; 32]>,
+        ctrl_seal: Option<std::sync::Arc<std::sync::Mutex<rdma_display_auth::Seal>>>,
+        ctrl_open: Option<std::sync::Arc<std::sync::Mutex<rdma_display_auth::Open>>>,
     ) -> Result<ServerLink> {
         // split the stream: reader thread gets the receive half, the frame
         // send path keeps a write-only clone for per-frame Stamps
         let stream = conn.into_inner();
         let stamp_w = stream.try_clone().context("clone stream for stamps")?;
         let rumble_w = stream.try_clone().context("clone stream for rumble")?;
-        let mut conn = Conn::new(stream);
+        // the handshake Conn was dropped by `into_inner`; re-wrap with the same
+        // shared ciphers so the counter continues and the reader thread inherits
+        // them
+        let mut conn = match (ctrl_seal.clone(), ctrl_open) {
+            (Some(seal), Some(open)) => Conn::encrypted(
+                stream,
+                Some(Box::new(SharedSeal(seal))),
+                Some(Box::new(SharedOpen(open))),
+            ),
+            _ => Conn::new(stream),
+        };
 
         let tx = match transport {
             Transport::Rdma => {
@@ -560,6 +634,7 @@ impl ServerLink {
         // disconnect so pad threads never block on a dead session
         let (rumble_tx, rumble_rx) = mpsc::channel::<proto::gamepad::Rumble>();
         rumble.set(rumble_tx);
+        let rumble_seal = ctrl_seal.clone();
         std::thread::Builder::new()
             .name("rumble-fwd".into())
             .spawn(move || {
@@ -567,7 +642,13 @@ impl ServerLink {
                 loop {
                     match rumble_rx.recv() {
                         Ok(r) => {
-                            if proto::send_msg(&mut w, &proto::Message::Rumble(r)).is_err() {
+                            if send_ctrl(
+                                &mut w,
+                                &proto::Message::Rumble(r),
+                                rumble_seal.as_ref(),
+                            )
+                            .is_err()
+                            {
                                 break;
                             }
                         }
@@ -653,6 +734,7 @@ impl ServerLink {
             last_send_us: 0,
             last_sent_bytes: 0,
             video_seal: video_key.map(|k| rdma_display_auth::Seal::new(&k)),
+            ctrl_seal,
         })
     }
 
@@ -1141,7 +1223,7 @@ impl ServerLink {
             mat: mat_times,
             meta_gen: self.meta_gen,
         };
-        if let Err(e) = proto::send_msg(w, &Message::Stamp(s)) {
+        if let Err(e) = send_ctrl(w, &Message::Stamp(s), self.ctrl_seal.as_ref()) {
             log::debug!("[rdma] stamp send failed: {e}");
             self.stamp_w = None;
         }
@@ -1265,7 +1347,7 @@ impl ServerLink {
     pub fn send_meta(&mut self, meta: &proto::DisplayMeta) -> bool {
         match self.stamp_w.as_mut() {
             Some(w) => {
-                if let Err(e) = proto::send_msg(w, &Message::Meta(meta.clone())) {
+                if let Err(e) = send_ctrl(w, &Message::Meta(meta.clone()), self.ctrl_seal.as_ref()) {
                     log::debug!("[rdma] meta send failed: {e}");
                     self.stamp_w = None;
                     return false;
@@ -1296,12 +1378,18 @@ impl ServerLink {
 /// Spawn the client-side control-channel reader (server → client direction:
 /// per-frame Stamps + clock-sync Pongs). Returns the receiver the main loop
 /// drains. Ends silently when the link (and thus the channel) is dropped.
-fn spawn_control_reader(stream: TcpStream) -> mpsc::Receiver<ControlEvent> {
+fn spawn_control_reader(
+    stream: TcpStream,
+    open: Option<std::sync::Arc<std::sync::Mutex<rdma_display_auth::Open>>>,
+) -> mpsc::Receiver<ControlEvent> {
     let (tx, rx) = mpsc::channel::<ControlEvent>();
     let _ = std::thread::Builder::new()
         .name("ctrl-reader".into())
         .spawn(move || {
-            let mut conn = Conn::new(stream);
+            let mut conn = match open {
+                Some(o) => Conn::encrypted(stream, None, Some(Box::new(SharedOpen(o)))),
+                None => Conn::new(stream),
+            };
             loop {
                 match conn.recv() {
                     Ok(proto::Message::Stamp(s)) => {
@@ -1612,7 +1700,34 @@ impl ClientLink {
         // its own clone; the link's conn keeps doing client→server sends
         let stream = conn.into_inner();
         let reader_stream = stream.try_clone().context("clone stream for control reader")?;
-        let mut conn = Conn::new(stream);
+        let (mut conn, ctrl_open) = if encrypt {
+            let wr = rdma_display_auth::derive_stream_key(
+                &session_secret,
+                proto::TAG_CONTROL,
+                true,
+            );
+            let rd = rdma_display_auth::derive_stream_key(
+                &session_secret,
+                proto::TAG_CONTROL,
+                false,
+            );
+            let seal = std::sync::Arc::new(std::sync::Mutex::new(
+                rdma_display_auth::Seal::new(&wr),
+            ));
+            let open = std::sync::Arc::new(std::sync::Mutex::new(
+                rdma_display_auth::Open::new(&rd),
+            ));
+            (
+                Conn::encrypted(
+                    stream,
+                    Some(Box::new(SharedSeal(seal))),
+                    Some(Box::new(SharedOpen(open.clone()))),
+                ),
+                Some(open),
+            )
+        } else {
+            (Conn::new(stream), None)
+        };
 
         // handshake: advertise our RDMA capability, learn the server's choice
         let mut caps = if pref == TransportPref::Tcp || rdma.is_none() {
@@ -1785,7 +1900,7 @@ impl ClientLink {
                     session_nonce,
                     mode_reply: mode_reply.clone(),
                     rx,
-                    ctrl_rx: spawn_control_reader(reader_stream),
+                    ctrl_rx: spawn_control_reader(reader_stream, ctrl_open),
                     transport,
                     last_rx_bytes: 0,
                     video_reader: video_reader.clone(),
@@ -1826,7 +1941,7 @@ impl ClientLink {
             session_nonce,
             mode_reply,
             rx,
-            ctrl_rx: spawn_control_reader(reader_stream),
+            ctrl_rx: spawn_control_reader(reader_stream, ctrl_open),
             transport,
             last_rx_bytes: 0,
             video_reader,

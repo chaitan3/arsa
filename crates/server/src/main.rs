@@ -406,6 +406,8 @@ fn run_testcard_server(
             rdma_display_rdma::random_nonce(),
             transport,
             rdma.is_some(),
+            None,
+            None,
         )?;
         let _ = rdma_display_rdma::send_mode_reply(
             &mut conn,
@@ -429,6 +431,8 @@ fn run_testcard_server(
             None,
             &rumble_hub,
             None, // testcard: no auth, no encryption
+            None,
+            None,
         )?;
         // TCP transport: the client opens its TAG_VIDEO socket right after the
         // codec handshake; grab it before the (blocking) testcard loop starts
@@ -1568,12 +1572,41 @@ fn run_capture(
                     }
                 };
                 let nonce = rdma_display_rdma::random_nonce();
+                let (ctrl_seal, ctrl_open) = if no_encrypt {
+                    (None, None)
+                } else {
+                    match *session_secret.lock().unwrap() {
+                        Some(s) => {
+                            let rd = rdma_display_auth::derive_stream_key(
+                                &s,
+                                rdma_display_proto::TAG_CONTROL,
+                                true,
+                            );
+                            let wr = rdma_display_auth::derive_stream_key(
+                                &s,
+                                rdma_display_proto::TAG_CONTROL,
+                                false,
+                            );
+                            (
+                                Some(std::sync::Arc::new(std::sync::Mutex::new(
+                                    rdma_display_auth::Seal::new(&wr),
+                                ))),
+                                Some(std::sync::Arc::new(std::sync::Mutex::new(
+                                    rdma_display_auth::Open::new(&rd),
+                                ))),
+                            )
+                        }
+                        None => (None, None),
+                    }
+                };
                 let (mut conn, neg, mode_req, client_codec_pref, client_lossy_mbps, client_caps) =
                     match rdma_display_rdma::handshake_server(
                         stream,
                         nonce,
                         transport,
                         rdma.is_some(),
+                        ctrl_seal.clone(),
+                        ctrl_open.clone(),
                     ) {
                         Ok(v) => v,
                         Err(e) => {
@@ -1786,6 +1819,8 @@ fn run_capture(
                         external.as_deref(),
                         &rumble_hub,
                         video_key,
+                        ctrl_seal,
+                        ctrl_open,
                     ) {
                         Ok(link) => {
                             log::info!("session up: {slots} slots, {} frame bytes", link.frame_bytes());
