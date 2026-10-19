@@ -41,12 +41,14 @@ pub struct PairedServer {
 }
 
 /// Client side of pairing. `pin` is the short code shown on the server.
+/// Returns the stream (for the Noise handshake that follows) and what we
+/// learned about the server.
 pub fn pair_client<S: Read + Write>(
     mut stream: S,
     identity: &Identity,
     name: &str,
     pin: &str,
-) -> Result<PairedServer> {
+) -> Result<(S, PairedServer)> {
     let (state, msg_a) = Spake2::<Ed25519Group>::start_a(
         &Password::new(pin.as_bytes()),
         &PakeId::new(PAKE_CLIENT),
@@ -92,19 +94,23 @@ pub fn pair_client<S: Read + Write>(
         bail!("server failed to confirm the PIN (wrong PIN?)");
     }
 
-    Ok(PairedServer {
-        name: String::from_utf8_lossy(&server_name).into_owned(),
-        public: server_pub,
-    })
+    Ok((
+        stream,
+        PairedServer {
+            name: String::from_utf8_lossy(&server_name).into_owned(),
+            public: server_pub,
+        },
+    ))
 }
 
-/// Server side of pairing. Returns the client's name and static public key.
+/// Server side of pairing. Returns the stream, the client's name, and its
+/// static public key.
 pub fn pair_server<S: Read + Write>(
     mut stream: S,
     identity: &Identity,
     name: &str,
     pin: &str,
-) -> Result<(String, Vec<u8>)> {
+) -> Result<(S, String, Vec<u8>)> {
     // C→S
     let mut client_name = Vec::new();
     let mut client_pub = Vec::new();
@@ -150,7 +156,7 @@ pub fn pair_server<S: Read + Write>(
     let mac_s = mac(&key, b"rdma-display-pair-s", &transcript);
     write_frame(&mut stream, &mac_s).context("send server confirm")?;
 
-    Ok((String::from_utf8_lossy(&client_name).into_owned(), client_pub))
+    Ok((stream, String::from_utf8_lossy(&client_name).into_owned(), client_pub))
 }
 
 /// The bytes both sides MAC: everything that must be bound together.
@@ -220,12 +226,12 @@ mod tests {
         let (spub, cpub) = (server.public().to_vec(), client.public().to_vec());
 
         let st2 = std::thread::spawn(move || {
-            let (name, pubkey) = pair_server(&mut st, &server, "desk", "483102").unwrap();
+            let (_s, name, pubkey) = pair_server(&mut st, &server, "desk", "483102").unwrap();
             assert_eq!(name, "laptop");
             assert_eq!(pubkey, cpub);
         });
 
-        let paired = pair_client(&mut ct, &client, "laptop", "483102").unwrap();
+        let (_s, paired) = pair_client(&mut ct, &client, "laptop", "483102").unwrap();
         assert_eq!(paired.name, "desk");
         assert_eq!(paired.public, spub);
         st2.join().unwrap();
@@ -241,7 +247,10 @@ mod tests {
             let _ = pair_server(&mut st, &server, "desk", "111111");
         });
 
-        let err = pair_client(&mut ct, &client, "laptop", "999999").unwrap_err();
+        let err = match pair_client(&mut ct, &client, "laptop", "999999") {
+            Ok(_) => panic!("pairing with the wrong PIN unexpectedly succeeded"),
+            Err(e) => e,
+        };
         assert!(
             format!("{err:#}").contains("confirm"),
             "expected a confirmation failure, got {err:#}"

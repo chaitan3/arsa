@@ -60,6 +60,12 @@ impl<S> EncryptedStream<S> {
     pub fn get_ref(&self) -> &S {
         &self.inner
     }
+
+    /// Recover the underlying stream (used once the handshake has delivered the
+    /// session secret, before the plaintext control protocol takes over).
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
 }
 
 impl<S: Read + Write> EncryptedStream<S> {

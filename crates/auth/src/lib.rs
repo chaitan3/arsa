@@ -28,12 +28,14 @@ pub mod identity;
 pub mod noise;
 pub mod pair;
 pub mod paths;
+pub mod session;
 pub mod stream;
 pub mod trust;
 
 pub use identity::Identity;
 pub use noise::{client_handshake, server_handshake};
 pub use pair::{pair_client, pair_server};
+pub use session::{client_auth, server_auth, ClientAuth, ServerAuth, SECRET_LEN};
 pub use stream::EncryptedStream;
 pub use trust::{AuthorizedClients, KnownServers};
 
