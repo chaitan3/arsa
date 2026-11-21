@@ -98,6 +98,7 @@ fn scanout_roundtrip(
     enc: &mut Encoder,
     dec: &mut Decoder,
     host: &mut HostBuffer,
+    out: &HostBuffer,
     bytes: &[u8],
     prev: &mut Option<(Image, vk::ImageView)>,
 ) {
@@ -131,7 +132,7 @@ fn scanout_roundtrip(
     *prev = Some((img, view));
 
     let n = enc.encode_scanout().expect("encode scanout");
-    let decoded = dec.decode(&enc.coded()[..n]).expect("decode");
+    let decoded = dec.decode(&out.as_slice()[..n]).expect("decode");
     if decoded != bytes {
         let i = decoded
             .iter()
@@ -158,13 +159,20 @@ fn vulkan_lossless_scanout_full_and_delta() {
     let mut host = core
         .host_buffer(geom.frame_bytes() as u64)
         .expect("host buffer");
+    // the server's production path: coded output written directly into the
+    // transport's host-visible staging buffer
+    let out = core
+        .host_buffer(geom.max_coded_len() as u64 + 16)
+        .expect("output buffer");
+    enc.set_output(out.buffer, geom.max_coded_len() + 16)
+        .expect("bind external output");
 
     let mut prev = None;
     let f0 = frame(0x5a);
-    scanout_roundtrip(&core, &mut enc, &mut dec, &mut host, &f0, &mut prev);
+    scanout_roundtrip(&core, &mut enc, &mut dec, &mut host, &out, &f0, &mut prev);
 
     let f1 = frame(0xa5);
-    scanout_roundtrip(&core, &mut enc, &mut dec, &mut host, &f1, &mut prev);
+    scanout_roundtrip(&core, &mut enc, &mut dec, &mut host, &out, &f1, &mut prev);
 
     drop(enc);
     if let Some((img, view)) = prev.take() {

@@ -156,10 +156,11 @@ The materializer turns a source frame into the linear wire bytes. `--materialize
 selects:
 
 - **`vk`** (default): imports the scanout dma-buf into a Vulkan `VkImage` (with
-  its DRM format modifier), copies it to host-visible staging buffers, and the
-  server registers those as the RDMA staging slots. The import is cached per
-  buffer (`buf_id`, format, stride, offset, modifier) and shared by the raw,
-  lossless and lossy paths.
+  its DRM format modifier) and uses host-visible staging buffers that are also
+  the RDMA staging slots (or the TCP video buffer). Raw copies the scanout there
+  on the GPU; lossless encodes directly into it; lossy packetizes directly into
+  it. The import is cached per buffer (`buf_id`, format, stride, offset,
+  modifier) and shared by the raw, lossless and lossy paths.
 - **`plain`**: for scanouts that are already host-linear (`qemu gl=off`); no GPU.
 
 The wire format is always `XR24`/BGRX bytes, top-first. When lossless is active
@@ -241,10 +242,14 @@ The original goal was to register the source dmabuf directly as an MR
 (`ibv_reg_dmabuf_mr`) so the NIC DMA-reads out of GPU memory. On the tested
 NVIDIA stack this fails: `nvidia-drm` exports scanouts through the *static*
 PRIME path (no pin/unpin ops), and peer-DMA mapping of VRAM returns `ENOMEM`.
-The **copy path is therefore the default**: import → blit → readback into a
-pinned host MR → WRITE. Zero-copy dmabuf-MR remains implemented behind the same
-config for hosts with a cooperative exporter (Intel/AMD GPU). The
-client-side GBM/dma-buf MR probes are in
+The **copy path is therefore the default**: import → encode/copy into a pinned
+host MR → WRITE (one GPU→host transfer per frame; the coded output is written
+directly into that MR, not into a scratch buffer). A future true-zero-copy
+**option** would export the coded `VkBuffer` and register it with
+`ibv_reg_dmabuf_mr` (or hand the scanout/GPU buffer to the NIC) so the write
+reads GPU memory; that is not implemented here — it needs a cooperative
+exporter and a Vulkan external-memory export/mapping path. The client-side
+GBM/dma-buf MR probes are in
 [`DEBUG.md`](DEBUG.md#5-client-zero-copy-c0-findings).
 
 ### 5.4 Frame pacing (`--pace`)
@@ -372,8 +377,10 @@ present (it presents only the newest). Skipping one desyncs the chain and trips
 the CRC.
 
 **Encoding cost.** The server imports the scanout into a Vulkan `VkImage` (with
-its DRM format modifier) and runs the tile-delta compute there; only the coded
-delta is copied into the staging slot. The import is **cached per buffer**
+its DRM format modifier) and runs the tile-delta compute there; the coded
+delta is written **directly into the staging slot's host-visible `VkBuffer`**
+(the same memory registered as the RDMA slot / TCP buffer), so there is no CPU
+copy. The import is **cached per buffer**
 (`buf_id`, format, stride, offset, modifier) — a compositor swaps a handful of
 buffers, so steady state pays only the encode. The sampled image is `(R,G,B,A)`;
 the coded word is memory-order `(B,G,R,A)`, so the image shader applies `.bgra`.
@@ -384,8 +391,9 @@ Measured numbers are in [`DEBUG.md`](DEBUG.md#3-performance).
 
 Intra-only GPU codec. The server imports the scanout dmabuf into a Vulkan image
 and runs PyroWave's `encode_gpu_scaled_synchronous` (RGB → YCbCr + scale), then
-packetizes the bitstream into the staging slot — no GL, no full-frame readback.
-The client decodes on the GPU into Y/U/V planes and converts to BGRA. Because
+packetizes the bitstream **directly into the staging slot** at the final header
+offset — no GL, no full-frame readback, no temporary packet buffer. The client
+decodes on the GPU into Y/U/V planes and converts to BGRA. Because
 it is intra-only there is no reference-chain invariant and no CRC.
 `--lossy-bitrate MBPS` sets the bitstream budget in Mbit/s, which the server
 converts to PyroWave's per-frame byte cap at a nominal 60 fps
@@ -556,8 +564,14 @@ RDMA video stays plaintext, and `--no-encrypt` disables it.
 
 ## 12. Design decisions and limits
 
-- **Copy path is the default**; zero-copy dmabuf-MR is implemented but only
-  viable with a cooperative exporter (see §5.3).
+- **Copy path is the default**: one GPU→host transfer per frame into a pinned
+  host MR (raw copy, lossless coded output, or lossy packetize); the slot is
+  written directly, not via a scratch buffer. True GPU zero-copy (NIC reads a
+  registered GPU dmabuf via `ibv_reg_dmabuf_mr`) is a future option, viable only
+  with a cooperative exporter (see §5.3).
+- **TCP has no extra copy**: the same Vulkan host staging buffer is the TCP send
+  buffer, and AES-256-GCM seals it in place (16-byte tailroom), so the ciphertext
+  is written straight to the socket.
 - **One session at a time**, single output, single console. The accept path is
   single-threaded, so a per-session bring-up (including the mode-settle wait)
   briefly delays a second client.

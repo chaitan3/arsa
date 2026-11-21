@@ -396,6 +396,88 @@ impl Pyrowave {
         Ok(EncodedFrame { len: end, packets })
     }
 
+    /// Encode and packetize **directly into the caller's buffer** (the staging
+    /// slot). The wire framing is `[u32 n][u32 sizes…][packets]`; the packet
+    /// bytes are written at the final header offset, so there is no temporary
+    /// bitstream buffer and no packet copy in the common case.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_packetized_into(
+        &self,
+        enc: PyrowaveEncoder,
+        info: &PyrowaveScaledEncodeInfo,
+        rate: &PyrowaveRateControl,
+        boundary: usize,
+        padding: usize,
+        out: &mut [u8],
+    ) -> Result<usize> {
+        let r = unsafe {
+            (self.encoder_encode_gpu_scaled_synchronous)(
+                enc,
+                std::ptr::null(),
+                std::ptr::null(),
+                info,
+                rate,
+            )
+        };
+        if r != PyrowaveResult::Success {
+            bail!("pyrowave encode: {r:?}");
+        }
+        let mut npackets = 0usize;
+        let r = unsafe {
+            (self.encoder_compute_num_packets_with_padding)(enc, boundary, padding, &mut npackets)
+        };
+        if r != PyrowaveResult::Success {
+            bail!("pyrowave compute_num_packets: {r:?}");
+        }
+        let hdr_max = 4 + 4 * npackets;
+        if hdr_max > out.len() {
+            bail!("lossy: header {hdr_max} > slot {}", out.len());
+        }
+        let mut packets = vec![PyrowavePacket::default(); npackets.max(1)];
+        let mut out_packets = 0usize;
+        let r = unsafe {
+            (self.encoder_packetize)(
+                enc,
+                packets.as_mut_ptr(),
+                boundary,
+                &mut out_packets,
+                out[hdr_max..].as_mut_ptr() as *mut c_void,
+                out.len() - hdr_max,
+            )
+        };
+        if r != PyrowaveResult::Success {
+            bail!(
+                "pyrowave packetize: {r:?} (slot {} too small?)",
+                out.len()
+            );
+        }
+        let hdr = 4 + 4 * out_packets;
+        if out_packets > npackets {
+            bail!(
+                "pyrowave packetize returned {out_packets} packets > computed {npackets}"
+            );
+        }
+        // Move the packets left if the actual packet count is below the
+        // padded-count reservation; normally out_packets == npackets.
+        let mut acc = 0usize;
+        for p in packets.iter().take(out_packets) {
+            let src = hdr_max + p.offset;
+            if src + p.size > out.len() {
+                bail!("pyrowave packet {src}+{} overruns slot {}", p.size, out.len());
+            }
+            let dst = hdr + acc;
+            if src != dst {
+                out.copy_within(src..src + p.size, dst);
+            }
+            acc += p.size;
+        }
+        out[0..4].copy_from_slice(&(out_packets as u32).to_le_bytes());
+        for (i, p) in packets.iter().take(out_packets).enumerate() {
+            out[4 + 4 * i..8 + 4 * i].copy_from_slice(&(p.size as u32).to_le_bytes());
+        }
+        Ok(hdr + acc)
+    }
+
     /// Push one packet (RDMA-received bitstream chunk) and report readiness.
     pub fn push(&self, dec: PyrowaveDecoder, data: &[u8]) -> Result<bool> {
         let r = unsafe {

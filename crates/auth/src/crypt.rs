@@ -60,6 +60,25 @@ impl Seal {
         self.counter = self.counter.wrapping_add(1);
         out.extend_from_slice(&ct);
     }
+
+    /// Seal in place: `buf` is `plaintext || 16 bytes of tailroom`; on success
+    /// it becomes `ciphertext || tag`. Avoids the second ciphertext buffer on
+    /// the TCP video hot path.
+    pub fn seal_in_place(&mut self, buf: &mut [u8]) -> Result<()> {
+        let n = buf.len();
+        if n < 16 {
+            anyhow::bail!("short seal buffer");
+        }
+        let plain_len = n - 16;
+        let (plain, tag_out) = buf.split_at_mut(plain_len);
+        let tag = self
+            .cipher
+            .encrypt_in_place_detached(&nonce(self.counter), b"", plain)
+            .map_err(|_| anyhow::anyhow!("stream encrypt failed"))?;
+        self.counter = self.counter.wrapping_add(1);
+        tag_out.copy_from_slice(&tag);
+        Ok(())
+    }
 }
 
 /// The receiving half: opens messages, enforcing a strict counter.
@@ -190,5 +209,22 @@ mod tests {
         seal.seal(b"in place", &mut ct);
         open.open_in_place(&mut ct).unwrap();
         assert_eq!(ct, b"in place");
+    }
+
+    #[test]
+    fn seal_in_place_matches_wire_format() {
+        let secret = [2u8; SECRET_LEN];
+        let key = derive(&secret, 0x05, false);
+        let mut a = Seal::new(&key);
+        let mut b = Seal::new(&key);
+        let mut out = Vec::new();
+        a.seal(b"same plaintext", &mut out);
+        let mut buf = b"same plaintext".to_vec();
+        buf.extend_from_slice(&[0u8; 16]);
+        b.seal_in_place(&mut buf).unwrap();
+        assert_eq!(buf, out);
+        let mut open = Open::new(&key);
+        open.open_in_place(&mut buf).unwrap();
+        assert_eq!(buf, b"same plaintext");
     }
 }

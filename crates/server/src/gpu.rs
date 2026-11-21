@@ -142,16 +142,61 @@ impl Gpu {
     }
 }
 
+/// The per-session host-visible staging buffers. Shared by the raw
+/// materializer, the lossless encoder and the transport registration.
+pub struct VkStaging {
+    core: Arc<VkCore>,
+    pub buffers: Vec<HostBuffer>,
+    /// postable payload length (the MR length; the buffers have +16 tailroom)
+    pub len: usize,
+}
+
+impl VkStaging {
+    /// The staging buffer whose CPU address is `ptr`, if any.
+    pub fn buffer_matching(&self, ptr: *mut u8) -> Option<vk::Buffer> {
+        self.buffers
+            .iter()
+            .find(|b| b.ptr == ptr)
+            .map(|b| b.buffer)
+    }
+
+    /// The staging buffer for `slot` only when `ptr` is that buffer's CPU
+    /// address. This keeps direct GPU output bound to the memory the transport
+    /// is actually about to post (RDMA slot or the TCP send buffer); a
+    /// mismatched pointer falls back to the explicit coded copy.
+    pub fn buffer_for(&self, slot: usize, ptr: *mut u8) -> Option<vk::Buffer> {
+        self.buffers
+            .get(slot)
+            .filter(|b| b.ptr == ptr)
+            .map(|b| b.buffer)
+    }
+}
+
+impl Drop for VkStaging {
+    fn drop(&mut self) {
+        unsafe {
+            // never destroy memory the GPU may still be reading
+            let _ = self.core.device.device_wait_idle();
+            for b in self.buffers.drain(..) {
+                self.core.device.destroy_buffer(b.buffer, None);
+                self.core.device.free_memory(b.memory, None);
+            }
+        }
+    }
+}
+
+pub type SharedStaging = Arc<Mutex<Option<Arc<VkStaging>>>>;
+
 /// Raw materializer: imports the scanout into Vulkan and copies it to
 /// host-visible staging buffers (the PBO equivalent). The RDMA path uses the
 /// async `issue_frame`/`finish_frame` pair so the copy overlaps the previous
 /// frame; TCP uses the synchronous `copy_frame`.
 pub struct VkMaterializer {
     gpu: Arc<Gpu>,
+    staging: SharedStaging,
     image: Option<Arc<CachedImage>>,
     fmt: Option<FrameFormat>,
     frame_bytes: usize,
-    host: Vec<HostBuffer>,
     scratch: Option<HostBuffer>,
     cmds: Vec<vk::CommandBuffer>,
     fences: Vec<vk::Fence>,
@@ -161,13 +206,13 @@ pub struct VkMaterializer {
 unsafe impl Send for VkMaterializer {}
 
 impl VkMaterializer {
-    pub fn new(gpu: Arc<Gpu>) -> Self {
+    pub fn new(gpu: Arc<Gpu>, staging: SharedStaging) -> Self {
         Self {
             gpu,
+            staging,
             image: None,
             fmt: None,
             frame_bytes: 0,
-            host: Vec::new(),
             scratch: None,
             cmds: Vec::new(),
             fences: Vec::new(),
@@ -211,12 +256,9 @@ impl VkMaterializer {
     }
 
     fn destroy_staging(&mut self) {
+        *self.staging.lock().unwrap() = None;
         unsafe {
             let dev = &self.gpu.core.device;
-            for b in self.host.drain(..) {
-                dev.destroy_buffer(b.buffer, None);
-                dev.free_memory(b.memory, None);
-            }
             if let Some(b) = self.scratch.take() {
                 dev.destroy_buffer(b.buffer, None);
                 dev.free_memory(b.memory, None);
@@ -253,7 +295,7 @@ impl FrameMaterializer for VkMaterializer {
         self.fmt = Some(fmt.clone());
         self.frame_bytes = fmt.frame_bytes() as usize;
         self.dirty = true;
-        if self.host.is_empty() && self.scratch.is_none() {
+        if self.staging.lock().unwrap().is_none() && self.scratch.is_none() {
             self.scratch = Some(
                 self.gpu
                     .core
@@ -272,6 +314,16 @@ impl FrameMaterializer for VkMaterializer {
             return Ok((false, MatTimes::ZERO));
         };
         img.ensure_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)?;
+        // TCP with the external staging buffer: copy straight into the memory
+        // that will be sealed and written, with no scratch + memcpy.
+        let staging = self.staging.lock().unwrap().clone();
+        if let Some(staging) = staging.as_ref() {
+            if let Some(dst) = staging.buffer_matching(out.as_ptr() as *mut u8) {
+                self.copy_image(img, dst)?;
+                self.dirty = false;
+                return Ok((true, MatTimes::ZERO));
+            }
+        }
         if self.scratch.is_none() {
             self.scratch = Some(self.gpu.core.host_buffer(self.frame_bytes as u64)?);
         }
@@ -284,13 +336,16 @@ impl FrameMaterializer for VkMaterializer {
     }
 
     fn bind_staging(&mut self, n: usize, slot_len: usize) -> Option<Vec<(*mut u8, usize)>> {
-        if self.host.len() == n && self.host.iter().all(|b| b.size >= slot_len as u64) {
-            return Some(self.host.iter().map(|b| (b.ptr, slot_len)).collect());
+        if let Some(s) = self.staging.lock().unwrap().as_ref() {
+            if s.buffers.len() == n && s.len >= slot_len {
+                return Some(s.buffers.iter().map(|b| (b.ptr, slot_len)).collect());
+            }
         }
         self.destroy_staging();
         let mut host = Vec::with_capacity(n);
         for _ in 0..n {
-            match self.gpu.core.host_buffer(slot_len as u64) {
+            // +16 tailroom for the in-place AES-GCM tag on the TCP path
+            match self.gpu.core.host_buffer(slot_len as u64 + 16) {
                 Ok(b) => host.push(b),
                 Err(e) => {
                     log::warn!("[vk] staging buffer alloc failed: {e:#}");
@@ -298,6 +353,12 @@ impl FrameMaterializer for VkMaterializer {
                 }
             }
         }
+        let staging = Arc::new(VkStaging {
+            core: self.gpu.core.clone(),
+            buffers: host,
+            len: slot_len,
+        });
+        *self.staging.lock().unwrap() = Some(staging.clone());
         let cmds = match unsafe {
             self.gpu.core.device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo {
@@ -311,12 +372,7 @@ impl FrameMaterializer for VkMaterializer {
             Ok(c) => c,
             Err(e) => {
                 log::warn!("[vk] staging command buffers failed: {e}");
-                for b in host {
-                    unsafe {
-                        self.gpu.core.device.destroy_buffer(b.buffer, None);
-                        self.gpu.core.device.free_memory(b.memory, None);
-                    }
-                }
+                *self.staging.lock().unwrap() = None;
                 return None;
             }
         };
@@ -335,24 +391,24 @@ impl FrameMaterializer for VkMaterializer {
                         unsafe { self.gpu.core.device.destroy_fence(f, None) };
                     }
                     unsafe {
-                        for b in &host {
-                            self.gpu.core.device.destroy_buffer(b.buffer, None);
-                            self.gpu.core.device.free_memory(b.memory, None);
-                        }
                         self.gpu.core.device.free_command_buffers(self.gpu.core.command_pool, &cmds);
                     }
+                    *self.staging.lock().unwrap() = None;
                     return None;
                 }
             }
         }
-        self.host = host;
         self.cmds = cmds;
         self.fences = fences;
-        Some(self.host.iter().map(|b| (b.ptr, slot_len)).collect())
+        Some(staging.buffers.iter().map(|b| (b.ptr, slot_len)).collect())
     }
 
     fn issue_frame(&mut self, slot: usize, out: &mut [u8]) -> Result<bool> {
-        if slot >= self.host.len() || slot >= self.cmds.len() || slot >= self.fences.len() {
+        let staging = self.staging.lock().unwrap().clone();
+        let Some(staging) = staging else {
+            return Ok(self.copy_frame(out)?.0);
+        };
+        if slot >= staging.buffers.len() || slot >= self.cmds.len() || slot >= self.fences.len() {
             return Ok(self.copy_frame(out)?.0);
         }
         if !self.dirty {
@@ -374,7 +430,7 @@ impl FrameMaterializer for VkMaterializer {
                     ..Default::default()
                 },
             )?;
-            self.record_copy(cb, img, self.host[slot].buffer);
+            self.record_copy(cb, img, staging.buffers[slot].buffer);
             core.device.end_command_buffer(cb)?;
             let cbs = [cb];
             core.device.queue_submit(
@@ -555,7 +611,8 @@ mod tests {
             strides: vec![pitch],
             format: fmt.clone(),
         };
-        let mut mat = VkMaterializer::new(gpu.clone());
+        let staging: SharedStaging = Arc::new(Mutex::new(None));
+        let mut mat = VkMaterializer::new(gpu.clone(), staging);
         mat.prepare(&fmt, Some(&d)).expect("prepare");
         let mut out = vec![0u8; frame_bytes];
         let (changed, _) = mat.copy_frame(&mut out).expect("copy");

@@ -959,6 +959,10 @@ fn run_capture(
     // One Vulkan device shared by the raw materializer and the lossless/lossy
     // encoders: the scanout import is cached and reused.
     let gpu = gpu::Gpu::new().context("create the shared Vulkan GPU")?;
+    // Host-visible staging shared by the raw materializer and the lossless
+    // encoder (the transport's RDMA slots are registered from these buffers,
+    // so coded output lands directly in the postable memory).
+    let staging: gpu::SharedStaging = Arc::new(std::sync::Mutex::new(None));
 
     // input sink: explicit --input wins, else paired default
     let input_name = input_name.unwrap_or(match source_name {
@@ -1052,6 +1056,7 @@ fn run_capture(
         codec,
         materialize,
         &gpu,
+        &staging,
         lossy_budget,
         lossy_chroma444,
     )?;
@@ -1200,6 +1205,9 @@ fn run_capture(
             if let Some(w) = workers.take() {
                 w.stop();
                 mat.release();
+                // an idle server must not hold the per-session staging buffers
+                // (lossy sessions don't bind them, so clear even then)
+                *staging.lock().unwrap() = None;
                 fc.teardown();
                 // audio is per-session too: stop it (and the helper) while idle
                 if let Some(mut a) = audio_capture.take() {
@@ -1649,6 +1657,7 @@ fn run_capture(
                         session_codec,
                         materialize,
                         &gpu,
+                        &staging,
                         eff_budget,
                         lossy_chroma444,
                     )?;
@@ -1802,7 +1811,7 @@ fn run_capture(
                         ctrl_seal,
                         ctrl_open,
                     ) {
-                        Ok(link) => {
+                        Ok(mut link) => {
                             log::info!("session up: {slots} slots, {} frame bytes", link.frame_bytes());
                             // the new client starts with zeroed slots: make
                             // the current scanout content sendable even
@@ -1814,6 +1823,7 @@ fn run_capture(
                             // never received)
                             fc.configure(
                                 &gpu,
+                                &staging,
                                 session_codec,
                                 meta.width,
                                 meta.height,
@@ -1821,6 +1831,23 @@ fn run_capture(
                                 meta.frame_bytes as usize,
                             )?;
                             frame_dirty = true;
+                            // TCP with the Vulkan materializer: send GPU output
+                            // straight from a host staging buffer (the same one
+                            // the encoder writes), sealed in place.
+                            if link.transport() == rdma_display_rdma::Transport::Tcp
+                                && session_codec != rdma_display_codec::Codec::Lossy
+                                && materialize == "vk"
+                            {
+                                if let Some(pts) = mat.bind_staging(1, slot_len) {
+                                    if let Some((ptr, _)) = pts.first() {
+                                        if link.set_tcp_buffer(*ptr, slot_len + 16) {
+                                            log::debug!(
+                                                "[server] TCP video buffer: Vulkan host staging (zero-copy output)"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             pipelined_capable = external.is_some()
                                 && link.transport() == rdma_display_rdma::Transport::Rdma;
                             pipelined = pipelined_capable;
@@ -1892,6 +1919,7 @@ fn run_capture(
                         if fc.geometry_stale(fmt.width, fmt.height, fmt.stride) {
                             fc.configure(
                                 &gpu,
+                                &staging,
                                 session_codec,
                                 fmt.width,
                                 fmt.height,
@@ -2005,11 +2033,11 @@ fn run_capture(
                 }
             } else {
                 match link.send_frame_checked(
-                    |out| {
+                    |slot, out| {
                         if fc.uses_scanout() {
                             // lossless texture-direct: encode from the imported
                             // dmabuf, write the coded delta into the slot
-                            return fc.encode_scanout(out);
+                            return fc.encode_scanout(slot, out);
                         }
                         let (changed, t) = mat.copy_frame(out)?;
                         if !changed {
@@ -2017,7 +2045,7 @@ fn run_capture(
                         }
                         let n = match mat.coded_len() {
                             Some(n) => n,
-                            None => fc.encode_in_place(out)?,
+                            None => fc.encode_in_place(slot, out)?,
                         };
                         Ok((true, n, t))
                     },
@@ -2087,7 +2115,7 @@ fn run_capture(
                     continue;
                 }
                 // compress the raw frame now that it is in the pinned slot
-                let post_len = match fc.encode_in_place(out) {
+                let post_len = match fc.encode_in_place(slot, out) {
                     Ok(n) => n,
                     Err(e) => {
                         log::warn!("[server] encode failed: {e:#}");
@@ -2141,8 +2169,7 @@ fn run_capture(
 
 /// In-place frame coding for the RDMA staging slot. `raw` is a pass-through
 /// (post the whole frame, no header). `lossless` runs the tile-delta encoder
-/// on the GPU (Vulkan compute, `rdma-display-vkcodec`); the CPU reference
-/// encoder is the fallback when Vulkan or the dma-buf import is unavailable.
+/// on the GPU (Vulkan compute, `rdma-display-vkcodec`).
 /// The encoder's reference is reset in `configure` (once per session, and on a
 /// geometry change) so the first frame a new client receives is always full.
 struct FrameCodec {
@@ -2160,6 +2187,8 @@ struct FrameCodec {
     scanout: bool,
     /// set once the texture-direct import failed (avoid per-frame log spam)
     scanout_warned: bool,
+    /// shared per-slot Vulkan staging buffers (raw/lossless direct output)
+    staging: gpu::SharedStaging,
 }
 
 impl FrameCodec {
@@ -2173,6 +2202,7 @@ impl FrameCodec {
             first: true,
             scanout: false,
             scanout_warned: false,
+            staging: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -2191,12 +2221,14 @@ impl FrameCodec {
     fn configure(
         &mut self,
         gpu: &Arc<gpu::Gpu>,
+        staging: &gpu::SharedStaging,
         codec: rdma_display_codec::Codec,
         width: u32,
         height: u32,
         stride: u32,
         frame_bytes: usize,
     ) -> Result<()> {
+        self.staging = staging.clone();
         self.frame_bytes = frame_bytes;
         self.geom = None;
         self.vk = None;
@@ -2229,20 +2261,33 @@ impl FrameCodec {
         }
     }
 
-    /// Encode `slot[..frame_bytes]` in place; returns the number of bytes to
-    /// post (coded length, or `frame_bytes` for raw).
-    fn encode_in_place(&mut self, slot: &mut [u8]) -> Result<usize> {
+    /// Encode `out[..frame_bytes]` in place; returns the number of bytes to
+    /// post (coded length, or `frame_bytes` for raw). When `slot_idx` names a
+    /// shared staging buffer the encoder writes the coded bytes straight into
+    /// it (no CPU copy).
+    fn encode_in_place(&mut self, slot_idx: usize, out: &mut [u8]) -> Result<usize> {
         let Some(vk) = self.vk.as_mut() else {
             // raw has no codec; lossless always installs the Vulkan encoder
             return Ok(self.frame_bytes);
         };
-        let n = vk.encode_host(&slot[..self.frame_bytes])?;
+        let staging = self.staging.lock().unwrap().clone();
+        let target = staging.as_ref().and_then(|s| {
+            s.buffer_for(slot_idx, out.as_ptr() as *mut u8)
+                .map(|b| (b, s.len + 16))
+        });
+        let direct = target.is_some();
+        if let Some((buf, cap)) = target {
+            vk.set_output(buf, cap)?;
+        }
+        let n = vk.encode_host(&out[..self.frame_bytes])?;
         ensure!(
-            n <= slot.len(),
+            n <= out.len(),
             "coded frame {n} exceeds staging slot {}",
-            slot.len()
+            out.len()
         );
-        slot[..n].copy_from_slice(&vk.coded()[..n]);
+        if !direct {
+            out[..n].copy_from_slice(&vk.coded()[..n]);
+        }
         self.first = false;
         Ok(n)
     }
@@ -2305,12 +2350,22 @@ impl FrameCodec {
     /// count; a zero-tile delta is not sent.
     fn encode_scanout(
         &mut self,
+        slot_idx: usize,
         out: &mut [u8],
     ) -> Result<(bool, usize, rdma_display_proto::MatTimes)> {
         let full = self.first;
+        let staging = self.staging.lock().unwrap().clone();
+        let target = staging.as_ref().and_then(|s| {
+            s.buffer_for(slot_idx, out.as_ptr() as *mut u8)
+                .map(|b| (b, s.len + 16))
+        });
+        let direct = target.is_some();
         let Some(vk) = self.vk.as_mut() else {
             anyhow::bail!("no Vulkan encoder");
         };
+        if let Some((buf, cap)) = target {
+            vk.set_output(buf, cap)?;
+        }
         let t = std::time::Instant::now();
         let n = vk.encode_scanout()?;
         let enc = t.elapsed();
@@ -2325,7 +2380,9 @@ impl FrameCodec {
             out.len()
         );
         let t = std::time::Instant::now();
-        out[..n].copy_from_slice(&vk.coded()[..n]);
+        if !direct {
+            out[..n].copy_from_slice(&vk.coded()[..n]);
+        }
         let copy = t.elapsed();
         Ok((
             changed,
@@ -2635,6 +2692,7 @@ fn build_materializer(
     codec: rdma_display_codec::Codec,
     materialize: &str,
     gpu: &Arc<gpu::Gpu>,
+    staging: &gpu::SharedStaging,
     lossy_budget: usize,
     lossy_chroma444: bool,
 ) -> Result<Box<dyn FrameMaterializer>> {
@@ -2646,7 +2704,7 @@ fn build_materializer(
         )?));
     }
     Ok(match materialize {
-        "vk" => Box::new(gpu::VkMaterializer::new(gpu.clone())),
+        "vk" => Box::new(gpu::VkMaterializer::new(gpu.clone(), staging.clone())),
         "plain" => Box::new(rdma_display_capture::materializer::PlainMaterializer::new()),
         other => bail!("materializer {other:?} not implemented (vk|plain)"),
     })
@@ -2854,8 +2912,10 @@ mod codec_tests {
         let geom = Geometry::new(w, h, stride);
         let fb = geom.frame_bytes();
         let gpu = crate::gpu::Gpu::new().unwrap();
+        let staging: crate::gpu::SharedStaging =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
         let mut fc = FrameCodec::new();
-        fc.configure(&gpu, Codec::Lossless, w, h, stride, fb).unwrap();
+        fc.configure(&gpu, &staging, Codec::Lossless, w, h, stride, fb).unwrap();
         let mut dec = Decoder::new(geom).unwrap();
         let mut slot = vec![0u8; geom.max_coded_len()];
         let base = synthetic(w, h, 1);
@@ -2867,10 +2927,48 @@ mod codec_tests {
                 orig[p] ^= 0x5a;
             }
             slot[..fb].copy_from_slice(&orig);
-            let n = fc.encode_in_place(&mut slot).unwrap();
+            let n = fc.encode_in_place(0, &mut slot).unwrap();
             assert!(n <= slot.len());
             let out = dec.decode(&slot[..n]).unwrap();
             assert_eq!(out, &orig[..], "frame {i} round trip");
+        }
+    }
+
+    /// Direct-output variant: when the codec writes into the transport's
+    /// staging `VkBuffer` (pointer matches), the coded bytes must land in that
+    /// memory with no CPU copy and still round-trip.
+    #[test]
+    fn lossless_direct_staging_round_trips() {
+        use rdma_display_capture::FrameMaterializer;
+        let (w, h) = (256u32, 256u32);
+        let stride = w * 4;
+        let geom = Geometry::new(w, h, stride);
+        let fb = geom.frame_bytes();
+        let slot_len = geom.max_coded_len();
+        let gpu = crate::gpu::Gpu::new().unwrap();
+        let staging: crate::gpu::SharedStaging =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut mat = crate::gpu::VkMaterializer::new(gpu.clone(), staging.clone());
+        assert!(mat.bind_staging(1, slot_len).is_some(), "bind staging");
+        let ptr = staging.lock().unwrap().as_ref().unwrap().buffers[0].ptr;
+        let slot = unsafe { std::slice::from_raw_parts_mut(ptr, slot_len) };
+        let mut fc = FrameCodec::new();
+        fc.configure(&gpu, &staging, Codec::Lossless, w, h, stride, fb).unwrap();
+        let mut dec = Decoder::new(geom).unwrap();
+        let base = synthetic(w, h, 7);
+        for i in 0..3u32 {
+            let mut orig = base.clone();
+            let off = (i as usize * 8192) % orig.len();
+            for k in 0..64 {
+                let p = (off + k) % orig.len();
+                orig[p] ^= 0x3c;
+            }
+            assert!(fb <= slot.len());
+            slot[..fb].copy_from_slice(&orig);
+            let n = fc.encode_in_place(0, slot).unwrap();
+            assert!(n <= slot.len());
+            let out = dec.decode(&slot[..n]).unwrap();
+            assert_eq!(out, &orig[..], "direct frame {i} round trip");
         }
     }
 }

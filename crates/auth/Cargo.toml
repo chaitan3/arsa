@@ -18,7 +18,6 @@ hmac = "0.12"
 sha2 = "0.10"
 hkdf = "0.12"
 aes-gcm = "0.10"
-base64 = "0.22"
 hex = "0.4"
 
 [dev-dependencies]

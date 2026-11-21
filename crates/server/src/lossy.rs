@@ -50,8 +50,6 @@ pub struct LossyMaterializer {
     dirty: bool,
     last_len: usize,
     last_mat: MatTimes,
-    /// encode scratch (packet-based bitstream before framing)
-    temp: Vec<u8>,
 }
 
 unsafe impl Send for LossyMaterializer {}
@@ -80,7 +78,6 @@ impl LossyMaterializer {
             dirty: false,
             last_len: 0,
             last_mat: MatTimes::ZERO,
-            temp: vec![0u8; budget + (1 << 20)],
         })
     }
 
@@ -157,29 +154,18 @@ impl FrameMaterializer for LossyMaterializer {
             maximum_bitstream_size: self.budget,
         };
         let t = std::time::Instant::now();
-        // encode into scratch, then frame as [u32 n][u32 sizes...][packet bytes]
-        // so the client can push each packet without guessing boundaries.
-        let frame = self
-            .pw
-            .encode_to(enc, &info, &rate, PACKET_BOUNDARY, PACKET_PADDING, &mut self.temp)?;
+        // Encode + packetize directly into the staging slot (no temp buffer).
+        let len = self.pw.encode_packetized_into(
+            enc,
+            &info,
+            &rate,
+            PACKET_BOUNDARY,
+            PACKET_PADDING,
+            out,
+        )?;
         let encode_us = t.elapsed().as_micros() as u64;
-        let n = frame.packets.len();
-        let hdr = 4 + 4 * n;
-        anyhow::ensure!(hdr + frame.len <= out.len(), "lossy: slot too small ({} + {} > {})", hdr, frame.len, out.len());
-        let t = std::time::Instant::now();
-        out[0..4].copy_from_slice(&(n as u32).to_le_bytes());
-        let mut off = hdr;
-        for (i, (po, ps)) in frame.packets.iter().enumerate() {
-            out[4 + 4 * i..8 + 4 * i].copy_from_slice(&(*ps as u32).to_le_bytes());
-            out[off..off + ps].copy_from_slice(&self.temp[*po..*po + *ps]);
-            off += ps;
-        }
-        let packetize_us = t.elapsed().as_micros() as u64;
-        self.last_len = off;
-        self.last_mat = MatTimes::new(
-            MatKind::Lossy,
-            [encode_us, packetize_us, 0, 0, 0, 0],
-        );
+        self.last_len = len;
+        self.last_mat = MatTimes::new(MatKind::Lossy, [encode_us, 0, 0, 0, 0, 0]);
         self.dirty = false;
         Ok((true, self.last_mat))
     }

@@ -51,6 +51,8 @@ pub struct Encoder {
     sampler: vk::Sampler,
     /// current imported scanout view (owned by the shared import cache)
     scanout_view: Option<vk::ImageView>,
+    /// external coded-output buffer (the staging slot); None = internal `coded`
+    output: Option<(vk::Buffer, usize)>,
 }
 
 impl Encoder {
@@ -201,6 +203,7 @@ impl Encoder {
             desc_pool,
             sampler,
             scanout_view: None,
+            output: None,
         })
     }
 
@@ -245,6 +248,26 @@ impl Encoder {
         let n = self.dispatch(full, false)?;
         self.first = false;
         Ok(n)
+    }
+
+    /// Bind an external coded-output buffer (the host-visible staging slot).
+    /// `capacity` is its size in bytes. The compute `coded` SSBO and the header
+    /// dispatch write directly into it, so the server never copies the coded
+    /// payload.
+    pub fn set_output(&mut self, buffer: vk::Buffer, capacity: usize) -> Result<()> {
+        ensure!(
+            capacity >= self.coded.size as usize,
+            "external coded buffer {capacity} < {}",
+            self.coded.size
+        );
+        if self.output == Some((buffer, capacity)) {
+            return Ok(());
+        }
+        update_buffers(&self.core, self.ssbo_set, 2, &[buffer]);
+        update_buffers(&self.core, self.image_set, 2, &[buffer]);
+        update_buffers(&self.core, self.header_set, 0, &[buffer]);
+        self.output = Some((buffer, capacity));
+        Ok(())
     }
 
     /// Use a scanout image view (owned by the shared import cache; the caller
@@ -398,10 +421,13 @@ impl Encoder {
         let c = self.counter.as_slice();
         let alloc = u32::from_ne_bytes(c[4..8].try_into().unwrap());
         let len = (self.pbase_words as usize + alloc as usize) * 4;
+        let cap = self
+            .output
+            .map(|(_, c)| c)
+            .unwrap_or(self.coded.size as usize);
         ensure!(
-            len <= self.coded.size as usize,
-            "coded length {len} exceeds buffer {}",
-            self.coded.size
+            len <= cap,
+            "coded length {len} exceeds buffer {cap}"
         );
         Ok(len)
     }

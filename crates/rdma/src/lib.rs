@@ -301,9 +301,51 @@ enum Tx {
     },
     Tcp {
         slot_len: usize,
-        buf: Vec<u8>,
+        buf: TcpBuf,
         busy: bool,
     },
+}
+
+/// The TCP video send buffer. Either owned (fallback) or an external slice —
+/// the server binds the Vulkan host staging buffer here so raw/lossless GPU
+/// output lands in the exact bytes that are sealed and written to the socket.
+struct TcpBuf {
+    ptr: *mut u8,
+    len: usize,
+    /// keeps an owned allocation alive; None for externally-owned memory
+    _owned: Option<Vec<u8>>,
+}
+
+impl TcpBuf {
+    fn owned(len: usize) -> Self {
+        let mut v = vec![0u8; len];
+        let ptr = v.as_mut_ptr();
+        Self {
+            ptr,
+            len: v.len(),
+            _owned: Some(v),
+        }
+    }
+
+    fn external(ptr: *mut u8, len: usize) -> Self {
+        Self {
+            ptr,
+            len,
+            _owned: None,
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
 }
 
 /// Server side of the pre-handshake: negotiate the video transport (the
@@ -491,8 +533,6 @@ pub struct ServerLink {
     /// Shared seal for the control direction (handshake `Conn` + stamp/rumble
     /// writers); None when unencrypted.
     ctrl_seal: Option<std::sync::Arc<std::sync::Mutex<rdma_display_auth::Seal>>>,
-    /// Reused ciphertext scratch for the video seal (avoids one alloc/frame).
-    video_ct: Vec<u8>,
 }
 
 impl ServerLink {
@@ -620,7 +660,8 @@ impl ServerLink {
                 conn.send(&Message::Codec(codec.id(), slot_len as u32, chroma))?;
                 Tx::Tcp {
                     slot_len,
-                    buf: vec![0u8; slot_len],
+                    // 16 bytes of tailroom for the in-place AES-GCM tag
+                    buf: TcpBuf::owned(slot_len + 16),
                     busy: false,
                 }
             }
@@ -733,7 +774,6 @@ impl ServerLink {
             last_sent_bytes: 0,
             video_seal: video_key.map(|k| rdma_display_auth::Seal::new(&k)),
             ctrl_seal,
-            video_ct: Vec::new(),
         })
     }
 
@@ -953,6 +993,20 @@ impl ServerLink {
         }
     }
 
+    /// Bind an externally-owned TCP video buffer (the Vulkan host staging
+    /// buffer), so GPU output, in-place sealing and the socket write all use
+    /// the same memory. The caller must keep it alive until the link drops.
+    /// Returns false on RDMA (which has its own registered slots).
+    pub fn set_tcp_buffer(&mut self, ptr: *mut u8, len: usize) -> bool {
+        match &mut self.tx {
+            Tx::Tcp { buf, .. } => {
+                *buf = TcpBuf::external(ptr, len);
+                true
+            }
+            Tx::Rdma { .. } => false,
+        }
+    }
+
     /// Blocks until an RDMA staging slot is free *and* the window has room,
     /// absorbing credit messages meanwhile. (Credits arrive via the
     /// control-reader thread's channel.)
@@ -985,7 +1039,7 @@ impl ServerLink {
     /// Returns the frame sequence number.
     pub fn send_frame(&mut self, fill: impl FnOnce(&mut [u8]), t0_unix_us: u64) -> Result<u64> {
         self.send_frame_checked(
-            |out| {
+            |_slot, out| {
                 let n = out.len();
                 fill(out);
                 Ok((true, n, proto::MatTimes::ZERO))
@@ -1008,7 +1062,7 @@ impl ServerLink {
     /// staging-slot credit wait; neither absorbs the per-frame prepare.
     pub fn send_frame_checked(
         &mut self,
-        fill: impl FnOnce(&mut [u8]) -> anyhow::Result<(bool, usize, proto::MatTimes)>,
+        fill: impl FnOnce(usize, &mut [u8]) -> anyhow::Result<(bool, usize, proto::MatTimes)>,
         t0_unix_us: u64,
         t0d_unix_us: u64,
         t0p_unix_us: u64,
@@ -1021,7 +1075,7 @@ impl ServerLink {
 
     fn send_frame_rdma(
         &mut self,
-        fill: impl FnOnce(&mut [u8]) -> anyhow::Result<(bool, usize, proto::MatTimes)>,
+        fill: impl FnOnce(usize, &mut [u8]) -> anyhow::Result<(bool, usize, proto::MatTimes)>,
         t0_unix_us: u64,
         t0d: u64,
         t0p: u64,
@@ -1041,7 +1095,7 @@ impl ServerLink {
                 unreachable!()
             };
             let frame_bytes = slots[slot].len();
-            let (changed, post_len, mat_times) = fill(slots[slot].as_mut_bytes(frame_bytes))?;
+            let (changed, post_len, mat_times) = fill(slot, slots[slot].as_mut_bytes(frame_bytes))?;
             #[cfg(feature = "frame-checksums")]
             {
                 let out = slots[slot].as_mut_bytes(frame_bytes);
@@ -1109,7 +1163,7 @@ impl ServerLink {
 
     fn send_frame_tcp(
         &mut self,
-        fill: impl FnOnce(&mut [u8]) -> anyhow::Result<(bool, usize, proto::MatTimes)>,
+        fill: impl FnOnce(usize, &mut [u8]) -> anyhow::Result<(bool, usize, proto::MatTimes)>,
         t0_unix_us: u64,
         t0d: u64,
         t0p: u64,
@@ -1124,11 +1178,13 @@ impl ServerLink {
         self.wait_for_window()?;
         let t1s = t0d; // TCP has no staging-slot credit wait of its own
         let (changed, post_len, mat_times, capacity) = {
-            let Tx::Tcp { buf, .. } = &mut self.tx else {
+            let Tx::Tcp { slot_len, buf, .. } = &mut self.tx else {
                 unreachable!()
             };
-            let capacity = buf.len();
-            let (changed, post_len, mat_times) = fill(buf)?;
+            // The fill may use the payload slots only; the trailing 16 bytes
+            // are reserved for the in-place AES-GCM tag.
+            let capacity = (*slot_len).min(buf.len());
+            let (changed, post_len, mat_times) = fill(0, &mut buf.as_mut_slice()[..capacity])?;
             (changed, post_len, mat_times, capacity)
         };
         if !changed {
@@ -1138,9 +1194,8 @@ impl ServerLink {
         let t1_unix_us = proto::unix_now_us();
         let seq = self.seq;
         let mut seal = self.video_seal.take();
-        let mut scratch = std::mem::take(&mut self.video_ct);
         let (t2_unix_us, t2c_unix_us) = {
-            let Tx::Tcp { buf, .. } = &self.tx else {
+            let Tx::Tcp { buf, .. } = &mut self.tx else {
                 unreachable!()
             };
             let w = self.video.as_mut().expect("video attached");
@@ -1154,32 +1209,26 @@ impl ServerLink {
                     );
                 }
             }
-            match seal.as_mut() {
+            let ct_len = match seal.as_mut() {
                 Some(s) => {
-                    scratch.clear();
-                    scratch.reserve(post_len + 16);
-                    s.seal(&buf[..post_len], &mut scratch);
-                    w.write_all(&(scratch.len() as u32).to_le_bytes())
-                        .context("tcp video frame length")?;
-                    w.write_all(&seq.to_le_bytes())
-                        .context("tcp video frame seq")?;
-                    w.write_all(&scratch).context("tcp video frame")?;
+                    let n = post_len + 16;
+                    anyhow::ensure!(n <= buf.len(), "sealed frame {n} > tcp buffer {}", buf.len());
+                    s.seal_in_place(&mut buf.as_mut_slice()[..n])?;
+                    n
                 }
-                None => {
-                    w.write_all(&(post_len as u32).to_le_bytes())
-                        .context("tcp video frame length")?;
-                    w.write_all(&seq.to_le_bytes())
-                        .context("tcp video frame seq")?;
-                    w.write_all(&buf[..post_len]).context("tcp video frame")?;
-                }
-            }
+                None => post_len,
+            };
+            w.write_all(&(ct_len as u32).to_le_bytes())
+                .context("tcp video frame length")?;
+            w.write_all(&seq.to_le_bytes())
+                .context("tcp video frame seq")?;
+            w.write_all(&buf.as_slice()[..ct_len]).context("tcp video frame")?;
             let t2 = proto::unix_now_us();
             // no remote-completion signal on TCP: t2c == t2 (the client's t3
             // read-observation is the meaningful receipt stamp)
             (t2, t2)
         };
         self.video_seal = seal;
-        self.video_ct = scratch;
         self.note_send();
         self.seq += 1;
         self.last_sent_bytes = post_len;
@@ -1329,7 +1378,7 @@ impl ServerLink {
                         .context("tcp video frame length")?;
                     w.write_all(&seq.to_le_bytes())
                         .context("tcp video frame seq")?;
-                    w.write_all(&buf[..post_len]).context("tcp video frame")?;
+                    w.write_all(&buf.as_slice()[..post_len]).context("tcp video frame")?;
                     let t2 = proto::unix_now_us();
                     (t2, t2)
                 };
