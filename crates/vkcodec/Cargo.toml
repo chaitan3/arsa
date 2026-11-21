@@ -1,0 +1,11 @@
+[package]
+name = "rdma-display-vkcodec"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+rdma-display-codec.workspace = true
+rdma-display-vkcore = { path = "../vkcore" }

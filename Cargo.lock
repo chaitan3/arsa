@@ -2611,6 +2611,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rdma-display-vkcodec"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log 0.4.34",
+ "rdma-display-codec",
+ "rdma-display-vkcore",
+]
+
+[[package]]
 name = "rdma-display-vkcore"
 version = "0.1.0"
 dependencies = [
