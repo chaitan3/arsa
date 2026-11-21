@@ -14,6 +14,10 @@ portal = ["rdma-display-capture/portal"]
 name = "arsa-server"
 path = "src/main.rs"
 
+[[bin]]
+name = "arsa-rdma-diag"
+path = "src/bin/arsa-rdma-diag.rs"
+
 [dependencies]
 rdma-display-proto.workspace = true
 rdma-display-rdma = { path = "../rdma" }

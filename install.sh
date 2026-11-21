@@ -74,6 +74,12 @@ SETCAP=$(find_tool setcap) || {
 newest_mtime() {
     find "$@" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1
 }
+# The server and client binaries do not include src/bin diagnostics; keep a
+# diagnostic source change from making them look perpetually stale.
+newest_mtime_no_bins() {
+    find "$@" -type f -not -path '*/src/bin/*' -printf '%T@\n' 2>/dev/null \
+        | sort -n | tail -1 | cut -d. -f1
+}
 
 # Cargo relinks a binary only when a crate it depends on changes, so each binary
 # is compared against *its own* sources: a change under crates/capture (say)
@@ -92,8 +98,8 @@ if [ "${SKIP_BUILD:-0}" = "1" ]; then
     echo "==> SKIP_BUILD=1; skipping cargo build"
     build_needed=0
 elif [ -x "$SERVER" ] && [ -x "$CLIENT" ]; then
-    srv_src=$(newest_mtime "${SERVER_CRATES[@]}" "${ROOT_FILES[@]}")
-    cli_src=$(newest_mtime "${CLIENT_CRATES[@]}" "${ROOT_FILES[@]}")
+    srv_src=$(newest_mtime_no_bins "${SERVER_CRATES[@]}" "${ROOT_FILES[@]}")
+    cli_src=$(newest_mtime_no_bins "${CLIENT_CRATES[@]}" "${ROOT_FILES[@]}")
     srv=$(stat -c %Y "$SERVER" 2>/dev/null || echo 0)
     cli=$(stat -c %Y "$CLIENT" 2>/dev/null || echo 0)
     stamp_ok=0
@@ -111,6 +117,9 @@ if [ "$build_needed" = "1" ]; then
     echo "==> cargo build --release ${FEATURE_ARGS[*]} (server + client)"
     cargo build --release -p rdma-display-server "${FEATURE_ARGS[@]}"
     cargo build --release -p rdma-display-client
+    # Cargo may decide a Cargo.toml-only change needs no relink; refresh the
+    # binary mtimes so the next run's source check does not build forever.
+    touch "$SERVER" "$CLIENT"
     mkdir -p target/release
     printf '%s\n' "$FEATURE_KEY" > "$STAMP"
 fi

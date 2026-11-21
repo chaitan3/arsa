@@ -351,6 +351,25 @@ lab lacks.
 ends (`[rdma] no routable GID`). Check `RLIMIT_MEMLOCK` covers the pinned pages
 and that the QP uses `PERMISSIVE` access. Force `--transport tcp` to isolate.
 
+**RDMA session setup fails with `register external staging slot ... Cannot
+allocate memory`.** The server is failing in `ibv_reg_mr` on the Vulkan host
+staging, before any frame is sent. Build and run the diagnostic binary:
+
+```bash
+cargo build --release -p rdma-display-server --no-default-features \
+    --bin arsa-rdma-diag
+./target/release/arsa-rdma-diag --slots 5
+```
+
+It reports `RLIMIT_MEMLOCK`/`CAP_IPC_LOCK`, the Vulkan memory type chosen for
+staging, whether a plain host mapping and the current staging allocation can be
+registered, whether a non-`DEVICE_LOCAL` Vulkan type works, and whether the
+GPU-exported dma-buf registers with `ibv_reg_dmabuf_mr`. Use the same user and,
+if applicable, the same file capabilities/`ulimit` as the server. If the plain
+host mapping fails, raise the lock limit or add `cap_ipc_lock`; if only the
+current Vulkan type fails and it is `DEVICE_LOCAL`, prefer a system-memory
+type or `VK_EXT_external_memory_host`.
+
 **Handshake rejects the peer.** The wire format is versioned
 (`VERSION`, currently 17). Rebuild the server and client together.
 
