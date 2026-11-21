@@ -1100,7 +1100,9 @@ fn run_capture(
     listener.set_nonblocking(true)?;
 
     let mut session: Option<rdma_display_rdma::ServerLink> = None;
-    // per-session true-zero-copy staging (None = host Vulkan staging fallback)
+    // Per-session true-zero-copy staging (None = host Vulkan staging fallback).
+    // Deliberately NOT cached across sessions: device-local coded buffers are
+    // large (slots * max_coded_len) and GPU memory is scarce.
     let mut gpu_direct = None;
     let mut raw_direct = None;
     // when the current session's control connection was accepted, for
@@ -1876,7 +1878,10 @@ fn run_capture(
                                             log::info!(
                                                 "[server] raw source: trying scanout dma-buf MRs (host copy fallback)"
                                             );
-                                            raw_direct = Some(direct::RawDirect::new(pd));
+                                            raw_direct = Some(direct::RawDirect::new(
+                                                pd,
+                                                slots.saturating_add(2),
+                                            ));
                                         }
                                         rdma_display_codec::Codec::Lossy => {}
                                     }

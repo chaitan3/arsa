@@ -24,9 +24,6 @@ use rdma_display_vkcore::{ash::vk, GpuBuffer, VkCore};
 
 /// DRM_FORMAT_XRGB8888 ("XR24"), the wire's BGRX byte order.
 const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
-/// How many distinct scanout buffers to keep registered. Compositors cycle a
-/// handful; old registrations are dropped when the list grows past this.
-const MAX_RAW_SOURCES: usize = 16;
 
 /// Device-local coded buffers exported as dma-bufs and registered with verbs.
 pub struct GpuDirect {
@@ -152,6 +149,11 @@ struct RawKey {
 pub struct RawDirect<'a> {
     pd: &'a ProtectionDomain,
     cache: VecDeque<(RawKey, MemoryRegion<()>)>,
+    /// Maximum source registrations to keep. This cache holds compositor
+    /// scanout buffers, not staging slots; the server sizes the cap as
+    /// `--frame-slots + 2` to cover a typical swapchain without pinning many
+    /// full-resolution source buffers.
+    max_sources: usize,
     /// keys whose registration already failed; do not retry every frame
     failed: HashSet<RawKey>,
     next_iova: u64,
@@ -159,10 +161,11 @@ pub struct RawDirect<'a> {
 }
 
 impl<'a> RawDirect<'a> {
-    pub fn new(pd: &'a ProtectionDomain) -> Self {
+    pub fn new(pd: &'a ProtectionDomain, max_sources: usize) -> Self {
         Self {
             pd,
             cache: VecDeque::new(),
+            max_sources: max_sources.max(1),
             failed: HashSet::new(),
             next_iova: 0x8_0000_0000,
             warned: false,
@@ -210,7 +213,7 @@ impl<'a> RawDirect<'a> {
                 let slice = mr.slice(..len);
                 self.failed.remove(&key);
                 self.cache.push_back((key, mr));
-                if self.cache.len() > MAX_RAW_SOURCES {
+                if self.cache.len() > self.max_sources {
                     self.cache.pop_front();
                 }
                 Some(slice)
