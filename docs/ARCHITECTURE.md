@@ -247,7 +247,7 @@ PRIME path (no pin/unpin ops), and peer-DMA mapping of VRAM returns `ENOMEM`.
 The **copy path is therefore the default**: import → blit → readback into a
 pinned host MR → WRITE. Zero-copy dmabuf-MR remains implemented behind the same
 config for hosts with a cooperative exporter (Intel/AMD rendernode). The
-client-side equivalent investigation (GBM/CUDA slots) is in
+client-side GBM/dma-buf MR probes are in
 [`DEBUG.md`](DEBUG.md#5-client-zero-copy-c0-findings).
 
 ### 5.4 Frame pacing (`--pace`)
@@ -404,10 +404,9 @@ the binaries (`$ORIGIN` rpath); build it against the lab's glibc with
 
 ### 7.1 Slot memory
 
-`--slot-mem host` (pinned RAM) is the production path. The client receives into
-the slot, uploads the frame to the GPU with `glTexImage2D`, and draws it. The
-dormant `--slot-mem cuda` (CUDA GPUDirect-over-dmabuf) is kept for future
-cooperative hardware; see [`DEBUG.md`](DEBUG.md#5-client-zero-copy-c0-findings).
+The client receives into pinned host slots, uploads the frame to the GPU with
+`glTexImage2D`, and draws it. The client-side GBM/dma-buf MR probes are in
+[`DEBUG.md`](DEBUG.md#5-client-zero-copy-c0-findings).
 
 ### 7.2 EGL-upload presenter (`--output egl`)
 
@@ -573,5 +572,5 @@ RDMA video stays plaintext, and `--no-encrypt` disables it.
   (root or the `input` group); `uinput` also creates real kernel devices.
 - **The presenter does not import dmabufs**: KWin 6.7.5 + NVIDIA refuses
   foreign system dmabuf imports, so the client uploads from host RAM.
-- **`--slot-mem cuda` and VRAM zero-copy are dormant** — RM-gated on
-  GeForce-class NVIDIA.
+- **Client receive slots are host memory**; the GBM/dma-buf MR probes are in
+  [`DEBUG.md`](DEBUG.md#5-client-zero-copy-c0-findings).

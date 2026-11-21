@@ -238,12 +238,13 @@ exports). On the test client (RTX-class NVIDIA, open module 615.71, KWin
   did.
 - **CUDA route** (`cuMemGetHandleForAddressRange`): `DMA_BUF_SUPPORTED=1`
   advertised, but the export call returned `CUDA_ERROR_NOT_SUPPORTED` — refused
-  by RM at export, product-gated on GeForce-class GPUs.
+  by RM at export, product-gated on GeForce-class GPUs. (The CUDA slot backend
+  has since been removed; the client always uses host slots.)
 - **dma-heap route** (`/dev/dma_heap/system`): system RAM that is a dma-buf from
   birth — the NIC registers it as plain host DMA (no GDR gate), and the same fd
   is EGL-importable/presentable. This is the route that kept the zero-copy
   structure while abandoning VRAM landing; in the end the production path is
-  simply `--slot-mem host` (pinned RAM).
+  simply pinned host slots.
 
 **Retrying the GBM→MR route (client and server directions).** `cargo test -p
 rdma-display-rdma --test gbm_dmabuf_mr -- --ignored --nocapture` allocates a

@@ -29,8 +29,6 @@ fn main() -> Result<()> {
     let mut slots: usize = 5;
     let mut dump: Option<String> = None;
     let mut seconds: Option<u64> = None;
-    let mut slot_mem: String = "host".to_string();
-    let mut cuda_device: u32 = 0;
     let mut output: String = "egl".to_string();
     let mut metrics_on = false;
     let mut verbose = false;
@@ -77,8 +75,6 @@ fn main() -> Result<()> {
             }
             "--dump" => dump = Some(args.next().expect("--dump needs a value")),
             "--seconds" => seconds = Some(args.next().expect("--seconds needs a value").parse()?),
-            "--slot-mem" => slot_mem = args.next().expect("--slot-mem needs a value").to_string(),
-            "--cuda-device" => cuda_device = args.next().expect("--cuda-device needs a value").parse()?,
             "--output" => output = args.next().expect("--output needs a value").to_string(),
             "--metrics" => metrics_on = true,
             "-v" | "--verbose" => verbose = true,
@@ -146,9 +142,7 @@ fn main() -> Result<()> {
                 println!("  HOST[:PORT]           server address, given as the first positional argument (default host 127.0.0.1; :{DEFAULT_PORT} assumed when the port is omitted)");
                 println!("  -s, --server HOST[:PORT]  same as the positional HOST[:PORT] (either form may be used)");
                 println!("  --frame-slots N       receive slots, each holding one coded frame: sets the receive-buffer pool and the maximum flow-control window (default 5; --slots is accepted as an alias)");
-                println!("  --slot-mem host|cuda  receive slots: host = pinned RAM (default); cuda = dormant GPU path");
-                println!("  --cuda-device N       CUDA device ordinal for --slot-mem cuda (default 0)");
-                println!("  --output egl|none     egl = present in a Wayland window (default; needs --slot-mem host); none = headless (e.g. with --dump)");
+                println!("  --output egl|none     egl = present in a Wayland window (default); none = headless (e.g. with --dump)");
                 println!("  -f, --fullscreen      fullscreen on the current output; frame letterboxed/scaled to the screen with aspect kept (compositor's own fullscreen toggle also works)");
                 println!("  -g, --grab            start with the input grab on (keyboard+mouse for the guest; same as Ctrl+Alt+G); default off");
                 println!("  --audio | --no-audio  play the server's audio side-channel (default sink; server captures its own monitor source). Default on; --no-audio disables");
@@ -187,9 +181,6 @@ fn main() -> Result<()> {
         }
     }
 
-    if !["host", "cuda"].contains(&slot_mem.as_str()) {
-        anyhow::bail!("--slot-mem must be host|cuda, got {slot_mem:?}");
-    }
     init_logging(verbose);
     // `HOST` (positional or `-s`/`--server`) without a port uses the default port
     let server = with_default_port(server.as_deref().unwrap_or("127.0.0.1"));
@@ -259,11 +250,6 @@ fn main() -> Result<()> {
         },
     };
     let rdma_ref = rdma_ctx.as_ref().map(|(c, p)| (c, p));
-    let mem = match slot_mem.as_str() {
-        "host" => rdma_display_rdma::SlotMem::Host,
-        "cuda" => rdma_display_rdma::SlotMem::Cuda { device: cuda_device },
-        other => anyhow::bail!("--slot-mem must be host|cuda, got {other:?}"),
-    };
     // display-mode request: resolved here (before the handshake) so the server
     // can reconfigure its output before it sizes the session
     let mode_req = resolve_mode_request(native, set_mode.as_deref(), &output)?;
@@ -273,7 +259,6 @@ fn main() -> Result<()> {
         rdma_ref,
         Some(addr),
         slots,
-        mem,
         mode_req,
         codec_pref,
         lossy_mbps,
@@ -281,9 +266,6 @@ fn main() -> Result<()> {
         session_secret,
         stream_encrypt,
     )?;
-    if link.slots_gpu_only() {
-        log::info!("[client] GPU slots without CPU mapping: content checks use the verification-only device->host copy (the render path itself stays zero-copy)");
-    }
     log::info!(
         "session up: {}x{} fourcc=0x{:08x} modifier=0x{:x} frame_bytes={} slots={}",
         link.meta.width,
@@ -315,9 +297,6 @@ fn main() -> Result<()> {
     let mut presenter = match output.as_str() {
         "none" => None,
         "egl" => {
-            if slot_mem != "host" {
-                bail!("--output egl requires --slot-mem host (the upload reads the slot through a CPU pointer)");
-            }
             let p = wayland::Presenter::new(link.meta.width, link.meta.height, input_tx, fullscreen, grab)?;
             let mut win = eglwin::EglWindow::new(
                 p.wl_display_ptr(),

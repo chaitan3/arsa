@@ -1,7 +1,7 @@
 //! EGL window presenter (C1, `--output egl`): the mirror of the server's
 //! copy path.
 //!
-//! The NIC lands frames in pinned host slots (`--slot-mem host`, default);
+//! The NIC lands frames in pinned host slots;
 //! the GPU *pulls* them with `glTexImage2D` (a DMA read of ordinary mapped
 //! RAM — no dma-buf import anywhere, which is what KWin's `import_failed`
 //! ruled out on this stack), and presents via `eglSwapBuffers` on an

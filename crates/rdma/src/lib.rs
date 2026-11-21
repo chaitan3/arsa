@@ -44,23 +44,6 @@ pub enum ControlEvent {
     ModeReply(proto::ModeReply),
 }
 
-pub mod cuda;
-pub mod slots;
-use slots::{SlotAlloc, SlotBuf};
-
-/// Where the client's receive slots live.
-#[derive(Clone, Debug, PartialEq)]
-pub enum SlotMem {
-    /// Registered host memory (today's copy path; the NIC lands frames in
-    /// RAM and the consumer copies/uploads from there).
-    Host,
-    /// `cuMemAlloc` memory exported via `cuMemGetHandleForAddressRange` —
-    /// NVIDIA's documented GPUDirect-over-dmabuf path (C0 route 2); refused
-    /// CUDA_ERROR_NOT_SUPPORTED on GeForce (RM product gate). Dormant code
-    /// for future cooperative hardware.
-    Cuda { device: u32 },
-}
-
 /// Open an RDMA device by name (or the first available one).
 pub fn open_device(name: Option<&str>) -> Result<ibverbs::Context> {
     let list = ibverbs::devices().context("ibv_get_device_list failed")?;
@@ -1458,37 +1441,11 @@ fn spawn_control_reader(
     rx
 }
 
-/// One receive slot: either host memory or an exported GPU buffer.
-/// For `Gpu`, field declaration order is load-bearing: `mr` drops (and
-/// deregisters) before `gbm` unmaps/destroys the bo.
-enum Slot {
-    Host(MemoryRegion<Box<[u8]>>),
-    Gpu {
-        mr: MemoryRegion<()>,
-        // declared after mr: deregisters before the buffer is freed
-        gpu: Box<dyn SlotBuf>,
-    },
-}
-
-impl Slot {
-    fn desc(&self) -> SlotDesc {
-        let r = match self {
-            Slot::Host(mr) => mr.remote(),
-            Slot::Gpu { mr, .. } => mr.remote(),
-        };
-        SlotDesc {
-            addr: r.addr,
-            len: r.len as u64,
-            rkey: r.rkey,
-        }
-    }
-}
-
 enum Rx {
     Rdma {
         qp: QueuePair<Rc>,
         recv_cq: CompletionQueue,
-        slots: Vec<Slot>,
+        slots: Vec<MemoryRegion<Box<[u8]>>>,
     },
     Tcp {
         frame_rx: mpsc::Receiver<(u64, Vec<u8>)>,
@@ -1669,45 +1626,18 @@ fn spawn_video_reader(
 }
 
 impl ClientLink {
-    /// Client half of a session with host-memory slots.
-    pub fn connect(
-        conn: Conn<TcpStream>,
-        pref: TransportPref,
-        rdma: Option<(&ibverbs::Context, &ibverbs::ProtectionDomain)>,
-        addr: Option<std::net::SocketAddr>,
-        slots: usize,
-        session_secret: [u8; rdma_display_auth::SECRET_LEN],
-    ) -> Result<ClientLink> {
-        Self::connect_with(
-            conn,
-            pref,
-            rdma,
-            addr,
-            slots,
-            SlotMem::Host,
-            proto::ModeRequest::Keep,
-            proto::CODEC_ANY,
-            0,
-            false,
-            session_secret,
-            false,
-        )
-    }
-
-    /// Client half of a session; `mem` chooses host vs GPU (GBM) slots (GPU
-    /// slots are RDMA-only; TCP always uses host buffers). `addr` is the
-    /// server endpoint, used to open the TAG_VIDEO socket when the negotiated
-    /// transport is TCP. `mode` is the pre-handshake display-mode request; the
-    /// server applies it before `Meta`, so the session is sized for the result.
-    /// `codec_pref` is the codec the client would like ([`proto::CODEC_ANY`] =
-    /// no preference); the server decides and reports it in the `Codec` message.
+    /// Client half of a session. `addr` is the server endpoint, used to open
+    /// the TAG_VIDEO socket when the negotiated transport is TCP. `mode` is the
+    /// pre-handshake display-mode request; the server applies it before `Meta`,
+    /// so the session is sized for the result. `codec_pref` is the codec the
+    /// client would like ([`proto::CODEC_ANY`] = no preference); the server
+    /// decides and reports it in the `Codec` message.
     pub fn connect_with(
         conn: Conn<TcpStream>,
         pref: TransportPref,
         rdma: Option<(&ibverbs::Context, &ibverbs::ProtectionDomain)>,
         addr: Option<std::net::SocketAddr>,
         slots: usize,
-        mem: SlotMem,
         mode: proto::ModeRequest,
         codec_pref: u8,
         lossy_mbps: u16,
@@ -1863,42 +1793,24 @@ impl ClientLink {
             Transport::Rdma => {
                 let (qp, _send_cq, recv_cq) = endpoint.expect("rdma endpoint");
                 let pd = pd.expect("pd");
-                let gpu_alloc: Option<Box<dyn SlotAlloc>> = match &mem {
-                    SlotMem::Host => None,
-                    SlotMem::Cuda { device } => Some(Box::new(cuda::CudaSlots::open(*device)?)),
-                };
-                let mut slots_v: Vec<Slot> = Vec::with_capacity(slots);
-                for i in 0..slots {
-                    let slot = match (&gpu_alloc, meta.width, meta.height) {
-                        (None, _, _) => {
-                            let mr = pd
-                                .allocate(slot_len, AccessFlags::PERMISSIVE)
-                                .context("allocate recv slot")?;
-                            Slot::Host(mr)
-                        }
-                        (Some(dev), w, h) => {
-                            let gpu = dev.alloc_slot(w, h, meta.stride)?;
-                            // Deliberately NOT PERMISSIVE: PERMISSIVE includes
-                            // RELAXED_ORDERING, which would let the NIC reorder
-                            // posted writes across PCIe destinations (CQE vs GPU
-                            // payload). Strict ordering is a zero-copy invariant.
-                            let flags = AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE;
-                            let mr = pd
-                                .register_dmabuf(gpu.fd(), gpu.offset(), slot_len, gpu.iova(), flags)
-                                .with_context(|| {
-                                    format!("ibv_reg_dmabuf_mr slot {i} (C0 gate #3)")
-                                })?;
-                            log::info!(
-                                "[slots] gpu slot {i}: iova={:#x} rkey={:#x}",
-                                mr.remote().addr,
-                                mr.remote().rkey
-                            );
-                            Slot::Gpu { mr, gpu }
-                        }
-                    };
-                    slots_v.push(slot);
+                let mut slots_v: Vec<MemoryRegion<Box<[u8]>>> = Vec::with_capacity(slots);
+                for _ in 0..slots {
+                    let mr = pd
+                        .allocate(slot_len, AccessFlags::PERMISSIVE)
+                        .context("allocate recv slot")?;
+                    slots_v.push(mr);
                 }
-                let descs: Vec<SlotDesc> = slots_v.iter().map(Slot::desc).collect();
+                let descs: Vec<SlotDesc> = slots_v
+                    .iter()
+                    .map(|mr| {
+                        let r = mr.remote();
+                        SlotDesc {
+                            addr: r.addr,
+                            len: r.len as u64,
+                            rkey: r.rkey,
+                        }
+                    })
+                    .collect();
                 conn.send(&Message::Buffers(descs))?;
                 match conn.recv()? {
                     Message::Ready => {}
@@ -2123,20 +2035,12 @@ impl ClientLink {
     }
 
 
-    /// Read the bytes of slot `slot`. For GPU slots this is the best-effort
-    /// CPU mapping of the dma-buf; an empty slice means "no CPU view" (the
-    /// data is still valid in GPU memory — verify GPU-side). This is the raw
-    /// slot contents (the coded frame when a codec is active); use
-    /// [`frame`](Self::frame) for decoded pixels.
+    /// Read the bytes of slot `slot` (the coded frame when a codec is active);
+    /// use [`frame`](Self::frame) for decoded pixels.
     pub fn slot_bytes(&self, slot: usize) -> &[u8] {
+        let n = self.slot_len;
         match &self.rx {
-            Rx::Rdma { slots, .. } => {
-                let n = self.slot_len;
-                match &slots[slot] {
-                    Slot::Host(mr) => &mr.bytes()[..n],
-                    Slot::Gpu { gpu, .. } => gpu.cpu_bytes(n).unwrap_or(&[]),
-                }
-            }
+            Rx::Rdma { slots, .. } => &slots[slot].bytes()[..n],
             Rx::Tcp { slots, .. } => &slots[slot][..],
         }
     }
@@ -2153,11 +2057,7 @@ impl ClientLink {
         // and `decoder` as disjoint fields.
         match &self.rx {
             Rx::Rdma { slots, .. } => {
-                let n = self.slot_len;
-                let coded: &[u8] = match &slots[slot] {
-                    Slot::Host(mr) => &mr.bytes()[..n],
-                    Slot::Gpu { gpu, .. } => gpu.cpu_bytes(n).unwrap_or(&[]),
-                };
+                let coded: &[u8] = &slots[slot].bytes()[..self.slot_len];
                 let dec = self.decoder.as_mut().expect("decoder present");
                 dec.decode(coded)
             }
@@ -2177,33 +2077,6 @@ impl ClientLink {
         self.decoder.as_ref().map(|d| d.frame())
     }
 
-    /// True when frames land in GPU memory with no CPU view.
-    pub fn slots_gpu_only(&self) -> bool {
-        match &self.rx {
-            Rx::Rdma { slots, .. } => {
-                matches!(slots.first(), Some(Slot::Gpu { gpu, .. }) if gpu.cpu_bytes(1).is_none())
-            }
-            Rx::Tcp { .. } => false,
-        }
-    }
-
-    /// Whole-slot read for content verification: CPU map when present, else
-    /// the (verification-only) device->host copy. Errors when neither exists.
-    pub fn slot_read(&self, slot: usize) -> Result<Vec<u8>> {
-        match &self.rx {
-            Rx::Rdma { slots, .. } => {
-                let n = self.slot_len;
-                match &slots[slot] {
-                    Slot::Host(mr) => Ok(mr.bytes()[..n].to_vec()),
-                    Slot::Gpu { gpu, .. } => match gpu.cpu_bytes(n) {
-                        Some(b) => Ok(b.to_vec()),
-                        None => gpu.dto_h_vec(n),
-                    },
-                }
-            }
-            Rx::Tcp { slots, .. } => Ok(slots[slot].clone()),
-        }
-    }
 }
 
 #[cfg(test)]

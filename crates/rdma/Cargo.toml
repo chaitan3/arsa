@@ -7,11 +7,13 @@ publish = false
 [features]
 frame-checksums = []
 
+[dev-dependencies]
+libloading = "0.8"
+
 [dependencies]
 rdma-display-proto.workspace = true
 rdma-display-codec.workspace = true
 rdma-display-auth = { path = "../auth" }
 ibverbs.workspace = true
 anyhow.workspace = true
-libloading = "0.8"
 log.workspace = true

@@ -224,7 +224,6 @@ both ends.
 | `--metrics` | Latency overlay + clock-sync pings, plus audio e2e split / A/V offset. |
 | `--scale-filter auto\|nearest\|linear\|cubic\|area` | Letterbox sampler. |
 | `--transport auto\|rdma\|tcp` | Video transport preference. |
-| `--slot-mem host\|cuda` | Receive memory (`host` = pinned RAM, the production path). |
 | `--audio` / `--no-audio` / `--audio-buffer-ms N` | Audio playback (default on). |
 | `--client-name NAME` | Name shown on the server's paired-clients list (default: hostname). |
 | `--audio-align-ms N` | Extra audio-only delay for manual A/V alignment (default 0; the ring jitter buffer adapts to measured jitter, capped at 20 ms). |
