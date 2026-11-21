@@ -2552,6 +2552,7 @@ name = "rdma-display-codec-gpu"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "libloading",
  "log 0.4.34",
  "rdma-display-codec",

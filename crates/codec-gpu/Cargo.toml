@@ -9,6 +9,9 @@ publish = false
 name = "codecbench"
 path = "src/bin/codecbench.rs"
 
+[dev-dependencies]
+libc = "0.2"
+
 [dependencies]
 anyhow.workspace = true
 libloading = "0.8"

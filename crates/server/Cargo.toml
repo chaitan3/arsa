@@ -21,7 +21,9 @@ path = "src/bin/reinit_bench.rs"
 [dependencies]
 rdma-display-proto.workspace = true
 rdma-display-rdma = { path = "../rdma" }
-rdma-display-capture = { path = "../capture" }
+# The server's `portal` feature re-enables capture/portal; without it,
+# `--no-default-features` must not pull PipeWire in through capture's default.
+rdma-display-capture = { path = "../capture", default-features = false }
 rdma-display-codec = { path = "../codec" }
 rdma-display-codec-gpu = { path = "../codec-gpu" }
 rdma-display-vkcore = { path = "../vkcore" }

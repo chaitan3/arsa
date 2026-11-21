@@ -245,14 +245,31 @@ exports). On the test client (RTX-class NVIDIA, open module 615.71, KWin
   structure while abandoning VRAM landing; in the end the production path is
   simply `--slot-mem host` (pinned RAM).
 
-**Retrying the GBM→MR route.** `cargo test -p rdma-display-rdma --test
-gbm_dmabuf_mr -- --ignored --nocapture` allocates a linear XR24 GBM bo on a DRM
-render node, exports it as a dma-buf, registers it with `ibv_reg_dmabuf_mr`,
-self-loopback RDMA-WRITEs into it, and (when the exporter allows a CPU mapping)
-verifies the bytes. It prints `skip:` when libgbm, a DRM node, an RDMA device or
-a routable GID is missing. `ARSA_DRM_NODE` / `ARSA_IB_DEVICE` pick a specific
-node/device — on a multi-GPU client point `ARSA_DRM_NODE` at the NVIDIA render
-node.
+**Retrying the GBM→MR route (client and server directions).** `cargo test -p
+rdma-display-rdma --test gbm_dmabuf_mr -- --ignored --nocapture` allocates a
+linear XR24 GBM bo on a DRM render node, exports it as a dma-buf, and registers
+it with `ibv_reg_dmabuf_mr`. Two tests use it: one self-loopback RDMA-WRITEs
+into the buffer and verifies it through a CPU mapping (the client receive
+direction); the other seeds it with an RDMA WRITE and RDMA-READs it back (the
+server staging slot's send direction). It prints `skip:` when libgbm, a DRM
+node, an RDMA device or a routable GID is missing. `ARSA_DRM_NODE` /
+`ARSA_IB_DEVICE` pick a specific node/device — on a multi-GPU client point
+`ARSA_DRM_NODE` at the NVIDIA render node.
+
+**Server scanout registration.** `sudo -E cargo test -p rdma-display-server
+--test scanout_dmabuf_mr -- --ignored --nocapture` spawns the real KMS source,
+waits for a dmabuf scanout, prints its fourcc/modifier/stride and tries
+`ibv_reg_dmabuf_mr` on the foreign export. This is the original `ENOMEM`
+experiment; a tiled modifier also means a direct raw send needs a
+modifier-aware client. Needs `CAP_SYS_ADMIN` and an active display.
+
+**GL memory-object import.** `cargo test -p rdma-display-codec-gpu --test
+gles_memory_object -- --ignored --nocapture` prints whether the server's GLES
+context advertises `GL_EXT_memory_object` / `GL_EXT_memory_object_fd` /
+`GL_EXT_buffer_storage`, then imports a dma-buf (dma-heap, or a GBM bo when
+dma-heap is absent) as a GL memory object and uses it as an SSBO. This is the
+gate for writing the lossless codec's coded stream directly into a registered
+dma-buf instead of copying it to host.
 
 **PCIe ordering note.** With a GPU-BAR destination, the CQE (a posted write to
 host RAM) can land before the last frame bytes (posted writes to the BAR) —
