@@ -187,6 +187,14 @@ fn gles_memory_object_fd_imports_a_dmabuf() {
         }
     };
 
+    for (label, name) in [("vendor", 0x1F00u32), ("renderer", 0x1F01), ("version", 0x1F02)] {
+        let p = unsafe { get_string(name) };
+        if !p.is_null() {
+            let s = unsafe { std::ffi::CStr::from_ptr(p as *const i8) }.to_string_lossy();
+            eprintln!("GL {label}: {s}");
+        }
+    }
+
     let raw = unsafe { get_string(GL_EXTENSIONS) };
     if raw.is_null() {
         eprintln!("skip: glGetString(GL_EXTENSIONS) returned null");
@@ -229,20 +237,23 @@ fn gles_memory_object_fd_imports_a_dmabuf() {
         sym(get_proc, "glDeleteBuffers").expect("glDeleteBuffers");
 
     const SIZE: usize = 1 << 20; // 1 MiB
-    let (fd, size) = match dma_heap_alloc(SIZE) {
-        Some(fd) => (fd, SIZE),
-        None => match gbm_dmabuf(SIZE) {
-            Some(x) => x,
-            None => {
-                eprintln!(
-                    "skip: no dma-buf source \
-                     (/dev/dma_heap/system and GBM both unavailable)"
-                );
-                return;
-            }
-        },
+    // Prefer GBM: that is what the server allocates its staging slots from.
+    // dma-heap/system is only a fallback for machines without GBM.
+    let (source, fd, size) = if let Some((fd, size)) = gbm_dmabuf(SIZE) {
+        ("gbm", fd, size)
+    } else if let Some(fd) = dma_heap_alloc(SIZE) {
+        ("dma-heap", fd, SIZE)
+    } else {
+        eprintln!(
+            "skip: no dma-buf source \
+             (/dev/dma_heap/system and GBM both unavailable)"
+        );
+        return;
     };
-    eprintln!("dma-buf: fd={} size={size}", fd.as_raw_fd());
+    eprintln!(
+        "dma-buf: source={source} fd={} size={size}",
+        fd.as_raw_fd()
+    );
 
     // glImportMemoryFdEXT consumes the fd on success; keep the original for
     // diagnostics and dup it for GL.
@@ -254,7 +265,7 @@ fn gles_memory_object_fd_imports_a_dmabuf() {
     unsafe { import_fd(mem, size as u64, GL_HANDLE_TYPE_OPAQUE_FD_EXT, gl_fd) };
     let err = unsafe { get_error() };
     if err != 0 {
-        panic!("glImportMemoryFdEXT failed: 0x{err:04x}");
+        panic!("glImportMemoryFdEXT failed for {source}: 0x{err:04x}");
     }
 
     let mut buf = 0u32;
