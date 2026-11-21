@@ -76,6 +76,7 @@ fn routable_gid_index(ctx: &ibverbs::Context) -> Result<u32> {
 fn create_prepared_qp(
     ctx: &ibverbs::Context,
     pd: &ibverbs::ProtectionDomain,
+    slots: usize,
 ) -> Result<(
     ibverbs::PreparedQueuePair<Rc>,
     CompletionQueue,
@@ -84,9 +85,12 @@ fn create_prepared_qp(
     let send_cq = ctx.create_cq(256).build().context("create send CQ")?;
     let recv_cq = ctx.create_cq(256).build().context("create recv CQ")?;
     let gid_index = routable_gid_index(ctx)?;
+    // The client posts one receive WR per slot up front. The default receive
+    // queue depth is 1, which makes post_recv of the second slot fail ENOMEM.
     let prepared = pd
         .create_qp::<Rc>(&send_cq, &recv_cq, 1)
         .context("create_qp")?
+        .set_max_recv_wr(slots.max(1) as u32)
         .set_gid_index(gid_index)
         // both sides must accept inbound RDMA WRITEs (the client receives
         // frames; the server's QP is only the initiator today, but symmetric
@@ -213,8 +217,9 @@ fn endpoint_exchange<T: std::io::Read + std::io::Write>(
     conn: &mut Conn<T>,
     ctx: &ibverbs::Context,
     pd: &ibverbs::ProtectionDomain,
+    slots: usize,
 ) -> Result<(QueuePair<Rc>, CompletionQueue, CompletionQueue)> {
-    let (prepared, send_cq, recv_cq) = create_prepared_qp(ctx, pd)?;
+    let (prepared, send_cq, recv_cq) = create_prepared_qp(ctx, pd, slots)?;
     let local = prepared.endpoint().context("qp endpoint")?;
     conn.send(&Message::QpEndpoint(local.to_bytes()))?;
     match conn.recv()? {
@@ -598,7 +603,8 @@ impl ServerLink {
         let tx = match transport {
             Transport::Rdma => {
                 let (ctx, pd) = rdma.context("RDMA transport selected but no device")?;
-                let (qp, send_cq, _recv_cq) = endpoint_exchange(&mut conn, ctx, pd)?;
+                let (qp, send_cq, _recv_cq) =
+                    endpoint_exchange(&mut conn, ctx, pd, slots)?;
 
                 let mut stage: Vec<StagingSlot> = Vec::with_capacity(slots);
                 match external {
@@ -1807,7 +1813,7 @@ impl ClientLink {
         // RDMA endpoint exchange happens before Meta (server sends Meta after)
         let endpoint = if transport == Transport::Rdma {
             let (ctx, pd) = rdma.context("server chose RDMA but no device")?;
-            Some(endpoint_exchange(&mut conn, ctx, pd)?)
+            Some(endpoint_exchange(&mut conn, ctx, pd, slots)?)
         } else {
             None
         };
