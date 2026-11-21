@@ -25,7 +25,6 @@ rdma-display-vkcodec = { path = "../vkcodec" }
 rdma-display-vkcore = { path = "../vkcore" }
 rdma-display-audio = { path = "../audio" }
 rdma-display-auth = { path = "../auth" }
-rdma-display-egl = { path = "../egl" }
 anyhow.workspace = true
 ibverbs.workspace = true
 libc = "0.2"

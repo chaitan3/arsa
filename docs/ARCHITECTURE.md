@@ -35,7 +35,7 @@ server                                              client
 capture source            (drm poll / qemu D-Bus signal)
    │  dmabuf / raw frame
    ▼
-materializer (EGL)        import scanout dmabuf, blit to linear, read back
+materializer (Vulkan)     import scanout dmabuf, copy to host staging
    │  staging slot (pinned host RAM)
    ▼
 codec                     raw | lossless (GPU) | lossy (GPU)
@@ -65,7 +65,7 @@ arsa/
 │   ├── codec/        # codec ids + the CPU reference (lossless format lives here)
 │   ├── codec-gpu/    # client GLES lossless decoder (+ codecbench)
 │   ├── vkcodec/      # server Vulkan compute lossless encoder
-│   ├── egl/          # shared surfaceless EGL context (server + client bring-up)
+│   ├── egl/          # client EGL/Wayland presenter + GLES decoder context
 │   ├── rdma/         # verbs setup, QP bring-up, slot MRs, WRITE loop, slots
 │   ├── audio/        # PipeWire/Pulse monitor capture + client playback, wire format
 │   ├── lifecycle/    # lazy per-session bring-up/teardown helpers
@@ -150,25 +150,21 @@ monitor (§8) and **gamepads** are never covered by the portal (`RemoteDesktop`
 is keyboard/pointer/touchscreen only), so `--input` stays `uinput` and input is
 deliberately not routed through the portal.
 
-### 4.4 Frame materialization (`crates/capture/src/{egl,materializer}.rs`)
+### 4.4 Frame materialization (`crates/server/src/gpu.rs`, `crates/capture/src/materializer.rs`)
 
 The materializer turns a source frame into the linear wire bytes. `--materialize`
 selects:
 
-- **`egl`** (default): import the scanout dmabuf with `eglCreateImageKHR`, blit
-  to a linear RGBA8 target, read back through persistent-coherent PBOs. Foreign
-  (tiled) dmabufs bind as `GL_TEXTURE_EXTERNAL_OES`; linear ones as
-  `GL_TEXTURE_2D`. The context is surfaceless on the EGL device platform.
-- **`plain`**: for scanouts that are already host-linear; no EGL.
+- **`vk`** (default): imports the scanout dma-buf into a Vulkan `VkImage` (with
+  its DRM format modifier), copies it to host-visible staging buffers, and the
+  server registers those as the RDMA staging slots. The import is cached per
+  buffer (`buf_id`, format, stride, offset, modifier) and shared by the raw,
+  lossless and lossy paths.
+- **`plain`**: for scanouts that are already host-linear (`qemu gl=off`); no GPU.
 
-NVIDIA specifics are load-bearing and encoded in `egl.rs` for the raw readback
-path: the modifier attributes are `EGL_DMA_BUF_PLANE0_MODIFIER_LO/HI_EXT =
-0x3443/0x3444` (not `0x3275/0x3276`), foreign dmabufs must bind to
-`EXTERNAL_OES`, and the readback rows are copied in order (no extra flip). The
-wire format is always `XR24`/BGRX bytes, top-first.
-
-When lossless is active the Vulkan encoder imports the scanout into a `VkImage`
-(with its DRM format modifier) and encodes there — no full-frame readback (§6).
+The wire format is always `XR24`/BGRX bytes, top-first. When lossless is active
+the Vulkan encoder imports the scanout into the same cached image and encodes
+there — no full-frame readback (§6).
 
 ### 4.5 Capture sync modes (`--capture-sync`)
 
@@ -247,7 +243,7 @@ NVIDIA stack this fails: `nvidia-drm` exports scanouts through the *static*
 PRIME path (no pin/unpin ops), and peer-DMA mapping of VRAM returns `ENOMEM`.
 The **copy path is therefore the default**: import → blit → readback into a
 pinned host MR → WRITE. Zero-copy dmabuf-MR remains implemented behind the same
-config for hosts with a cooperative exporter (Intel/AMD rendernode). The
+config for hosts with a cooperative exporter (Intel/AMD GPU). The
 client-side GBM/dma-buf MR probes are in
 [`DEBUG.md`](DEBUG.md#5-client-zero-copy-c0-findings).
 

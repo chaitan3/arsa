@@ -9,11 +9,10 @@
 //!     the materializer should consume.
 //!
 //! A `FrameMaterializer` turns the source's frame representation into linear
-//! bytes the RDMA sender stages into its registered slots. Implemented:
-//! `plain` (D-Bus bytes, no GPU), `egl` (GPU blit + readback, default).
+//! bytes the RDMA sender stages into its registered slots. The server's Vulkan
+//! materializer handles dmabuf sources; `plain` handles D-Bus host bytes.
 
 pub mod drm;
-pub mod egl;
 mod fence;
 pub mod input;
 pub mod materializer;
@@ -23,7 +22,6 @@ pub mod qemu;
 
 pub use materializer::FrameMaterializer;
 pub use rdma_display_lifecycle::{sleep_or_stop, Running, Stop};
-pub use egl::{run_readback_bench, EglInitPhases, EglMaterializer, ReadBenchOpts};
 pub use input::{InputSink, QemuDbusInput, UinputSink};
 pub use drm::DrmKmsSource;
 #[cfg(feature = "portal")]

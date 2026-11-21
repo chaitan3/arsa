@@ -119,11 +119,10 @@ Per-frame compute: `cpu 6.6 / gpu 0.2 ms` for a delta, `cpu 9.3 / gpu 8.1 ms`
 for a full frame. On high-motion content that compresses poorly, `raw` is still
 cheaper.
 
-**The import path dominates.** The scanout import (`eglCreateImageKHR` + target
-bind) costs ~3 ms/frame uncached vs 0.17–0.33 ms for the encode — so it is
-cached per buffer (keyed by `fd, offset, stride, fourcc, modifier, w, h`,
-evicted past 4 entries). Steady state then pays only the encode. The external
-(tiled) sampler is not the bottleneck once cached.
+**The import path dominates.** The scanout import (Vulkan `VkImage` with its
+DRM modifier) costs far more than the encode, so it is cached per buffer
+(`buf_id`, format, stride, offset, modifier) and shared by raw/lossless/lossy.
+Steady state then pays only the encode.
 
 `codecbench` benchmarks all variants (`[texture]`, `[external]`, `[fetch]`,
 `[import]`) and requires them byte-identical to the SSBO encode and

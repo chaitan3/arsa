@@ -15,7 +15,7 @@ boxes on a fast link, not a browser-streaming service.
  server                                            client
  ┌───────────────────────────┐                    ┌──────────────────────────┐
  │ capture: drm (KMS) or qemu │                    │ receive slot             │
- │   → EGL import / blit      │                    │   → EGL upload           │
+ │   → Vulkan import / copy   │                    │   → EGL upload           │
  │   → codec (raw/lossless/   │   RDMA WRITE+imm   │   → letterboxed draw     │
  │     lossy) into a slot MR  │ ─────────────────► │   → eglSwapBuffers       │
  │   → RDMA WRITE / TCP       │                    │                          │
@@ -148,7 +148,7 @@ groups and log out / back in for the change to take effect:
 | --- | --- | --- |
 | `input` | server `--input uinput`; client gamepad capture | `/dev/uinput`; `/dev/input/event*` (read+write — write is for rumble) |
 | `video` | server KMS capture (`--source drm`) | `/dev/dri/card*` |
-| `render` | server EGL materializer / GPU encode (`--rendernode`) | `/dev/dri/renderD*` |
+| `render` | server Vulkan import / GPU encode | `/dev/dri/renderD*` |
 | `rdma` | RDMA transport, on both ends (where the distribution restricts it) | `/dev/infiniband/*` |
 
 ```bash
@@ -285,9 +285,8 @@ Transport, codec, and presenter are independent axes:
   to do anything; otherwise the request is reported as failed and the session
   runs at the server's current resolution.
 - **GPUs** — the server capture path was developed and tested on NVIDIA
-  (KMS + EGL dmabuf import); a `plain` materializer handles host-linear
+  (KMS + Vulkan dmabuf import); a `plain` materializer handles host-linear
   scanouts. The client presenter is GPU-agnostic (EGL upload from host RAM).
-  VRAM zero-copy paths are NVIDIA-gated and currently dormant.
 
 ## Documentation
 

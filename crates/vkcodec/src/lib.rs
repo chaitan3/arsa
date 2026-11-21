@@ -49,12 +49,8 @@ pub struct Encoder {
     header_set: vk::DescriptorSet,
     desc_pool: vk::DescriptorPool,
     sampler: vk::Sampler,
-    image: Option<ScanoutImage>,
-}
-
-struct ScanoutImage {
-    img: rdma_display_vkcore::Image,
-    view: vk::ImageView,
+    /// current imported scanout view (owned by the shared import cache)
+    scanout_view: Option<vk::ImageView>,
 }
 
 impl Encoder {
@@ -204,7 +200,7 @@ impl Encoder {
             header_set,
             desc_pool,
             sampler,
-            image: None,
+            scanout_view: None,
         })
     }
 
@@ -251,38 +247,9 @@ impl Encoder {
         Ok(n)
     }
 
-    /// Import the current scanout dma-buf and make it the encode source.
-    #[allow(clippy::too_many_arguments)]
-    pub fn set_scanout(
-        &mut self,
-        fd: i32,
-        width: u32,
-        height: u32,
-        format: vk::Format,
-        modifier: u64,
-        offset: u32,
-        stride: u32,
-    ) -> Result<()> {
-        if let Some(old) = self.image.take() {
-            unsafe {
-                self.core.device.destroy_image_view(old.view, None);
-                self.core.destroy_image(old.img);
-            }
-        }
-        let img = self.core.import_dmabuf(fd, width, height, format, modifier, offset, stride)?;
-        self.core.transition(
-            img.image,
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::ImageAspectFlags::COLOR,
-        )?;
-        let view = self.core.make_view(
-            img.image,
-            format,
-            vk::ImageAspectFlags::COLOR,
-            vk::ComponentSwizzle::IDENTITY,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        )?;
+    /// Use a scanout image view (owned by the shared import cache; the caller
+    /// must have transitioned it to `SHADER_READ_ONLY_OPTIMAL`).
+    pub fn set_scanout_image(&mut self, view: vk::ImageView) -> Result<()> {
         let info = vk::DescriptorImageInfo {
             sampler: self.sampler,
             image_view: view,
@@ -297,14 +264,14 @@ impl Encoder {
             ..Default::default()
         };
         unsafe { self.core.device.update_descriptor_sets(&[write], &[]); }
-        self.image = Some(ScanoutImage { img, view });
+        self.scanout_view = Some(view);
         Ok(())
     }
 
-    /// Encode from the scanout imported by [`set_scanout`](Self::set_scanout).
+    /// Encode from the scanout set by [`set_scanout_image`](Self::set_scanout_image).
     pub fn encode_scanout(&mut self) -> Result<usize> {
-        if self.image.is_none() {
-            bail!("encode_scanout before set_scanout");
+        if self.scanout_view.is_none() {
+            bail!("encode_scanout before set_scanout_image");
         }
         let full = self.first;
         let n = self.dispatch(full, true)?;
@@ -477,10 +444,6 @@ impl Drop for Encoder {
     fn drop(&mut self) {
         unsafe {
             let dev = &self.core.device;
-            if let Some(img) = self.image.take() {
-                dev.destroy_image_view(img.view, None);
-                self.core.destroy_image(img.img);
-            }
             dev.destroy_sampler(self.sampler, None);
             dev.destroy_descriptor_pool(self.desc_pool, None);
             dev.destroy_pipeline(self.ssbo_pipe, None);

@@ -6,7 +6,7 @@
 //! legacy `crtc.fb_id`, so the fb must be read from the plane state), and
 //! poll `plane.fb_id`. The compositor flips the fb on every repaint — that
 //! flip *is* our dirty signal (same semantics as QEMU's alternating
-//! ScanoutDMABUF announcements, so the existing Scanout → EglMaterializer
+//! ScanoutDMABUF announcements, so the existing Scanout → Vulkan materializer
 //! path consumes it unchanged).
 //!
 //! Permissions: GETFB2 leaks GEM handles, so the kernel gates it on DRM

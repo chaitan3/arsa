@@ -63,7 +63,7 @@ newest_mtime() {
 # relinks the server but not the client, and must not force a client rebuild.
 # Keep these in sync with crates/{server,client}/Cargo.toml.
 ROOT_FILES=(Cargo.toml Cargo.lock .cargo/config.toml)
-SERVER_CRATES=(crates/proto crates/capture crates/rdma crates/audio crates/egl \
+SERVER_CRATES=(crates/proto crates/capture crates/rdma crates/audio \
     crates/codec crates/vkcore crates/vkcodec crates/lifecycle crates/server)
 CLIENT_CRATES=(crates/proto crates/rdma crates/audio crates/codec \
     crates/codec-gpu crates/vkcore crates/lifecycle crates/client)

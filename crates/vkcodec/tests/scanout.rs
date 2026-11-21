@@ -1,10 +1,10 @@
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
 
 use anyhow::Result;
 use rdma_display_codec::{Decoder, Geometry};
 use rdma_display_vkcodec::Encoder;
-use rdma_display_vkcore::{ash::vk, HostBuffer, VkCore};
+use rdma_display_vkcore::{ash::vk, HostBuffer, Image, VkCore};
 
 fn frame(seed: u32) -> Vec<u8> {
     let mut f = vec![0u8; 256 * 256 * 4];
@@ -99,9 +99,10 @@ fn scanout_roundtrip(
     dec: &mut Decoder,
     host: &mut HostBuffer,
     bytes: &[u8],
+    prev: &mut Option<(Image, vk::ImageView)>,
 ) {
     host.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
-    let (img, fd, pitch) = core
+    let (img, fd, _pitch) = core
         .create_exportable_image(
             vk::Format::B8G8R8A8_UNORM,
             256,
@@ -109,28 +110,26 @@ fn scanout_roundtrip(
             vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
         )
         .expect("exportable image");
-    upload(core, img.image, host, 256, 256).expect("upload");
-    let sub = vk::ImageSubresource {
-        aspect_mask: vk::ImageAspectFlags::COLOR,
-        mip_level: 0,
-        array_layer: 0,
-    };
-    let layout = unsafe { core.device.get_image_subresource_layout(img.image, sub) };
-    eprintln!(
-        "exportable image: returned pitch={pitch} layout row_pitch={} offset={} size={}",
-        layout.row_pitch, layout.offset, layout.size
-    );
     let _fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    enc.set_scanout(
-        _fd.as_raw_fd(),
-        256,
-        256,
-        vk::Format::B8G8R8A8_UNORM,
-        0,
-        0,
-        pitch,
-    )
-    .expect("set_scanout");
+    upload(core, img.image, host, 256, 256).expect("upload");
+    let view = core
+        .make_view(
+            img.image,
+            vk::Format::B8G8R8A8_UNORM,
+            vk::ImageAspectFlags::COLOR,
+            vk::ComponentSwizzle::IDENTITY,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        )
+        .expect("image view");
+    enc.set_scanout_image(view).expect("set_scanout_image");
+    // The encoder's descriptor now points at the new view; the old image/view
+    // can be released.
+    if let Some((old_img, old_view)) = prev.take() {
+        unsafe { core.device.destroy_image_view(old_view, None) };
+        core.destroy_image(old_img);
+    }
+    *prev = Some((img, view));
+
     let n = enc.encode_scanout().expect("encode scanout");
     let decoded = dec.decode(&enc.coded()[..n]).expect("decode");
     if decoded != bytes {
@@ -143,16 +142,10 @@ fn scanout_roundtrip(
         let ch = i % 4;
         let (x, y) = (px % 256, px / 256);
         panic!(
-            "scanout mismatch at byte {i} (x={x} y={y} ch={ch}): \
-             decoded={} expected={} | row0 decoded={:?} | row1 decoded={:?} expected={:?}",
-            decoded[i],
-            bytes[i],
-            &decoded[..16.min(decoded.len())],
-            &decoded[1024..1040.min(decoded.len())],
-            &bytes[1024..1040.min(bytes.len())]
+            "scanout mismatch at byte {i} (x={x} y={y} ch={ch}): decoded={} expected={}",
+            decoded[i], bytes[i]
         );
     }
-    core.destroy_image(img);
 }
 
 #[test]
@@ -166,9 +159,16 @@ fn vulkan_lossless_scanout_full_and_delta() {
         .host_buffer(geom.frame_bytes() as u64)
         .expect("host buffer");
 
+    let mut prev = None;
     let f0 = frame(0x5a);
-    scanout_roundtrip(&core, &mut enc, &mut dec, &mut host, &f0);
+    scanout_roundtrip(&core, &mut enc, &mut dec, &mut host, &f0, &mut prev);
 
     let f1 = frame(0xa5);
-    scanout_roundtrip(&core, &mut enc, &mut dec, &mut host, &f1);
+    scanout_roundtrip(&core, &mut enc, &mut dec, &mut host, &f1, &mut prev);
+
+    drop(enc);
+    if let Some((img, view)) = prev.take() {
+        unsafe { core.device.destroy_image_view(view, None) };
+        core.destroy_image(img);
+    }
 }

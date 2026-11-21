@@ -5,10 +5,10 @@
 //!   --mode capture   stream a display source:
 //!     --source drm (default)  KMS capture of the host screen (Sunshine-style):
 //!             grabs the CRTC's current fb via GETFB2 as a dmabuf each flip;
-//!             requires sudo (CAP_SYS_ADMIN) and kernel >= 5.8; egl
+//!             requires sudo (CAP_SYS_ADMIN) and kernel >= 5.8; Vulkan
 //!             materialize only; --input uinput (default)
 //!     --source qemu           QEMU dbus display capture (the guest):
-//!             --materialize egl    GPU blit+readback (default, gl=on)
+//!             --materialize vk     Vulkan import + host staging (default)
 //!             --materialize plain  D-Bus host-memory scanouts (gl=off)
 //!             --input qemu         inject into the guest console (default)
 //!     --codec lossless (default)|raw|lossy  frame coding (lossless =
@@ -30,6 +30,7 @@ use rdma_display_capture::{
 };
 
 mod display;
+mod gpu;
 mod gpu_power;
 mod lossy;
 mod signals;
@@ -86,8 +87,7 @@ fn main() -> Result<()> {
     let mut input: Option<String> = None; // None = paired default for the source
     let mut dbus_socket: Option<String> = None;
     let mut console: u32 = 0;
-    let mut materialize: String = "egl".to_string();
-    let mut rendernode: Option<String> = None;
+    let mut materialize: String = "vk".to_string();
     let mut drm_card: Option<String> = None;
     let mut input_test = false;
     let mut audio = true;
@@ -141,7 +141,6 @@ fn main() -> Result<()> {
             }
             "--console" => console = args.next().expect("--console needs a value").parse()?,
             "--materialize" => materialize = args.next().expect("--materialize needs a value"),
-            "--rendernode" => rendernode = Some(args.next().expect("--rendernode needs a value")),
             "--drm-card" => drm_card = Some(args.next().expect("--drm-card needs a value")),
             "--capture-sync" => {
                 let v = args.next().expect("--capture-sync needs a value");
@@ -223,8 +222,8 @@ fn main() -> Result<()> {
 capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS capture, the host — requires sudo/CAP_SYS_ADMIN, kernel >= 5.8; portal = XDG Desktop Portal ScreenCast over PipeWire — needs a session bus and a portal backend, and needs no root)\n  \
   --input qemu|uinput (default auto: qemu↔qemu-dbus, drm↔uinput, portal↔uinput)\n  \
   qemu: [--dbus-socket /path/dbus.sock] [--console 0]   drm: [--drm-card /dev/dri/cardN] (default: first card0..card8 with an active scanout)\n  \
-  [--materialize egl|plain] [--rendernode /dev/dri/renderD128] [--input-test]\n  \
-  --materialize egl (default) imports the dmabuf and reads it back for raw/lossy; GPU lossless encodes straight from the imported dmabuf (no full-frame readback). plain = D-Bus host-memory scanouts (qemu gl=off).\n  \
+  [--materialize vk|plain] [--input-test]\n  \
+  --materialize vk (default) imports the dmabuf into Vulkan and copies it to host staging for raw; lossless encodes straight from the imported image. plain = D-Bus host-memory scanouts (qemu gl=off).\n  \
   --capture-sync auto|settle[:ms]|fence  (drm) when to capture, on top of the 1 ms poll that emits only when the plane's fb changes: auto (default) and fence read the current frame when the compositor's per-frame completion fence signals (tracefs; ~1 ms, tear-free, needs root), falling back to settle:2ms while the watch calibrates or if tracefs is unavailable; settle[:ms] = emit the current fb ms after its commit (default 2 ms; usually complete, but frames whose render outlasts the window tear)\n  \
   --pace auto|latency|smooth  frame pacing: the server's flow-control window — how many frames it keeps in flight ahead of the client's display. The client credits one frame per present, which paces both TCP and RDMA. auto (default) sizes the window from the measured link (ceil(turnaround / source frame period): keeps the pipe full without queueing); latency = 1 (present-paced, lowest latency, may stall if the link is slower than the display); smooth = the transport maximum (smoothest cadence, highest latency).\n  \
   --codec auto|raw|lossless|lossy  frame coding for the whole session (default auto = honour the client's Hello preference, else lossless). raw = unchanged wire; lossless = v2 tile-delta against the previous frame (desktop-friendly); lossy = PyroWave intra-only GPU codec (needs libpyrowave-shared.so). A non-auto value forces the codec. Build server and client together (lossless v2 is a wire-format version).\n  \
@@ -301,7 +300,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
         "testcard" => run_testcard_server(rdma_ref, transport, &listen, slots, fps),
         "capture" => run_capture(
             rdma_ref, transport, &source, input.as_deref(), &dbus_socket, console, &drm_card,
-            &materialize, rendernode.as_deref(), &listen, slots, fps, input_test,
+            &materialize, &listen, slots, fps, input_test,
             capture_sync, audio, audio_device.as_deref(), codec, codec_auto, lossy_mbps,
             lossy_chroma444, &display_control, display_output.as_deref(), idle_metrics, pace,
             no_encrypt,
@@ -912,7 +911,6 @@ fn run_capture(
     console: u32,
     drm_card: &Option<String>,
     materialize: &str,
-    rendernode: Option<&str>,
     listen: &str,
     slots: usize,
     fps: u64,
@@ -930,8 +928,8 @@ fn run_capture(
     pace: Pace,
     no_encrypt: bool,
 ) -> Result<()> {
-    if source_name == "drm" && materialize != "egl" && codec != rdma_display_codec::Codec::Lossy {
-        bail!("--source drm requires --materialize egl (KMS capture is dmabuf-only)");
+    if source_name == "drm" && materialize != "vk" && codec != rdma_display_codec::Codec::Lossy {
+        bail!("--source drm requires --materialize vk (KMS capture is dmabuf-only)");
     }
     if source_name == "portal" {
         // the portal identifies the caller via /proc/<pid>/root; a setcap'd
@@ -958,17 +956,9 @@ fn run_capture(
     let mut audio_capture: Option<rdma_display_audio::capture::AudioCapture> = None;
     let audio_busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // One EGL context shared by the materializer and the lossless encoder:
-    // both import the same scanout dmabufs and run on the server thread, so a
-    // single GLES 3.x context serves both and saves a second context creation
-    // (~49 ms on this stack) per session. Only built when something needs GL.
-    let needs_egl = (codec != rdma_display_codec::Codec::Lossy && materialize == "egl")
-        || codec == rdma_display_codec::Codec::Lossless;
-    let gl: Option<Arc<rdma_display_egl::SharedContext>> = if needs_egl {
-        Some(Arc::new(rdma_display_egl::SharedContext::new(rendernode)?))
-    } else {
-        None
-    };
+    // One Vulkan device shared by the raw materializer and the lossless/lossy
+    // encoders: the scanout import is cached and reused.
+    let gpu = gpu::Gpu::new().context("create the shared Vulkan GPU")?;
 
     // input sink: explicit --input wins, else paired default
     let input_name = input_name.unwrap_or(match source_name {
@@ -1048,6 +1038,7 @@ fn run_capture(
         codec_auto,
         lossy_budget,
         lossy_chroma444,
+        &gpu,
         capture_connector.as_deref(),
     );
     if let Some(m) = geometry.as_ref() {
@@ -1060,13 +1051,12 @@ fn run_capture(
     let mut mat: Box<dyn FrameMaterializer> = build_materializer(
         codec,
         materialize,
-        gl.as_ref(),
-        rendernode,
+        &gpu,
         lossy_budget,
         lossy_chroma444,
     )?;
     // whether the current materializer is the lossy one; raw/lossless share the
-    // EGL/plain materializer, so the box is only rebuilt when the family changes
+    // Vulkan/plain materializer, so the box is only rebuilt when the family changes
     let mut mat_is_lossy = codec == rdma_display_codec::Codec::Lossy;
     // the lossy budget baked into the current materializer (rebuild on change)
     let mut mat_lossy_budget = lossy_budget;
@@ -1658,8 +1648,7 @@ fn run_capture(
                     mat = build_materializer(
                         session_codec,
                         materialize,
-                        gl.as_ref(),
-                        rendernode,
+                        &gpu,
                         eff_budget,
                         lossy_chroma444,
                     )?;
@@ -1772,7 +1761,7 @@ fn run_capture(
                     let external = if rdma.is_some()
                         && transport != rdma_display_rdma::TransportPref::Tcp
                         && session_codec != rdma_display_codec::Codec::Lossy
-                        && materialize == "egl"
+                        && materialize == "vk"
                     {
                         match mat.bind_staging(slots, slot_len) {
                             Some(v) => Some(v),
@@ -1824,6 +1813,7 @@ fn run_capture(
                             // frame must be full (no delta against a frame it
                             // never received)
                             fc.configure(
+                                &gpu,
                                 session_codec,
                                 meta.width,
                                 meta.height,
@@ -1901,6 +1891,7 @@ fn run_capture(
                         // next frame is full)
                         if fc.geometry_stale(fmt.width, fmt.height, fmt.stride) {
                             fc.configure(
+                                &gpu,
                                 session_codec,
                                 fmt.width,
                                 fmt.height,
@@ -2157,6 +2148,10 @@ fn run_capture(
 struct FrameCodec {
     /// Vulkan lossless encoder; None for raw.
     vk: Option<rdma_display_vkcodec::Encoder>,
+    /// shared Vulkan device + scanout import cache
+    gpu: Option<Arc<gpu::Gpu>>,
+    /// currently sampled scanout (owned by the cache)
+    last_image: Option<Arc<gpu::CachedImage>>,
     frame_bytes: usize,
     geom: Option<rdma_display_codec::Geometry>,
     /// the next encode must be a full frame (new session / new geometry)
@@ -2165,20 +2160,19 @@ struct FrameCodec {
     scanout: bool,
     /// set once the texture-direct import failed (avoid per-frame log spam)
     scanout_warned: bool,
-    /// identity of the imported scanout buffer (skip a re-import)
-    scanout_key: Option<(u64, u32, u32, u64, u32, u32, u32)>,
 }
 
 impl FrameCodec {
     fn new() -> Self {
         Self {
             vk: None,
+            gpu: None,
+            last_image: None,
             frame_bytes: 0,
             geom: None,
             first: true,
             scanout: false,
             scanout_warned: false,
-            scanout_key: None,
         }
     }
 
@@ -2186,15 +2180,17 @@ impl FrameCodec {
     /// buffers; the next session reconfigures.
     fn teardown(&mut self) {
         self.vk = None;
+        self.gpu = None;
+        self.last_image = None;
         self.geom = None;
         self.first = true;
         self.scanout = false;
-        self.scanout_key = None;
         self.frame_bytes = 0;
     }
 
     fn configure(
         &mut self,
+        gpu: &Arc<gpu::Gpu>,
         codec: rdma_display_codec::Codec,
         width: u32,
         height: u32,
@@ -2204,16 +2200,17 @@ impl FrameCodec {
         self.frame_bytes = frame_bytes;
         self.geom = None;
         self.vk = None;
+        self.gpu = Some(gpu.clone());
+        self.last_image = None;
         self.first = true;
         self.scanout = false;
-        self.scanout_key = None;
         match codec {
             rdma_display_codec::Codec::Raw | rdma_display_codec::Codec::Lossy => {}
             rdma_display_codec::Codec::Lossless => {
                 let geom = rdma_display_codec::Geometry::new(width, height, stride);
                 self.geom = Some(geom);
                 self.vk = Some(
-                    rdma_display_vkcodec::Encoder::new(geom)
+                    rdma_display_vkcodec::Encoder::with_core(gpu.core.clone(), geom)
                         .context("lossless Vulkan encoder (no CPU fallback)")?,
                 );
                 log::info!("[server] lossless encoder: GPU (Vulkan compute)");
@@ -2261,47 +2258,22 @@ impl FrameCodec {
 
     fn clear_scanout(&mut self) {
         self.scanout = false;
-        self.scanout_key = None;
+        self.last_image = None;
     }
 
     /// Import the scanout dmabuf into the Vulkan encoder so
     /// [`encode_scanout`](Self::encode_scanout) samples it directly.
     fn set_scanout(&mut self, d: &rdma_display_capture::DmabufScanout) -> Result<()> {
+        let Some(gpu) = self.gpu.as_ref() else {
+            anyhow::bail!("no Vulkan GPU");
+        };
         let Some(vk) = self.vk.as_mut() else {
             anyhow::bail!("no Vulkan encoder");
         };
-        if d.fds.len() != 1 {
-            anyhow::bail!(
-                "lossless texture-direct needs a single-plane dmabuf (got {})",
-                d.fds.len()
-            );
-        }
-        let stride = d.strides.first().copied().unwrap_or(d.format.stride);
-        let offset = d.offsets.first().copied().unwrap_or(0);
-        let key = (
-            d.buf_id,
-            d.format.width,
-            d.format.height,
-            d.format.modifier,
-            stride,
-            offset,
-            d.format.fourcc,
-        );
-        // buf_id 0 means "no stable identity" (e.g. QEMU): re-import.
-        if d.buf_id != 0 && self.scanout_key == Some(key) {
-            return Ok(());
-        }
-        let format = lossy::fourcc_to_vk(d.format.fourcc).with_context(|| {
-            format!(
-                "unsupported scanout fourcc {:#010x} for the Vulkan lossless encoder",
-                d.format.fourcc
-            )
-        })?;
-        // The image shader packs the sampled RGBA8 word; 10-bit scanouts must
-        // take the readback path.
         use rdma_display_vkcore::ash::vk;
+        let img = gpu.import(d)?;
         if !matches!(
-            format,
+            img.format,
             vk::Format::B8G8R8A8_UNORM | vk::Format::R8G8B8A8_UNORM
         ) {
             anyhow::bail!(
@@ -2309,17 +2281,16 @@ impl FrameCodec {
                 d.format.fourcc
             );
         }
-        use std::os::fd::AsRawFd;
-        vk.set_scanout(
-            d.fds[0].as_raw_fd(),
-            d.format.width,
-            d.format.height,
-            format,
-            d.format.modifier,
-            offset,
-            stride,
-        )?;
-        self.scanout_key = Some(key);
+        if self
+            .last_image
+            .as_ref()
+            .is_some_and(|old| Arc::ptr_eq(old, &img))
+        {
+            return Ok(());
+        }
+        img.ensure_layout(rdma_display_vkcore::ash::vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
+        vk.set_scanout_image(img.view())?;
+        self.last_image = Some(img);
         if !self.scanout {
             log::debug!(
                 "[server] lossless Vulkan: scanout imported (modifier={:#x})",
@@ -2658,29 +2629,26 @@ fn lossy_budget_bytes(mbps: u16) -> usize {
 }
 
 /// Build the frame materializer for `codec`: the lossy (PyroWave/Vulkan) one, or
-/// the EGL/plain one shared by raw and lossless. Called at startup and again
+/// the Vulkan/plain one shared by raw and lossless. Called at startup and again
 /// when a session's resolved codec changes the materializer family.
 fn build_materializer(
     codec: rdma_display_codec::Codec,
     materialize: &str,
-    gl: Option<&Arc<rdma_display_egl::SharedContext>>,
-    rendernode: Option<&str>,
+    gpu: &Arc<gpu::Gpu>,
     lossy_budget: usize,
     lossy_chroma444: bool,
 ) -> Result<Box<dyn FrameMaterializer>> {
     if codec == rdma_display_codec::Codec::Lossy {
         return Ok(Box::new(lossy::LossyMaterializer::new(
+            gpu.clone(),
             lossy_budget,
             lossy_chroma444,
         )?));
     }
     Ok(match materialize {
-        "egl" => Box::new(match gl {
-            Some(gl) => rdma_display_capture::EglMaterializer::new_shared(gl)?,
-            None => rdma_display_capture::EglMaterializer::new(rendernode)?,
-        }),
+        "vk" => Box::new(gpu::VkMaterializer::new(gpu.clone())),
         "plain" => Box::new(rdma_display_capture::materializer::PlainMaterializer::new()),
-        other => bail!("materializer {other:?} not implemented (egl|plain)"),
+        other => bail!("materializer {other:?} not implemented (vk|plain)"),
     })
 }
 
@@ -2773,6 +2741,7 @@ fn preflight(
     codec_auto: bool,
     lossy_budget: usize,
     lossy_chroma444: bool,
+    gpu: &Arc<gpu::Gpu>,
     drm_connector: Option<&str>,
 ) -> Option<DisplayMeta> {
     let mut geometry = None;
@@ -2808,7 +2777,7 @@ fn preflight(
             .as_ref()
             .map(|m| rdma_display_codec::Geometry::new(m.width, m.height, m.stride))
             .unwrap_or_else(|| rdma_display_codec::Geometry::new(1920, 1080, 1920 * 4));
-        match rdma_display_vkcodec::Encoder::new(g) {
+        match rdma_display_vkcodec::Encoder::with_core(gpu.core.clone(), g) {
             Ok(_) => log::debug!("[preflight] lossless encoder ok ({}x{})", g.width, g.height),
             Err(e) => {
                 log::warn!("[preflight] lossless encoder failed: {e:#} (Vulkan/dma-buf required)")
@@ -2819,7 +2788,7 @@ fn preflight(
     // 2b. lossy encoder (PyroWave/Vulkan) — validate when lossy can be selected
     // (a client request under --codec auto, or a server-forced --codec lossy)
     if codec == rdma_display_codec::Codec::Lossy || codec_auto {
-        match lossy::LossyMaterializer::new(lossy_budget, lossy_chroma444) {
+        match lossy::LossyMaterializer::new(gpu.clone(), lossy_budget, lossy_chroma444) {
             Ok(m) => {
                 drop(m);
                 log::debug!("[preflight] lossy encoder ok");
@@ -2884,8 +2853,9 @@ mod codec_tests {
         let stride = w * 4;
         let geom = Geometry::new(w, h, stride);
         let fb = geom.frame_bytes();
+        let gpu = crate::gpu::Gpu::new().unwrap();
         let mut fc = FrameCodec::new();
-        fc.configure(Codec::Lossless, w, h, stride, fb).unwrap();
+        fc.configure(&gpu, Codec::Lossless, w, h, stride, fb).unwrap();
         let mut dec = Decoder::new(geom).unwrap();
         let mut slot = vec![0u8; geom.max_coded_len()];
         let base = synthetic(w, h, 1);
