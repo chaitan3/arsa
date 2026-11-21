@@ -260,6 +260,11 @@ fn gles_memory_object_fd_imports_a_dmabuf() {
     let gl_fd = unsafe { libc::dup(fd.as_raw_fd()) };
     assert!(gl_fd >= 0, "dup dma-buf fd failed");
 
+    // Drain earlier errors so the import result is unambiguous.
+    unsafe {
+        while get_error() != 0 {}
+    }
+
     let mut mem = 0u32;
     unsafe { create_memory(1, &mut mem) };
     unsafe { import_fd(mem, size as u64, GL_HANDLE_TYPE_OPAQUE_FD_EXT, gl_fd) };
