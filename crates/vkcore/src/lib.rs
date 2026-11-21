@@ -73,6 +73,7 @@ impl VkCore {
             let required = [
                 "VK_KHR_external_memory_fd",
                 "VK_KHR_external_semaphore_fd",
+                "VK_EXT_external_memory_dma_buf",
                 "VK_EXT_image_drm_format_modifier",
                 "VK_KHR_dedicated_allocation",
                 "VK_KHR_get_memory_requirements2",
