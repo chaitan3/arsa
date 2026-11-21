@@ -316,12 +316,32 @@ impl FrameFill {
     }
 }
 
+/// What the caller's fill callback is writing into. `Gpu` means the coded
+/// output is a GPU buffer and the link posts from a GPU staging MR; no host
+/// slice exists.
+pub enum SlotMem<'a> {
+    Host(&'a mut [u8]),
+    Gpu,
+}
+
+/// GPU-backed local staging supplied by the server. The `LocalMemorySlice`s
+/// refer to MRs owned by the caller (the GpuDirect object), which must outlive
+/// the link.
+pub struct GpuStaging {
+    pub slices: Vec<LocalMemorySlice>,
+}
+
 enum Tx {
     Rdma {
         qp: QueuePair<Rc>,
         send_cq: CompletionQueue,
-        /// local staging slots (copy path / testcard writes here before WRITE)
+        /// local host staging slots (copy path / testcard writes here before WRITE)
         slots: Vec<StagingSlot>,
+        /// GPU-coded staging slots; when present, `slots` is empty and the
+        /// coded output is written into these GPU MRs directly.
+        gpu: Option<GpuStaging>,
+        /// postable/client slot length
+        frame_bytes: usize,
         remote: Vec<RemoteMemorySlice>,
         slot_free: Vec<bool>,
     },
@@ -578,6 +598,7 @@ impl ServerLink {
         chroma: u8,
         input_tx: mpsc::Sender<proto::InputEvent>,
         external: Option<&[(*mut u8, usize)]>,
+        gpu: Option<GpuStaging>,
         rumble: &proto::gamepad::RumbleHub,
         video_key: Option<[u8; 32]>,
         ctrl_seal: Option<std::sync::Arc<std::sync::Mutex<rdma_display_auth::Seal>>>,
@@ -606,42 +627,60 @@ impl ServerLink {
                 let (qp, send_cq, _recv_cq) =
                     endpoint_exchange(&mut conn, ctx, pd, slots)?;
 
+                let gpu = if transport == Transport::Rdma { gpu } else { None };
                 let mut stage: Vec<StagingSlot> = Vec::with_capacity(slots);
-                match external {
-                    Some(list) => {
-                        anyhow::ensure!(
-                            list.len() == slots,
-                            "external staging slot count {} != {slots}",
-                            list.len()
-                        );
-                        for (i, (ptr, len)) in list.iter().enumerate() {
+                if let Some(g) = gpu.as_ref() {
+                    anyhow::ensure!(
+                        g.slices.len() == slots,
+                        "GPU staging slot count {} != {slots}",
+                        g.slices.len()
+                    );
+                    anyhow::ensure!(
+                        g.slices.iter().all(|s| s.len() >= slot_len),
+                        "GPU staging slice shorter than {slot_len}"
+                    );
+                    anyhow::ensure!(
+                        external.is_none(),
+                        "both host and GPU staging were supplied"
+                    );
+                    log::info!("[rdma] GPU staging: {slots} coded dma-buf MRs (no host slots)");
+                } else {
+                    match external {
+                        Some(list) => {
                             anyhow::ensure!(
-                                *len == slot_len,
-                                "external slot {i} len {len} != expected {slot_len}"
+                                list.len() == slots,
+                                "external staging slot count {} != {slots}",
+                                list.len()
                             );
-                            // zero-copy staging: the NIC reads the same pages the GL
-                            // readback DMA fills. LOCAL_WRITE|REMOTE_READ, matching
-                            // the bench probe (deliberately not PERMISSIVE).
-                            let mr = unsafe {
-                                pd.register_from_raw(
-                                    *ptr,
-                                    *len,
-                                    AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ,
-                                )
+                            for (i, (ptr, len)) in list.iter().enumerate() {
+                                anyhow::ensure!(
+                                    *len == slot_len,
+                                    "external slot {i} len {len} != expected {slot_len}"
+                                );
+                                // zero-copy staging: the NIC reads the same pages the GL
+                                // readback DMA fills. LOCAL_WRITE|REMOTE_READ, matching
+                                // the bench probe (deliberately not PERMISSIVE).
+                                let mr = unsafe {
+                                    pd.register_from_raw(
+                                        *ptr,
+                                        *len,
+                                        AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ,
+                                    )
+                                }
+                                .context("register external staging slot (PBO)")?;
+                                stage.push(StagingSlot::Ext(mr));
                             }
-                            .context("register external staging slot (PBO)")?;
-                            stage.push(StagingSlot::Ext(mr));
+                            log::info!(
+                                "[rdma] external staging: {slots} slots from materializer PBOs (zero-copy)"
+                            );
                         }
-                        log::info!(
-                            "[rdma] external staging: {slots} slots from materializer PBOs (zero-copy)"
-                        );
-                    }
-                    None => {
-                        for _ in 0..slots {
-                            let mr = pd
-                                .allocate(slot_len, AccessFlags::PERMISSIVE)
-                                .context("allocate staging slot")?;
-                            stage.push(StagingSlot::Owned(mr));
+                        None => {
+                            for _ in 0..slots {
+                                let mr = pd
+                                    .allocate(slot_len, AccessFlags::PERMISSIVE)
+                                    .context("allocate staging slot")?;
+                                stage.push(StagingSlot::Owned(mr));
+                            }
                         }
                     }
                 }
@@ -676,6 +715,8 @@ impl ServerLink {
                     qp,
                     send_cq,
                     slots: stage,
+                    gpu,
+                    frame_bytes: slot_len,
                     remote,
                     slot_free: vec![true; slots],
                 }
@@ -1012,7 +1053,12 @@ impl ServerLink {
     /// The claimed slot's registered memory, for `issue_frame`.
     pub fn slot_bytes_mut(&mut self, slot: usize) -> &mut [u8] {
         match &mut self.tx {
-            Tx::Rdma { slots, .. } => {
+            Tx::Rdma { slots, gpu, .. } => {
+                if gpu.is_some() {
+                    // GPU staging has no CPU-writable slot; pipelining is not
+                    // used for that path.
+                    return &mut [];
+                }
                 let len = slots[slot].len();
                 slots[slot].as_mut_bytes(len)
             }
@@ -1066,7 +1112,10 @@ impl ServerLink {
     /// Returns the frame sequence number.
     pub fn send_frame(&mut self, fill: impl FnOnce(&mut [u8]), t0_unix_us: u64) -> Result<u64> {
         self.send_frame_checked(
-            |_slot, out| {
+            |_slot, mem| {
+                let SlotMem::Host(out) = mem else {
+                    anyhow::bail!("testcard fill requested a host slot")
+                };
                 let n = out.len();
                 fill(out);
                 Ok(FrameFill::host(true, n, proto::MatTimes::ZERO))
@@ -1089,7 +1138,7 @@ impl ServerLink {
     /// staging-slot credit wait; neither absorbs the per-frame prepare.
     pub fn send_frame_checked(
         &mut self,
-        fill: impl FnOnce(usize, &mut [u8]) -> anyhow::Result<FrameFill>,
+        fill: impl FnOnce(usize, SlotMem<'_>) -> anyhow::Result<FrameFill>,
         t0_unix_us: u64,
         t0d_unix_us: u64,
         t0p_unix_us: u64,
@@ -1102,7 +1151,7 @@ impl ServerLink {
 
     fn send_frame_rdma(
         &mut self,
-        fill: impl FnOnce(usize, &mut [u8]) -> anyhow::Result<FrameFill>,
+        fill: impl FnOnce(usize, SlotMem<'_>) -> anyhow::Result<FrameFill>,
         t0_unix_us: u64,
         t0d: u64,
         t0p: u64,
@@ -1118,13 +1167,24 @@ impl ServerLink {
             );
         }
         let (filled, frame_bytes) = {
-            let Tx::Rdma { slots, .. } = &mut self.tx else {
+            let Tx::Rdma {
+                slots,
+                gpu,
+                frame_bytes,
+                ..
+            } = &mut self.tx
+            else {
                 unreachable!()
             };
-            let frame_bytes = slots[slot].len();
-            let filled = fill(slot, slots[slot].as_mut_bytes(frame_bytes))?;
+            let frame_bytes = *frame_bytes;
+            let mem = if gpu.is_some() {
+                SlotMem::Gpu
+            } else {
+                SlotMem::Host(slots[slot].as_mut_bytes(frame_bytes))
+            };
+            let filled = fill(slot, mem)?;
             #[cfg(feature = "frame-checksums")]
-            if filled.source.is_none() {
+            if gpu.is_none() && filled.source.is_none() {
                 let out = slots[slot].as_mut_bytes(frame_bytes);
                 let sum: u32 = out.iter().map(|b| *b as u32).sum();
                 let nonzero = out.iter().filter(|b| **b != 0).count();
@@ -1149,6 +1209,7 @@ impl ServerLink {
         let (t2_unix_us, t2c_unix_us) = {
             let Tx::Rdma {
                 slots,
+                gpu,
                 remote,
                 qp,
                 send_cq,
@@ -1161,7 +1222,13 @@ impl ServerLink {
             let imm = imm_encode(seq, slot);
             let local = match source {
                 Some(s) => s,
-                None => slots[slot].post_slice(post_len),
+                None => {
+                    if let Some(g) = gpu.as_ref() {
+                        g.slices[slot].slice(..post_len)
+                    } else {
+                        slots[slot].post_slice(post_len)
+                    }
+                }
             };
             anyhow::ensure!(
                 local.len() == post_len,
@@ -1198,7 +1265,7 @@ impl ServerLink {
 
     fn send_frame_tcp(
         &mut self,
-        fill: impl FnOnce(usize, &mut [u8]) -> anyhow::Result<FrameFill>,
+        fill: impl FnOnce(usize, SlotMem<'_>) -> anyhow::Result<FrameFill>,
         t0_unix_us: u64,
         t0d: u64,
         t0p: u64,
@@ -1219,7 +1286,7 @@ impl ServerLink {
             // The fill may use the payload slots only; the trailing 16 bytes
             // are reserved for the in-place AES-GCM tag.
             let capacity = (*slot_len).min(buf.len());
-            let filled = fill(0, &mut buf.as_mut_slice()[..capacity])?;
+            let filled = fill(0, SlotMem::Host(&mut buf.as_mut_slice()[..capacity]))?;
             (filled, capacity)
         };
         if !filled.changed {
@@ -1453,7 +1520,7 @@ impl ServerLink {
 
     pub fn frame_bytes(&self) -> usize {
         match &self.tx {
-            Tx::Rdma { slots, .. } => slots.first().map(|m| m.len()).unwrap_or(0),
+            Tx::Rdma { frame_bytes, .. } => *frame_bytes,
             Tx::Tcp { slot_len, .. } => *slot_len,
         }
     }

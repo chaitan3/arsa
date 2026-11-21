@@ -22,7 +22,7 @@ cd "$(dirname "$(readlink -f "$0")")"
 #   --gpu-power           -> nvidia-smi clock floor (root)
 # Set CAPS to widen the set if you need those, e.g.
 #   CAPS=cap_sys_admin,cap_dac_override,cap_dac_read_search ./install.sh
-CAPS="${CAPS:-cap_sys_admin,cap_dac_override}"
+CAPS="${CAPS:-cap_sys_admin,cap_dac_override,cap_ipc_lock}"
 
 SERVER=target/release/arsa-server
 CLIENT=target/release/arsa-client
