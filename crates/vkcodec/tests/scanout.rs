@@ -132,6 +132,8 @@ fn scanout_roundtrip(
     *prev = Some((img, view));
 
     let n = enc.encode_scanout().expect("encode scanout");
+    assert!(enc.coded().is_empty(), "external scanout output must not allocate coded");
+    assert_eq!(enc.coded_capacity(), 0);
     let decoded = dec.decode(&out.as_slice()[..n]).expect("decode");
     if decoded != bytes {
         let i = decoded

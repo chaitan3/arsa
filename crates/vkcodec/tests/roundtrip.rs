@@ -21,6 +21,7 @@ fn vulkan_lossless_roundtrips_full_and_delta() {
     let mut dec = Decoder::new(geom).expect("cpu decoder");
 
     let n0 = enc.encode_host(&f0).expect("encode full");
+    assert_eq!(enc.coded_capacity(), geom.max_coded_len());
     let d0 = dec.decode(&enc.coded()[..n0]).expect("decode full");
     assert_eq!(d0, &f0[..], "full frame mismatch");
 
@@ -67,6 +68,8 @@ fn vulkan_lossless_direct_output_roundtrips() {
     let mut dec = Decoder::new(geom).expect("cpu decoder");
 
     let n0 = enc.encode_host(&f0).expect("encode full");
+    assert!(enc.coded().is_empty(), "external output must not allocate coded");
+    assert_eq!(enc.coded_capacity(), 0);
     let d0 = dec.decode(&out.as_slice()[..n0]).expect("decode full");
     assert_eq!(d0, &f0[..], "full frame mismatch");
 
@@ -121,6 +124,8 @@ fn vulkan_lossless_gpu_output_roundtrips() {
     let mut dec = Decoder::new(geom).expect("cpu decoder");
 
     let n0 = enc.encode_host(&f0).expect("encode full");
+    assert!(enc.coded().is_empty(), "GPU output must not allocate coded");
+    assert_eq!(enc.coded_capacity(), 0);
     core.one_shot(|cb| unsafe {
         core.device.cmd_pipeline_barrier(
             cb,

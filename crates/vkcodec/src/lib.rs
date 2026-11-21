@@ -6,15 +6,15 @@
 //! scanout-image variants at build time. The coded header is written by a
 //! second one-invocation dispatch, so the CPU never touches the payload.
 //!
-//! The coded output is a host-visible Vulkan buffer. The server can either
-//! register that buffer's mapped pointer as a pinned host MR (RDMA single
-//! copy) or, once the transport staging supports it, point at an exported
-//! device buffer (RDMA zero copy).
+//! The coded output can be an external host-visible or device buffer
+//! (`set_output`; the production server paths), or a lazily allocated internal
+//! host buffer for the no-external fallback and the host-input tests. The CPU
+//! `upload` buffer is likewise allocated only when `encode_host` is used.
 
 use std::ffi::CString;
 use std::sync::Arc;
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{bail, ensure, Context, Result};
 use rdma_display_codec::{Geometry, HEADER_LEN, INDEX_WORDS};
 use rdma_display_vkcore::{ash::vk, HostBuffer, VkCore};
 
@@ -32,9 +32,13 @@ pub struct Encoder {
     cur_mem: vk::DeviceMemory,
     reference: vk::Buffer,
     ref_mem: vk::DeviceMemory,
-    coded: HostBuffer,
+    /// internal coded output; allocated only when no external output is bound
+    coded: Option<HostBuffer>,
+    /// CPU upload buffer; allocated only for `encode_host`
+    upload: Option<HostBuffer>,
+    /// tiny valid buffer for the initial coded/header descriptors
+    placeholder: HostBuffer,
     counter: HostBuffer,
-    upload: HostBuffer,
     ssbo_pipe: vk::Pipeline,
     ssbo_layout: vk::PipelineLayout,
     ssbo_set_layout: vk::DescriptorSetLayout,
@@ -67,7 +71,6 @@ impl Encoder {
             "vkcodec shaders are compiled for 64 px tiles (tile_log2=6)"
         );
         let frame_bytes = geom.frame_bytes() as u64;
-        let coded_len = geom.max_coded_len() as u64;
         let pbase_words = ((HEADER_LEN + geom.tile_count() * INDEX_WORDS * 4) / 4) as u32;
 
         let (cur, cur_mem) = device_buffer(&core, frame_bytes)?;
@@ -78,9 +81,13 @@ impl Encoder {
             core.device.cmd_fill_buffer(cb, reference, 0, frame_bytes, 0);
         })?;
 
-        let coded = core.host_buffer(coded_len)?;
+        // Do not allocate the full coded/upload buffers here. The server
+        // binds an external output (GPU or host staging) for the production
+        // path; the internal `coded` is only needed by the fallback/tests.
+        // The descriptor sets still need a valid coded buffer, so bind a tiny
+        // placeholder until set_output() or the lazy coded allocation.
+        let placeholder = core.host_buffer(4)?;
         let counter = core.host_buffer(8)?;
-        let upload = core.host_buffer(frame_bytes)?;
 
         let ssbo_mod = shader_module(&core, SSBO_SPV)?;
         let image_mod = shader_module(&core, IMAGE_SPV)?;
@@ -151,16 +158,16 @@ impl Encoder {
             &core,
             ssbo_set,
             0,
-            &[cur, reference, coded.buffer, counter.buffer],
+            &[cur, reference, placeholder.buffer, counter.buffer],
         );
         // binding 0 is the combined image sampler, filled by set_scanout
         update_buffers(
             &core,
             image_set,
             1,
-            &[reference, coded.buffer, counter.buffer],
+            &[reference, placeholder.buffer, counter.buffer],
         );
-        update_buffers(&core, header_set, 0, &[coded.buffer, counter.buffer]);
+        update_buffers(&core, header_set, 0, &[placeholder.buffer, counter.buffer]);
 
         let sampler = unsafe {
             core.device.create_sampler(
@@ -185,9 +192,10 @@ impl Encoder {
             cur_mem,
             reference,
             ref_mem,
-            coded,
+            coded: None,
+            upload: None,
+            placeholder,
             counter,
-            upload,
             ssbo_pipe,
             ssbo_layout,
             ssbo_set_layout,
@@ -221,7 +229,8 @@ impl Encoder {
     }
 
     /// Encode a host frame (BGRA/XRGB bytes) and return the coded length.
-    /// The coded bytes are in [`coded`](Self::coded).
+    /// The coded bytes are in [`coded`](Self::coded) only when no external
+    /// output is bound; otherwise read the buffer passed to `set_output`.
     pub fn encode_host(&mut self, frame: &[u8]) -> Result<usize> {
         ensure!(
             frame.len() == self.geom.frame_bytes(),
@@ -229,9 +238,18 @@ impl Encoder {
             frame.len(),
             self.geom.frame_bytes()
         );
-        self.upload.as_mut_slice()[..frame.len()].copy_from_slice(frame);
+        self.ensure_output()?;
+        if self.upload.is_none() {
+            self.upload = Some(
+                self.core
+                    .host_buffer(self.geom.frame_bytes() as u64)
+                    .context("allocate host upload buffer")?,
+            );
+        }
+        let upload_buf = self.upload.as_mut().unwrap();
+        upload_buf.as_mut_slice()[..frame.len()].copy_from_slice(frame);
         let full = self.first;
-        let upload = self.upload.buffer;
+        let upload = upload_buf.buffer;
         let cur = self.cur;
         let frame_bytes = self.geom.frame_bytes() as u64;
         self.core.one_shot(|cb| unsafe {
@@ -255,13 +273,27 @@ impl Encoder {
     /// dispatch write directly into it, so the server never copies the coded
     /// payload.
     pub fn set_output(&mut self, buffer: vk::Buffer, capacity: usize) -> Result<()> {
+        let need = self
+            .coded
+            .as_ref()
+            .map(|c| c.size as usize)
+            .unwrap_or_else(|| self.geom.max_coded_len());
         ensure!(
-            capacity >= self.coded.size as usize,
-            "external coded buffer {capacity} < {}",
-            self.coded.size
+            capacity >= need,
+            "external coded buffer {capacity} < {need}"
         );
         if self.output == Some((buffer, capacity)) {
             return Ok(());
+        }
+        // An external output makes the internal coded buffer unnecessary.
+        // Drop it if a previous internal encode allocated it.
+        if self.coded.is_some() {
+            if let Some(c) = self.coded.take() {
+                unsafe {
+                    self.core.device.destroy_buffer(c.buffer, None);
+                    self.core.device.free_memory(c.memory, None);
+                }
+            }
         }
         update_buffers(&self.core, self.ssbo_set, 2, &[buffer]);
         update_buffers(&self.core, self.image_set, 2, &[buffer]);
@@ -296,6 +328,7 @@ impl Encoder {
         if self.scanout_view.is_none() {
             bail!("encode_scanout before set_scanout_image");
         }
+        self.ensure_output()?;
         let full = self.first;
         let n = self.dispatch(full, true)?;
         self.first = false;
@@ -308,18 +341,45 @@ impl Encoder {
         u32::from_ne_bytes(c[0..4].try_into().unwrap())
     }
 
-    /// The coded bytes (host-visible; valid until the next encode).
+    /// The internal coded bytes (host-visible; valid until the next encode).
+    /// Empty when an external output is bound and no internal coded buffer was
+    /// needed.
     pub fn coded(&self) -> &[u8] {
-        self.coded.as_slice()
+        self.coded
+            .as_ref()
+            .map(|c| c.as_slice())
+            .unwrap_or(&[])
     }
 
-    /// The mapped coded-buffer pointer for host-MR registration.
+    /// The mapped internal coded-buffer pointer for host-MR registration.
+    /// Null when the internal coded buffer was not allocated.
     pub fn coded_ptr(&self) -> *const u8 {
-        self.coded.ptr as *const u8
+        self.coded
+            .as_ref()
+            .map(|c| c.ptr as *const u8)
+            .unwrap_or(std::ptr::null())
     }
 
     pub fn coded_capacity(&self) -> usize {
-        self.coded.size as usize
+        self.coded.as_ref().map(|c| c.size as usize).unwrap_or(0)
+    }
+
+    /// Allocate the internal coded output on first use when no external output
+    /// is bound. The production server paths always bind an external output,
+    /// so they never allocate it.
+    fn ensure_output(&mut self) -> Result<()> {
+        if self.output.is_some() || self.coded.is_some() {
+            return Ok(());
+        }
+        let coded = self
+            .core
+            .host_buffer(self.geom.max_coded_len() as u64)
+            .context("allocate internal coded buffer")?;
+        update_buffers(&self.core, self.ssbo_set, 2, &[coded.buffer]);
+        update_buffers(&self.core, self.image_set, 2, &[coded.buffer]);
+        update_buffers(&self.core, self.header_set, 0, &[coded.buffer]);
+        self.coded = Some(coded);
+        Ok(())
     }
 
     fn dispatch(&self, full: bool, image: bool) -> Result<usize> {
@@ -440,9 +500,10 @@ impl Encoder {
         let cap = self
             .output
             .map(|(_, c)| c)
-            .unwrap_or(self.coded.size as usize);
+            .or_else(|| self.coded.as_ref().map(|c| c.size as usize))
+            .unwrap_or(0);
         ensure!(
-            len <= cap,
+            cap > 0 && len <= cap,
             "coded length {len} exceeds buffer {cap}"
         );
         Ok(len)
@@ -501,7 +562,12 @@ impl Drop for Encoder {
             dev.free_memory(self.cur_mem, None);
             dev.destroy_buffer(self.reference, None);
             dev.free_memory(self.ref_mem, None);
-            for b in [&self.coded, &self.counter, &self.upload] {
+            for b in [Some(&self.placeholder), Some(&self.counter)]
+                .into_iter()
+                .flatten()
+                .chain(self.coded.iter())
+                .chain(self.upload.iter())
+            {
                 dev.destroy_buffer(b.buffer, None);
                 dev.free_memory(b.memory, None);
             }
