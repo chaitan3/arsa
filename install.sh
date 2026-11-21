@@ -28,8 +28,25 @@ SERVER=target/release/arsa-server
 CLIENT=target/release/arsa-client
 LIBS=target/release/libpyrowave-shared.so
 DEST=${1:-/usr/local/bin}
+STAMP=target/release/.arsa-build-features
 # SKIP_BUILD=1 forces the cargo build to be skipped (e.g. the binaries were
 # built elsewhere, like a container, and this host only needs setcap/copy).
+#
+# The server's only default feature is the XDG portal source, which needs the
+# PipeWire development files. Build with it when available; otherwise install a
+# KMS/QEMU-only server. NO_PORTAL=1 forces the lean build.
+FEATURE_KEY=portal
+FEATURE_ARGS=()
+if [ "${NO_PORTAL:-0}" = "1" ]; then
+    FEATURE_KEY=no-portal
+    FEATURE_ARGS+=(--no-default-features)
+elif ! command -v pkg-config >/dev/null 2>&1 \
+    || ! pkg-config --exists libpipewire-0.3 2>/dev/null; then
+    FEATURE_KEY=no-portal
+    FEATURE_ARGS+=(--no-default-features)
+    echo "warning: libpipewire-0.3 development files not found;" >&2
+    echo "         building the server without --source portal" >&2
+fi
 
 # setcap live in /usr/sbin (Debian) or /sbin, which are not on a normal
 # user's PATH; resolve them explicitly rather than trusting PATH.
@@ -64,9 +81,11 @@ newest_mtime() {
 # Keep these in sync with crates/{server,client}/Cargo.toml.
 ROOT_FILES=(Cargo.toml Cargo.lock .cargo/config.toml)
 SERVER_CRATES=(crates/proto crates/capture crates/rdma crates/audio \
-    crates/codec crates/vkcore crates/vkcodec crates/lifecycle crates/server)
-CLIENT_CRATES=(crates/proto crates/rdma crates/audio crates/codec \
-    crates/codec-gpu crates/vkcore crates/lifecycle crates/client)
+    crates/auth crates/codec crates/vkcore crates/vkcodec crates/lifecycle \
+    crates/server)
+CLIENT_CRATES=(crates/proto crates/rdma crates/audio crates/auth \
+    crates/codec crates/codec-gpu crates/egl crates/vkcore crates/lifecycle \
+    crates/client)
 
 build_needed=1
 if [ "${SKIP_BUILD:-0}" = "1" ]; then
@@ -77,7 +96,11 @@ elif [ -x "$SERVER" ] && [ -x "$CLIENT" ]; then
     cli_src=$(newest_mtime "${CLIENT_CRATES[@]}" "${ROOT_FILES[@]}")
     srv=$(stat -c %Y "$SERVER" 2>/dev/null || echo 0)
     cli=$(stat -c %Y "$CLIENT" 2>/dev/null || echo 0)
-    if [ -n "$srv_src" ] && [ -n "$cli_src" ] \
+    stamp_ok=0
+    if [ -f "$STAMP" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$FEATURE_KEY" ]; then
+        stamp_ok=1
+    fi
+    if [ -n "$srv_src" ] && [ -n "$cli_src" ] && [ "$stamp_ok" = "1" ] \
         && [ "$srv" -ge "$srv_src" ] && [ "$cli" -ge "$cli_src" ]; then
         echo "==> binaries are newer than the sources; skipping cargo build"
         build_needed=0
@@ -85,11 +108,15 @@ elif [ -x "$SERVER" ] && [ -x "$CLIENT" ]; then
 fi
 
 if [ "$build_needed" = "1" ]; then
-    echo "==> cargo build --release (server + client)"
-    cargo build --release -p rdma-display-server -p rdma-display-client
+    echo "==> cargo build --release ${FEATURE_ARGS[*]} (server + client)"
+    cargo build --release -p rdma-display-server "${FEATURE_ARGS[@]}"
+    cargo build --release -p rdma-display-client
+    mkdir -p target/release
+    printf '%s\n' "$FEATURE_KEY" > "$STAMP"
 fi
 
 [ -x "$SERVER" ] || { echo "error: $SERVER not built" >&2; exit 1; }
+[ -x "$CLIENT" ] || { echo "error: $CLIENT not built" >&2; exit 1; }
 
 # File capabilities are ignored on a filesystem mounted nosuid.
 if command -v findmnt >/dev/null 2>&1 \
@@ -98,13 +125,29 @@ if command -v findmnt >/dev/null 2>&1 \
 fi
 
 echo "Copying release to $DEST"
-cp $SERVER $DEST
-cp $CLIENT $DEST
+if [ -d "$DEST" ] && [ -w "$DEST" ]; then
+    COPY=(cp)
+elif [ ! -e "$DEST" ] && [ -w "$(dirname "$DEST")" ]; then
+    mkdir -p "$DEST"
+    COPY=(cp)
+else
+    echo "==> $DEST is not writable; using sudo"
+    sudo install -d "$DEST"
+    COPY=(sudo cp)
+fi
+"${COPY[@]}" "$SERVER" "$DEST/"
+"${COPY[@]}" "$CLIENT" "$DEST/"
 if [ -f "$LIBS" ]; then
-    cp $LIBS $DEST
+    # Follow the target/release symlink; install both the plain name and the
+    # library SONAME so dlopen finds it before any system copy.
+    "${COPY[@]}" -L "$LIBS" "$DEST/libpyrowave-shared.so"
+    "${COPY[@]}" -L "$LIBS" "$DEST/libpyrowave-shared.so.0"
 else
     echo "warning: $LIBS not found — the lossy codec will be unavailable" >&2
     echo "         (build it with scripts/build-pyrowave-docker.sh)" >&2
+fi
+if [ "$FEATURE_KEY" = "no-portal" ]; then
+    echo "note: installed server has no --source portal (PipeWire dev files missing)" >&2
 fi
 
 echo "==> setcap $CAPS+ep $DEST/arsa-server"

@@ -74,14 +74,22 @@ process as root:
 ./install.sh
 ```
 
-It must be run as your **normal user** (it calls `sudo setcap` internally).
-File capabilities live on the inode, so **re-run `install.sh` after every
-rebuild** — otherwise the server loses the capability.
+It must be run as your **normal user** (it calls `sudo setcap` internally,
+and uses `sudo` only for `/usr/local/bin` and the capability). File
+capabilities live on the inode, so **re-run `install.sh` after every rebuild** —
+otherwise the server loses the capability.
+
+The server's default build includes the XDG portal source. If the PipeWire
+development files are missing (`libpipewire-0.3`), `install.sh` automatically
+builds a KMS/QEMU-only server and says so; set `NO_PORTAL=1` to force that
+without the warning. Install `libpipewire-0.3-dev` (then re-run) to get
+`--source portal` back.
 
 Manual equivalent:
 
 ```bash
-cargo build --release -p rdma-display-server -p rdma-display-client
+cargo build --release -p rdma-display-server   # add --no-default-features without PipeWire
+cargo build --release -p rdma-display-client
 sudo setcap cap_sys_admin+ep target/release/arsa-server
 ```
 
