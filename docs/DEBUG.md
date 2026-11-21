@@ -245,6 +245,15 @@ exports). On the test client (RTX-class NVIDIA, open module 615.71, KWin
   structure while abandoning VRAM landing; in the end the production path is
   simply `--slot-mem host` (pinned RAM).
 
+**Retrying the GBM→MR route.** `cargo test -p rdma-display-rdma --test
+gbm_dmabuf_mr -- --ignored --nocapture` allocates a linear XR24 GBM bo on a DRM
+render node, exports it as a dma-buf, registers it with `ibv_reg_dmabuf_mr`,
+self-loopback RDMA-WRITEs into it, and (when the exporter allows a CPU mapping)
+verifies the bytes. It prints `skip:` when libgbm, a DRM node, an RDMA device or
+a routable GID is missing. `ARSA_DRM_NODE` / `ARSA_IB_DEVICE` pick a specific
+node/device — on a multi-GPU client point `ARSA_DRM_NODE` at the NVIDIA render
+node.
+
 **PCIe ordering note.** With a GPU-BAR destination, the CQE (a posted write to
 host RAM) can land before the last frame bytes (posted writes to the BAR) —
 PCIe does not order posted writes across destinations. The mitigation is a
