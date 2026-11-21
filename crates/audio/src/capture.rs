@@ -216,8 +216,18 @@ fn in_process_loop(pulse: Pulse, dev: String, mbox: Mailbox, stop: Stop) {
                         last_report = std::time::Instant::now();
                     }
                 }, &mut seq, &stop) {
-                    Ok(()) => log::debug!("[audio] capture stream ended; reopening in 2 s"),
-                    Err(e) => log::debug!("[audio] capture read failed: {e:#}; reopening in 2 s"),
+                    Ok(()) => {
+                        // the preflight probe stops the stream deliberately;
+                        // do not claim we are reopening when we are shutting down
+                        if !stop.stopped() {
+                            log::debug!("[audio] capture stream ended; reopening in 2 s");
+                        }
+                    }
+                    Err(e) => {
+                        if !stop.stopped() {
+                            log::debug!("[audio] capture read failed: {e:#}; reopening in 2 s");
+                        }
+                    }
                 }
             }
             Err(e) => log::debug!("[audio] capture open failed ({dev:?}): {e:#}; retrying in 2 s"),

@@ -68,9 +68,9 @@ fn with_default_port(s: &str) -> String {
 fn init_logging(verbose: bool) {
     use std::io::Write as _;
     let default = if verbose {
-        "warn,rdma_display=debug"
+        "warn,rdma_display=debug,arsa_server=debug"
     } else {
-        "warn,rdma_display=info"
+        "warn,rdma_display=info,arsa_server=info"
     };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default))
         .format(|buf, record| writeln!(buf, "[{}] {}", record.level(), record.args()))
