@@ -312,6 +312,12 @@ impl Encoder {
         Ok(n)
     }
 
+    /// Changed tiles in the last encode (0 = an idle delta).
+    pub fn last_count(&self) -> u32 {
+        let c = self.counter.as_slice();
+        u32::from_ne_bytes(c[0..4].try_into().unwrap())
+    }
+
     /// The coded bytes (host-visible; valid until the next encode).
     pub fn coded(&self) -> &[u8] {
         self.coded.as_slice()

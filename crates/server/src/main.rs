@@ -10,10 +10,6 @@
 //!     --source qemu           QEMU dbus display capture (the guest):
 //!             --materialize egl    GPU blit+readback (default, gl=on)
 //!             --materialize plain  D-Bus host-memory scanouts (gl=off)
-//!             --readback pbo       zero-copy staging: GL readback DMA fills
-//!                                  persistent-mapped PBOs registered as RDMA
-//!                                  slots (default for egl); "direct" = legacy
-//!                                  readPixels path
 //!             --input qemu         inject into the guest console (default)
 //!     --codec lossless (default)|raw|lossy  frame coding (lossless =
 //!             tile-delta against the previous frame; raw = unchanged wire;
@@ -94,7 +90,6 @@ fn main() -> Result<()> {
     let mut rendernode: Option<String> = None;
     let mut drm_card: Option<String> = None;
     let mut input_test = false;
-    let mut readback: String = "pbo".to_string();
     let mut audio = true;
     let mut audio_device: Option<String> = None;
     let mut audio_helper = false;
@@ -146,7 +141,6 @@ fn main() -> Result<()> {
             }
             "--console" => console = args.next().expect("--console needs a value").parse()?,
             "--materialize" => materialize = args.next().expect("--materialize needs a value"),
-            "--readback" => readback = args.next().expect("--readback needs a value"),
             "--rendernode" => rendernode = Some(args.next().expect("--rendernode needs a value")),
             "--drm-card" => drm_card = Some(args.next().expect("--drm-card needs a value")),
             "--capture-sync" => {
@@ -229,8 +223,8 @@ fn main() -> Result<()> {
 capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS capture, the host — requires sudo/CAP_SYS_ADMIN, kernel >= 5.8; portal = XDG Desktop Portal ScreenCast over PipeWire — needs a session bus and a portal backend, and needs no root)\n  \
   --input qemu|uinput (default auto: qemu↔qemu-dbus, drm↔uinput, portal↔uinput)\n  \
   qemu: [--dbus-socket /path/dbus.sock] [--console 0]   drm: [--drm-card /dev/dri/cardN] (default: first card0..card8 with an active scanout)\n  \
-  [--materialize egl|plain] [--rendernode /dev/dri/renderD128] [--readback pbo|direct] [--input-test]\n  \
-  --materialize egl (default) imports the dmabuf and reads the frame back for raw/lossy and for the CPU/readback lossless fallback; GPU lossless bypasses the readback entirely and encodes straight from the imported dmabuf (no full-frame readback, no re-upload). --readback pbo|direct only affects that readback path.\n  \
+  [--materialize egl|plain] [--rendernode /dev/dri/renderD128] [--input-test]\n  \
+  --materialize egl (default) imports the dmabuf and reads it back for raw/lossy; GPU lossless encodes straight from the imported dmabuf (no full-frame readback). plain = D-Bus host-memory scanouts (qemu gl=off).\n  \
   --capture-sync auto|settle[:ms]|fence  (drm) when to capture, on top of the 1 ms poll that emits only when the plane's fb changes: auto (default) and fence read the current frame when the compositor's per-frame completion fence signals (tracefs; ~1 ms, tear-free, needs root), falling back to settle:2ms while the watch calibrates or if tracefs is unavailable; settle[:ms] = emit the current fb ms after its commit (default 2 ms; usually complete, but frames whose render outlasts the window tear)\n  \
   --pace auto|latency|smooth  frame pacing: the server's flow-control window — how many frames it keeps in flight ahead of the client's display. The client credits one frame per present, which paces both TCP and RDMA. auto (default) sizes the window from the measured link (ceil(turnaround / source frame period): keeps the pipe full without queueing); latency = 1 (present-paced, lowest latency, may stall if the link is slower than the display); smooth = the transport maximum (smoothest cadence, highest latency).\n  \
   --codec auto|raw|lossless|lossy  frame coding for the whole session (default auto = honour the client's Hello preference, else lossless). raw = unchanged wire; lossless = v2 tile-delta against the previous frame (desktop-friendly); lossy = PyroWave intra-only GPU codec (needs libpyrowave-shared.so). A non-auto value forces the codec. Build server and client together (lossless v2 is a wire-format version).\n  \
@@ -307,7 +301,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
         "testcard" => run_testcard_server(rdma_ref, transport, &listen, slots, fps),
         "capture" => run_capture(
             rdma_ref, transport, &source, input.as_deref(), &dbus_socket, console, &drm_card,
-            &materialize, rendernode.as_deref(), &listen, slots, fps, input_test, &readback,
+            &materialize, rendernode.as_deref(), &listen, slots, fps, input_test,
             capture_sync, audio, audio_device.as_deref(), codec, codec_auto, lossy_mbps,
             lossy_chroma444, &display_control, display_output.as_deref(), idle_metrics, pace,
             no_encrypt,
@@ -923,7 +917,6 @@ fn run_capture(
     slots: usize,
     fps: u64,
     input_test: bool,
-    readback: &str,
     capture_sync: CaptureSync,
     audio: bool,
     audio_device: Option<&str>,
@@ -1055,7 +1048,6 @@ fn run_capture(
         codec_auto,
         lossy_budget,
         lossy_chroma444,
-        gl.as_ref(),
         capture_connector.as_deref(),
     );
     if let Some(m) = geometry.as_ref() {
@@ -1774,19 +1766,18 @@ fn run_capture(
                         slot_len,
                         meta.frame_bytes
                     );
-                    // zero-copy staging (PBO readback): bind the materializer's
-                    // persistent-mapped PBOs as the staging slots; None = fall
-                    // back to verbs-allocated slots + direct readback
+                    // PBO staging: bind the materializer's persistent-mapped
+                    // PBOs as the staging slots; None = fall back to
+                    // verbs-allocated slots.
                     let external = if rdma.is_some()
                         && transport != rdma_display_rdma::TransportPref::Tcp
                         && session_codec != rdma_display_codec::Codec::Lossy
-                        && readback == "pbo"
                         && materialize == "egl"
                     {
                         match mat.bind_staging(slots, slot_len) {
                             Some(v) => Some(v),
                             None => {
-                                log::warn!("[server] PBO staging unavailable — direct readback slots");
+                                log::warn!("[server] PBO staging unavailable — verbs-allocated slots");
                                 None
                             }
                         }
@@ -1838,11 +1829,7 @@ fn run_capture(
                                 meta.height,
                                 meta.stride,
                                 meta.frame_bytes as usize,
-                                gl.as_ref(),
                             )?;
-                            // configure may have created/activated the shared
-                            // GL context; restore the materializer's view
-                            mat.activate()?;
                             frame_dirty = true;
                             pipelined_capable = external.is_some()
                                 && link.transport() == rdma_display_rdma::Transport::Rdma;
@@ -1919,9 +1906,7 @@ fn run_capture(
                                 fmt.height,
                                 fmt.stride,
                                 fmt.frame_bytes() as usize,
-                                gl.as_ref(),
                             )?;
-                            mat.activate()?;
                         }
                         // Lossless on the GPU: import the scanout into the
                         // encoder and encode straight from GPU memory. When this
@@ -1938,21 +1923,22 @@ fn run_capture(
                                 Err(e) => {
                                     if !fc.scanout_warned {
                                         log::warn!(
-                                            "[server] lossless texture-direct unavailable ({e:#}); using readback+encode"
+                                            "[server] lossless Vulkan scanout import failed ({e:#}); waiting for a usable scanout"
                                         );
                                         fc.scanout_warned = true;
                                     }
                                     fc.clear_scanout();
                                 }
                             }
-                            // set_scanout made the codec's EGL context current
-                            mat.activate()?;
                         }
                         if texture_ok {
                             have_frame = true;
+                        } else if session_codec == rdma_display_codec::Codec::Lossless {
+                            // The texture-direct path is the only lossless path.
+                            // Without it there is no readback/CPU fallback; wait
+                            // for a scanout the Vulkan encoder can import.
                         } else {
-                            // materializer path: raw/lossy, or the lossless
-                            // fallback (readback + encode)
+                            // raw/lossy share the materializer
                             mat.activate()?;
                             match mat.prepare(&fmt, Some(&d)) {
                                 Ok(()) => {
@@ -2032,12 +2018,7 @@ fn run_capture(
                         if fc.uses_scanout() {
                             // lossless texture-direct: encode from the imported
                             // dmabuf, write the coded delta into the slot
-                            let r = fc.encode_scanout(out)?;
-                            // the codec's EGL context is current; restore ours
-                            let t = std::time::Instant::now();
-                            mat.activate()?;
-                            fc.mat_activate_us = t.elapsed().as_micros() as u64;
-                            return Ok(r);
+                            return fc.encode_scanout(out);
                         }
                         let (changed, t) = mat.copy_frame(out)?;
                         if !changed {
@@ -2045,12 +2026,7 @@ fn run_capture(
                         }
                         let n = match mat.coded_len() {
                             Some(n) => n,
-                            None => {
-                                let n = fc.encode_in_place(out)?;
-                                // GPU encode leaves its own EGL context current
-                                mat.activate()?;
-                                n
-                            }
+                            None => fc.encode_in_place(out)?,
                         };
                         Ok((true, n, t))
                     },
@@ -2121,11 +2097,7 @@ fn run_capture(
                 }
                 // compress the raw frame now that it is in the pinned slot
                 let post_len = match fc.encode_in_place(out) {
-                    Ok(n) => {
-                        // GPU encode leaves its own EGL context current
-                        mat.activate()?;
-                        n
-                    }
+                    Ok(n) => n,
                     Err(e) => {
                         log::warn!("[server] encode failed: {e:#}");
                         session = None;
@@ -2178,82 +2150,47 @@ fn run_capture(
 
 /// In-place frame coding for the RDMA staging slot. `raw` is a pass-through
 /// (post the whole frame, no header). `lossless` runs the tile-delta encoder
-/// on the GPU (`rdma-display-codec-gpu`, GLES 3.1 compute) against the frame
-/// the materializer just read back; the CPU reference encoder is kept as a
-/// fallback when the GPU codec can't be created. The encoder's reference is
-/// reset in `configure` (once per session, and on a geometry change) so the
-/// first frame a new client receives is always full.
-///
-/// The GPU encoder owns its own EGL context, so after it has run on the server
-/// thread the caller must restore the materializer's context via
-/// [`FrameMaterializer::activate`](rdma_display_capture::FrameMaterializer::activate).
+/// on the GPU (Vulkan compute, `rdma-display-vkcodec`); the CPU reference
+/// encoder is the fallback when Vulkan or the dma-buf import is unavailable.
+/// The encoder's reference is reset in `configure` (once per session, and on a
+/// geometry change) so the first frame a new client receives is always full.
 struct FrameCodec {
-    /// GPU lossless encoder (GLES compute); None = use the CPU encoder.
-    gpu: Option<rdma_display_codec_gpu::GpuCodec>,
-    /// CPU reference encoder: the fallback path.
-    enc: Option<rdma_display_codec::Encoder>,
-    buf: Vec<u8>,
+    /// Vulkan lossless encoder; None for raw.
+    vk: Option<rdma_display_vkcodec::Encoder>,
     frame_bytes: usize,
     geom: Option<rdma_display_codec::Geometry>,
     /// the next encode must be a full frame (new session / new geometry)
     first: bool,
-    /// lossless GPU: a scanout dmabuf is imported for texture-direct encode
-    /// (no readback/re-upload). False = use the readback+encode path.
+    /// a scanout dmabuf is imported for texture-direct encode
     scanout: bool,
     /// set once the texture-direct import failed (avoid per-frame log spam)
     scanout_warned: bool,
-    /// periodic texture-direct breakdown: [activate, blit, encode, ref, copy,
-    /// mat_restore] in µs for the last interval (reported as a p50)
-    stat_buf: Vec<[u64; 6]>,
-    /// time the caller spent restoring the materializer context last frame
-    mat_activate_us: u64,
-    /// import-cache hit/miss counters (cumulative)
-    import_hits: u64,
-    import_misses: u64,
-    /// one-shot startup benchmark: iterations left (RDMA_LOSSLESS_BENCH=N)
-    bench_left: u32,
-    /// run the memprobe every N encodes (0 = off; RDMA_MEMPROBE=N)
-    memprobe_every: u32,
-    enc_frames: u64,
+    /// identity of the imported scanout buffer (skip a re-import)
+    scanout_key: Option<(u64, u32, u32, u64, u32, u32, u32)>,
 }
 
 impl FrameCodec {
     fn new() -> Self {
         Self {
-            gpu: None,
-            enc: None,
-            buf: Vec::new(),
+            vk: None,
             frame_bytes: 0,
             geom: None,
             first: true,
             scanout: false,
             scanout_warned: false,
-            stat_buf: Vec::new(),
-            mat_activate_us: 0,
-            import_hits: 0,
-            import_misses: 0,
-            bench_left: std::env::var("RDMA_LOSSLESS_BENCH")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            memprobe_every: std::env::var("RDMA_MEMPROBE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            enc_frames: 0,
+            scanout_key: None,
         }
     }
 
     /// Drop per-session encoder state so an idle server holds no codec
     /// buffers; the next session reconfigures.
     fn teardown(&mut self) {
-        self.gpu = None;
-        self.enc = None;
+        self.vk = None;
         self.geom = None;
         self.first = true;
         self.scanout = false;
+        self.scanout_key = None;
         self.frame_bytes = 0;
-        self.buf.clear();
     }
 
     fn configure(
@@ -2263,40 +2200,23 @@ impl FrameCodec {
         height: u32,
         stride: u32,
         frame_bytes: usize,
-        gl: Option<&Arc<rdma_display_egl::SharedContext>>,
     ) -> Result<()> {
         self.frame_bytes = frame_bytes;
         self.geom = None;
-        self.gpu = None;
-        self.enc = None;
+        self.vk = None;
         self.first = true;
         self.scanout = false;
+        self.scanout_key = None;
         match codec {
             rdma_display_codec::Codec::Raw | rdma_display_codec::Codec::Lossy => {}
             rdma_display_codec::Codec::Lossless => {
                 let geom = rdma_display_codec::Geometry::new(width, height, stride);
-                self.buf.resize(geom.max_coded_len(), 0);
                 self.geom = Some(geom);
-                let gpu = match gl {
-                    Some(gl) => rdma_display_codec_gpu::GpuCodec::new_shared(geom, gl.clone()),
-                    None => rdma_display_codec_gpu::GpuCodec::new(geom),
-                };
-                match gpu {
-                    Ok(g) => {
-                        log::info!("[server] lossless encoder: GPU (GLES compute)");
-                        self.gpu = Some(g);
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "[server] lossless encoder: GPU unavailable ({e:#}); falling back to CPU"
-                        );
-                        let mut e = rdma_display_codec::Encoder::new(geom)?;
-                        // streaming path: the payload CRC costs tens of ms on a
-                        // full frame and RC RDMA already guarantees delivery
-                        e.set_crc(false);
-                        self.enc = Some(e);
-                    }
-                }
+                self.vk = Some(
+                    rdma_display_vkcodec::Encoder::new(geom)
+                        .context("lossless Vulkan encoder (no CPU fallback)")?,
+                );
+                log::info!("[server] lossless encoder: GPU (Vulkan compute)");
             }
         }
         Ok(())
@@ -2313,61 +2233,42 @@ impl FrameCodec {
     }
 
     /// Encode `slot[..frame_bytes]` in place; returns the number of bytes to
-    /// post (coded length, or `frame_bytes` for raw). When the GPU encoder
-    /// ran, the materializer's GL context must be restored afterwards.
+    /// post (coded length, or `frame_bytes` for raw).
     fn encode_in_place(&mut self, slot: &mut [u8]) -> Result<usize> {
-        if let Some(gpu) = self.gpu.as_mut() {
-            let full = self.first;
-            gpu.activate()?;
-            gpu.upload(&slot[..self.frame_bytes])?;
-            let n = gpu.encode(full)?;
-            // advance the encoder's reference to the frame just coded, so the
-            // next encode deltas against it (the decode pass writes the coded
-            // tiles back into the reference buffer)
-            gpu.update_reference()?;
-            ensure!(
-                n <= slot.len(),
-                "coded frame {n} exceeds staging slot {}",
-                slot.len()
-            );
-            let coded = gpu.coded(n);
-            slot[..n].copy_from_slice(coded);
-            self.first = false;
-            return Ok(n);
-        }
-        let Some(enc) = self.enc.as_mut() else {
+        let Some(vk) = self.vk.as_mut() else {
+            // raw has no codec; lossless always installs the Vulkan encoder
             return Ok(self.frame_bytes);
         };
-        let n = enc.encode(&slot[..self.frame_bytes], &mut self.buf)?;
+        let n = vk.encode_host(&slot[..self.frame_bytes])?;
         ensure!(
             n <= slot.len(),
             "coded frame {n} exceeds staging slot {}",
             slot.len()
         );
-        slot[..n].copy_from_slice(&self.buf[..n]);
+        slot[..n].copy_from_slice(&vk.coded()[..n]);
+        self.first = false;
         Ok(n)
     }
 
     fn has_gpu(&self) -> bool {
-        self.gpu.is_some()
+        self.vk.is_some()
     }
 
     /// Whether the texture-direct path is active for this frame.
     fn uses_scanout(&self) -> bool {
-        self.scanout && self.gpu.is_some()
+        self.scanout && self.vk.is_some()
     }
 
     fn clear_scanout(&mut self) {
         self.scanout = false;
+        self.scanout_key = None;
     }
 
-    /// Import the scanout dmabuf into the GPU encoder so [`encode_scanout`]
-    /// encodes straight from GPU memory — the readback to host and the
-    /// re-upload are both skipped. Errors are returned so the caller keeps the
-    /// readback+encode path (and only warns once).
+    /// Import the scanout dmabuf into the Vulkan encoder so
+    /// [`encode_scanout`](Self::encode_scanout) samples it directly.
     fn set_scanout(&mut self, d: &rdma_display_capture::DmabufScanout) -> Result<()> {
-        let Some(gpu) = self.gpu.as_mut() else {
-            anyhow::bail!("no GPU encoder");
+        let Some(vk) = self.vk.as_mut() else {
+            anyhow::bail!("no Vulkan encoder");
         };
         if d.fds.len() != 1 {
             anyhow::bail!(
@@ -2375,214 +2276,100 @@ impl FrameCodec {
                 d.fds.len()
             );
         }
-        use std::os::fd::AsRawFd;
-        gpu.set_scanout(&rdma_display_codec_gpu::DmabufImage {
-            key: d.buf_id,
-            fd: d.fds[0].as_raw_fd(),
-            offset: d.offsets.first().copied().unwrap_or(0),
-            stride: d.strides.first().copied().unwrap_or(d.format.stride),
-            fourcc: d.format.fourcc,
-            modifier: d.format.modifier,
-            width: d.format.width,
-            height: d.format.height,
+        let stride = d.strides.first().copied().unwrap_or(d.format.stride);
+        let offset = d.offsets.first().copied().unwrap_or(0);
+        let key = (
+            d.buf_id,
+            d.format.width,
+            d.format.height,
+            d.format.modifier,
+            stride,
+            offset,
+            d.format.fourcc,
+        );
+        // buf_id 0 means "no stable identity" (e.g. QEMU): re-import.
+        if d.buf_id != 0 && self.scanout_key == Some(key) {
+            return Ok(());
+        }
+        let format = lossy::fourcc_to_vk(d.format.fourcc).with_context(|| {
+            format!(
+                "unsupported scanout fourcc {:#010x} for the Vulkan lossless encoder",
+                d.format.fourcc
+            )
         })?;
-        let (h, m) = gpu.cache_stats();
-        self.import_hits = h;
-        self.import_misses = m;
+        // The image shader packs the sampled RGBA8 word; 10-bit scanouts must
+        // take the readback path.
+        use rdma_display_vkcore::ash::vk;
+        if !matches!(
+            format,
+            vk::Format::B8G8R8A8_UNORM | vk::Format::R8G8B8A8_UNORM
+        ) {
+            anyhow::bail!(
+                "scanout fourcc {:#010x} is not 8-bit BGRA/RGBA; the Vulkan lossless path cannot import it",
+                d.format.fourcc
+            );
+        }
+        use std::os::fd::AsRawFd;
+        vk.set_scanout(
+            d.fds[0].as_raw_fd(),
+            d.format.width,
+            d.format.height,
+            format,
+            d.format.modifier,
+            offset,
+            stride,
+        )?;
+        self.scanout_key = Some(key);
         if !self.scanout {
             log::debug!(
-                "[server] lossless texture-direct: {} scanout (modifier={:#x}) — no readback/re-upload",
-                if gpu.has_fetch_encode() {
-                    "linear → texelFetch"
-                } else {
-                    "tiled → external sampler"
-                },
-                d.format.modifier,
+                "[server] lossless Vulkan: scanout imported (modifier={:#x})",
+                d.format.modifier
             );
         }
         self.scanout = true;
         Ok(())
     }
 
-    /// Texture-direct lossless encode: blit the imported scanout into the
-    /// encoder's RGBA8 source image, encode against the reference, and write
-    /// the coded delta into the staging slot. `changed` follows the encoder's
-    /// changed-tile count (0 = idle delta, nothing to send). The codec's EGL
-    /// context is left current; the caller restores the materializer's.
+    /// Vulkan texture-direct encode. `changed` follows the changed-tile
+    /// count; a zero-tile delta is not sent.
     fn encode_scanout(
         &mut self,
         out: &mut [u8],
     ) -> Result<(bool, usize, rdma_display_proto::MatTimes)> {
         let full = self.first;
-        let Some(gpu) = self.gpu.as_mut() else {
-            anyhow::bail!("no GPU encoder");
+        let Some(vk) = self.vk.as_mut() else {
+            anyhow::bail!("no Vulkan encoder");
         };
         let t = std::time::Instant::now();
-        gpu.activate()?;
-        let act = t.elapsed();
-        // source path: linear scanout -> texelFetch (fast); else the external
-        // sampler (no blit either way); else blit + image encode
-        let fetch = gpu.has_fetch_encode();
-        let ext = gpu.has_ext_encode();
-        let t = std::time::Instant::now();
-        if !fetch && !ext {
-            gpu.blit_source()?;
-        }
-        let blit = t.elapsed();
-        let t = std::time::Instant::now();
-        let n = if fetch {
-            gpu.encode_fetch(full)?
-        } else if ext {
-            gpu.encode_ext(full)?
-        } else {
-            gpu.encode_tex(full)?
-        };
+        let n = vk.encode_scanout()?;
         let enc = t.elapsed();
-        let count = gpu.last_count();
+        let count = vk.last_count();
         let changed = full || count > 0;
-        let t = std::time::Instant::now();
         if changed {
-            // The encode shader advances the reference in-pass (it writes each
-            // coded tile's words back into `ref`), so there is no separate
-            // decode-to-reference pass: the previous ref up-call was a second
-            // pass over the coded payload (a PCIe read for every changed tile).
             self.first = false;
         }
-        let rf = t.elapsed();
         anyhow::ensure!(
             n <= out.len(),
             "coded frame {n} exceeds staging slot {}",
             out.len()
         );
         let t = std::time::Instant::now();
-        let coded = gpu.coded(n);
-        out[..n].copy_from_slice(coded);
+        out[..n].copy_from_slice(&vk.coded()[..n]);
         let copy = t.elapsed();
-        if self.bench_left > 0 {
-            let n_iter = self.bench_left;
-            self.bench_left = 0;
-            self.bench_scanout_read(n_iter)?;
-        }
-        self.enc_frames += 1;
-        if self.memprobe_every > 0 && self.enc_frames % self.memprobe_every as u64 == 0 {
-            eprintln!(
-                "[memprobe] --- encode #{} | gpu: {} ---",
-                self.enc_frames,
-                gpu_clocks()
-            );
-            if let Some(gpu) = self.gpu.as_mut() {
-                gpu.memprobe()?;
-            }
-        }
-        self.stat_buf.push([
-            act.as_micros() as u64,
-            blit.as_micros() as u64,
-            enc.as_micros() as u64,
-            rf.as_micros() as u64,
-            copy.as_micros() as u64,
-            self.mat_activate_us,
-        ]);
-        if self.stat_buf.len() >= 120 {
-            let mut med = [0u64; 6];
-            let mut mx = [0u64; 6];
-            for c in 0..6 {
-                let mut v: Vec<u64> = self.stat_buf.iter().map(|r| r[c]).collect();
-                v.sort_unstable();
-                med[c] = v[v.len() / 2];
-                mx[c] = v[v.len() - 1];
-            }
-            let sum: u64 = med.iter().sum();
-            log::debug!(
-                "[server] lossless texture p50/xmax us: activate={}/{} blit={}/{} encode={}/{} ref={}/{} copy={}/{} mat_restore={}/{} | p50 sum={} | import hit={} miss={} | tiles={} coded={} B",
-                med[0], mx[0], med[1], mx[1], med[2], mx[2], med[3], mx[3],
-                med[4], mx[4], med[5], mx[5], sum,
-                self.import_hits, self.import_misses, count, n,
-            );
-            self.stat_buf.clear();
-        }
         Ok((
             changed,
             n,
             rdma_display_proto::MatTimes::new(
                 rdma_display_proto::MatKind::Lossless,
-                [
-                    act.as_micros() as u64,
-                    blit.as_micros() as u64,
-                    enc.as_micros() as u64,
-                    rf.as_micros() as u64,
-                    copy.as_micros() as u64,
-                    // context restore is measured after this returns; report the
-                    // running value (same staleness as the p50 line above)
-                    self.mat_activate_us,
-                ],
+                [0, 0, enc.as_micros() as u64, 0, copy.as_micros() as u64, 0],
             ),
         ))
-    }
-
-    /// One-shot startup diagnostic (`RDMA_LOSSLESS_BENCH=N`): time N
-    /// detection-only reads of the imported real scanout through the active
-    /// path, after the first frame has seeded the reference. Compare with
-    /// `codecbench --gbm` (a synthetic tiled dma-buf) to see whether the cost
-    /// is the tiled layout or the compositor's buffer itself.
-    fn bench_scanout_read(&mut self, n: u32) -> Result<()> {
-        let Some(gpu) = self.gpu.as_mut() else {
-            return Ok(());
-        };
-        gpu.activate()?;
-        let path = if gpu.has_fetch_encode() {
-            "fetch"
-        } else if gpu.has_ext_encode() {
-            "ext"
-        } else {
-            "blit+tex"
-        };
-        let mut us = Vec::with_capacity(n as usize);
-        for _ in 0..n {
-            gpu.sync();
-            let t = std::time::Instant::now();
-            match path {
-                "fetch" => {
-                    gpu.encode_fetch(false)?;
-                }
-                "ext" => {
-                    gpu.encode_ext(false)?;
-                }
-                _ => {
-                    gpu.blit_source()?;
-                    gpu.encode_tex(false)?;
-                }
-            }
-            us.push(t.elapsed().as_micros() as u64);
-        }
-        us.sort_unstable();
-        log::debug!(
-            "[server] real-scanout read bench (path={path}, n={n}): p50={}us min={}us max={}us",
-            us[us.len() / 2],
-            us[0],
-            us[us.len() - 1],
-        );
-        Ok(())
     }
 }
 
 /// Input-connection worker: validate the session nonce, forward input events
 /// to the injection sink, and release everything the client held when the
 /// socket dies — a network blip must never leave a key stuck down.
-/// Best-effort GPU clocks/power for the memprobe, to spot throttling.
-fn gpu_clocks() -> String {
-    std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=clocks.sm,clocks.mem,pstate,temperature.gpu,power.draw,utilization.gpu",
-            "--format=csv,noheader",
-        ])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "n/a".to_string())
-}
-
 fn serve_input(
     stream: std::net::TcpStream,
     encrypt: bool,
@@ -2986,7 +2773,6 @@ fn preflight(
     codec_auto: bool,
     lossy_budget: usize,
     lossy_chroma444: bool,
-    gl: Option<&Arc<rdma_display_egl::SharedContext>>,
     drm_connector: Option<&str>,
 ) -> Option<DisplayMeta> {
     let mut geometry = None;
@@ -3016,22 +2802,16 @@ fn preflight(
         _ => {}
     }
 
-    // 2. lossless GPU encoder (shader compile + buffers) on the shared context
+    // 2. lossless GPU encoder (Vulkan compute: SPIR-V shaders + buffers)
     if codec == rdma_display_codec::Codec::Lossless {
-        if let Some(gl) = gl {
-            let g = geometry
-                .as_ref()
-                .map(|m| rdma_display_codec::Geometry::new(m.width, m.height, m.stride))
-                .unwrap_or_else(|| rdma_display_codec::Geometry::new(1920, 1080, 1920 * 4));
-            match rdma_display_codec_gpu::GpuCodec::new_shared(g, gl.clone()) {
-                Ok(c) => {
-                    c.sync();
-                    drop(c);
-                    log::debug!("[preflight] lossless GPU encoder ok ({}x{})", g.width, g.height);
-                }
-                Err(e) => {
-                    log::warn!("[preflight] lossless GPU encoder failed: {e:#} (will fall back to CPU)")
-                }
+        let g = geometry
+            .as_ref()
+            .map(|m| rdma_display_codec::Geometry::new(m.width, m.height, m.stride))
+            .unwrap_or_else(|| rdma_display_codec::Geometry::new(1920, 1080, 1920 * 4));
+        match rdma_display_vkcodec::Encoder::new(g) {
+            Ok(_) => log::debug!("[preflight] lossless encoder ok ({}x{})", g.width, g.height),
+            Err(e) => {
+                log::warn!("[preflight] lossless encoder failed: {e:#} (Vulkan/dma-buf required)")
             }
         }
     }
@@ -3105,7 +2885,7 @@ mod codec_tests {
         let geom = Geometry::new(w, h, stride);
         let fb = geom.frame_bytes();
         let mut fc = FrameCodec::new();
-        fc.configure(Codec::Lossless, w, h, stride, fb, None).unwrap();
+        fc.configure(Codec::Lossless, w, h, stride, fb).unwrap();
         let mut dec = Decoder::new(geom).unwrap();
         let mut slot = vec![0u8; geom.max_coded_len()];
         let base = synthetic(w, h, 1);

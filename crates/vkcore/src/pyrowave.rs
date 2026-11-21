@@ -167,24 +167,6 @@ pub struct PyrowaveImageCreateInfo {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum CpuBufferFormat {
-    Nv12 = 0,
-    Yuv420p = 1,
-    Yuv444p = 2,
-}
-
-#[repr(C)]
-pub struct PyrowaveCpuBuffer {
-    pub data: [*mut c_void; 3],
-    pub row_stride_in_bytes: [usize; 3],
-    pub plane_size_in_bytes: [usize; 3],
-    pub width: i32,
-    pub height: i32,
-    pub format: CpuBufferFormat,
-}
-
-#[repr(C)]
 pub struct pyrowave_sync_object_opaque {
     _p: [u8; 0],
 }
@@ -231,11 +213,6 @@ pub struct Pyrowave {
         *mut c_void,
         usize,
     ) -> PyrowaveResult,
-    pub encoder_encode_cpu_synchronous: unsafe extern "C" fn(
-        PyrowaveEncoder,
-        *const PyrowaveCpuBuffer,
-        *const PyrowaveRateControl,
-    ) -> PyrowaveResult,
     pub encoder_packetize: unsafe extern "C" fn(
         PyrowaveEncoder,
         *mut PyrowavePacket,
@@ -253,8 +230,6 @@ pub struct Pyrowave {
         unsafe extern "C" fn(PyrowaveDecoder, *const c_void, usize) -> PyrowaveResult,
     pub decoder_decode_is_ready: unsafe extern "C" fn(PyrowaveDecoder, bool) -> bool,
     pub decoder_clear: unsafe extern "C" fn(PyrowaveDecoder),
-    pub decoder_decode_cpu_buffer_synchronous:
-        unsafe extern "C" fn(PyrowaveDecoder, *const PyrowaveCpuBuffer) -> PyrowaveResult,
     pub decoder_decode_gpu_buffer: unsafe extern "C" fn(
         PyrowaveDecoder,
         *const PyrowaveGpuSyncOperation,
@@ -354,13 +329,11 @@ impl Pyrowave {
             )?,
             encoder_packetize: sym(&lib, "pyrowave_encoder_packetize")?,
             encoder_packetize_with_padding: sym(&lib, "pyrowave_encoder_packetize_with_padding")?,
-            encoder_encode_cpu_synchronous: sym(&lib, "pyrowave_encoder_encode_cpu_synchronous")?,
             encoder_destroy: sym(&lib, "pyrowave_encoder_destroy")?,
             decoder_create: sym(&lib, "pyrowave_decoder_create")?,
             decoder_push_packet: sym(&lib, "pyrowave_decoder_push_packet")?,
             decoder_decode_is_ready: sym(&lib, "pyrowave_decoder_decode_is_ready")?,
             decoder_clear: sym(&lib, "pyrowave_decoder_clear")?,
-            decoder_decode_cpu_buffer_synchronous: sym(&lib, "pyrowave_decoder_decode_cpu_buffer_synchronous")?,
             decoder_decode_gpu_buffer: sym(&lib, "pyrowave_decoder_decode_gpu_buffer")?,
             sync_object_create: sym(&lib, "pyrowave_sync_object_create")?,
             sync_object_get_semaphore: sym(&lib, "pyrowave_sync_object_get_semaphore")?,
@@ -586,51 +559,4 @@ pub struct EncodedFrame {
     pub packets: Vec<(usize, usize)>,
 }
 
-impl Pyrowave {
-    /// CPU (bring-up) encode: YUV planes -> bitstream. Returns the coded
-    /// length and the packet (offset, size) list for the decoder.
-    pub fn encode_cpu(
-        &self,
-        enc: PyrowaveEncoder,
-        buf: &PyrowaveCpuBuffer,
-        rate: &PyrowaveRateControl,
-        boundary: usize,
-        padding: usize,
-        out: &mut [u8],
-    ) -> Result<EncodedFrame> {
-        let r = unsafe { (self.encoder_encode_cpu_synchronous)(enc, buf, rate) };
-        if r != PyrowaveResult::Success {
-            bail!("pyrowave encode_cpu: {r:?}");
-        }
-        let mut npackets = 0usize;
-        let r = unsafe {
-            (self.encoder_compute_num_packets_with_padding)(enc, boundary, padding, &mut npackets)
-        };
-        if r != PyrowaveResult::Success {
-            bail!("pyrowave compute_num_packets: {r:?}");
-        }
-        let mut packets = vec![PyrowavePacket::default(); npackets.max(1)];
-        let mut out_packets = 0usize;
-        let r = unsafe {
-            (self.encoder_packetize_with_padding)(
-                enc,
-                packets.as_mut_ptr(),
-                boundary,
-                padding,
-                &mut out_packets,
-                out.as_mut_ptr() as *mut c_void,
-                out.len(),
-            )
-        };
-        if r != PyrowaveResult::Success {
-            bail!("pyrowave packetize_with_padding: {r:?} (buffer {} too small?)", out.len());
-        }
-        let packets: Vec<(usize, usize)> = packets[..out_packets]
-            .iter()
-            .map(|p| (p.offset, p.size))
-            .collect();
-        let len = packets.iter().map(|(o, s)| o + s).max().unwrap_or(0);
-        Ok(EncodedFrame { len, packets })
-    }
-}
 

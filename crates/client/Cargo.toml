@@ -8,9 +8,6 @@ publish = false
 name = "arsa-client"
 path = "src/main.rs"
 
-[dev-dependencies]
-tempfile = "3"
-
 [dependencies]
 rdma-display-proto.workspace = true
 rdma-display-rdma = { path = "../rdma" }

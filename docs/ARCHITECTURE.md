@@ -63,7 +63,8 @@ arsa/
 │   ├── proto/        # wire structs, framing, MsgType, fourcc, InputEvent, keymap
 │   ├── capture/      # CaptureSource trait; drm + qemu impls; InputSink; materializers
 │   ├── codec/        # codec ids + the CPU reference (lossless format lives here)
-│   ├── codec-gpu/    # GLES compute lossless encoder/decoder
+│   ├── codec-gpu/    # client GLES lossless decoder (+ codecbench)
+│   ├── vkcodec/      # server Vulkan compute lossless encoder
 │   ├── egl/          # shared surfaceless EGL context (server + client bring-up)
 │   ├── rdma/         # verbs setup, QP bring-up, slot MRs, WRITE loop, slots
 │   ├── audio/        # PipeWire/Pulse monitor capture + client playback, wire format
@@ -160,14 +161,14 @@ selects:
   `GL_TEXTURE_2D`. The context is surfaceless on the EGL device platform.
 - **`plain`**: for scanouts that are already host-linear; no EGL.
 
-NVIDIA specifics are load-bearing and encoded in `egl.rs`: the modifier
-attributes are `EGL_DMA_BUF_PLANE0_MODIFIER_LO/HI_EXT = 0x3443/0x3444` (not
-`0x3275/0x3276`), foreign dmabufs must bind to `EXTERNAL_OES`, and the readback
-rows are copied in order (no extra flip). `--readback pbo|direct` only affects
-the readback path. The wire format is always `XR24`/BGRX bytes, top-first.
+NVIDIA specifics are load-bearing and encoded in `egl.rs` for the raw readback
+path: the modifier attributes are `EGL_DMA_BUF_PLANE0_MODIFIER_LO/HI_EXT =
+0x3443/0x3444` (not `0x3275/0x3276`), foreign dmabufs must bind to
+`EXTERNAL_OES`, and the readback rows are copied in order (no extra flip). The
+wire format is always `XR24`/BGRX bytes, top-first.
 
-When the GPU lossless codec is active it encodes **straight from the imported
-dmabuf** — no full-frame readback, no re-upload (§6).
+When lossless is active the Vulkan encoder imports the scanout into a `VkImage`
+(with its DRM format modifier) and encodes there — no full-frame readback (§6).
 
 ### 4.5 Capture sync modes (`--capture-sync`)
 
@@ -317,7 +318,7 @@ subsampled — the window is new there. Beyond the window, frames are dropped
 **latest-wins** at both the server's capture mailbox and the client's drain, so
 nothing queues and no GPU work is spent on a frame that will not be shown.
 
-## 6. Codecs (`crates/codec`, `crates/codec-gpu`)
+## 6. Codecs (`crates/codec`, `crates/vkcodec`, `crates/codec-gpu`)
 
 Selected with the server's `--codec auto|raw|lossless|lossy` (default `auto`).
 The client sends its preference in `Hello.codec_pref` (`CODEC_ANY` = none); the
@@ -374,16 +375,14 @@ client must decode *every* received frame in order, even ones it will not
 present (it presents only the newest). Skipping one desyncs the chain and trips
 the CRC.
 
-**Encoding cost.** The scanout dmabuf is imported into the codec's own GLES 3.1
-compute context and encoded there; only the coded delta is copied into the
-staging slot. The import (`eglCreateImageKHR` + bind) is the cost, so it is
-**cached per buffer** (keyed by `fd, offset, stride, fourcc, modifier, w, h`,
-evicted past 4 entries) — a compositor swaps a handful of buffers, so steady
-state pays only the encode. Linear scanouts bind as `GL_TEXTURE_2D`
-(`texelFetch`); tiled ones as `EXTERNAL_OES`. The external path must swizzle
-`.bgra` (the dma-buf sampler returns real `(R,G,B)`, the coded word is
-`B,G,R,A`). Measured numbers are in
-[`DEBUG.md`](DEBUG.md#3-performance).
+**Encoding cost.** The server imports the scanout into a Vulkan `VkImage` (with
+its DRM format modifier) and runs the tile-delta compute there; only the coded
+delta is copied into the staging slot. The import is **cached per buffer**
+(`buf_id`, format, stride, offset, modifier) — a compositor swaps a handful of
+buffers, so steady state pays only the encode. The sampled image is `(R,G,B,A)`;
+the coded word is memory-order `(B,G,R,A)`, so the image shader applies `.bgra`.
+The client decodes the coded stream with the GLES decoder in `codec-gpu`.
+Measured numbers are in [`DEBUG.md`](DEBUG.md#3-performance).
 
 ### Lossy (PyroWave)
 

@@ -264,15 +264,6 @@ waits for a dmabuf scanout, prints its fourcc/modifier/stride and tries
 experiment; a tiled modifier also means a direct raw send needs a
 modifier-aware client. Needs `CAP_SYS_ADMIN` and an active display.
 
-**GL memory-object import.** `cargo test -p rdma-display-codec-gpu --test
-gles_memory_object -- --ignored --nocapture` prints the GL vendor/renderer and
-whether the server's GLES context advertises `GL_EXT_memory_object` /
-`GL_EXT_memory_object_fd` / `GL_EXT_buffer_storage`, then imports a dma-buf as a
-GL memory object and uses it as an SSBO. It prefers a GBM source (what the
-server allocates) and falls back to dma-heap. This is the gate for writing the
-lossless codec's coded stream directly into a registered dma-buf instead of
-copying it to host.
-
 **2026-11 rerun** (RTX 2080 Ti, NVIDIA 620.73.04, `rocep4s0`): the linear GBM bo
 registers and the NIC can both write into it and read it back. The live
 3840×2160 XR24 scanout (modifier `0x0300000000606014`, NVIDIA 16Bx2) also

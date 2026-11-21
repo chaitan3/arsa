@@ -22,7 +22,7 @@ const PACKET_BOUNDARY: usize = 4096;
 const PACKET_PADDING: usize = 2000;
 
 /// Map a DRM fourcc to the matching Vulkan format for the scanout content.
-fn fourcc_to_vk(fourcc: u32) -> Option<vk::Format> {
+pub(crate) fn fourcc_to_vk(fourcc: u32) -> Option<vk::Format> {
     Some(match fourcc {
         // B,G,R,[A/X] in memory
         0x3432_5258 | 0x3432_5241 | 0x3432_4142 | 0x3432_5842 => vk::Format::B8G8R8A8_UNORM,

@@ -2534,7 +2534,6 @@ dependencies = [
  "rdma-display-proto",
  "rdma-display-rdma",
  "rdma-display-vkcore",
- "tempfile",
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",
@@ -2552,7 +2551,6 @@ name = "rdma-display-codec-gpu"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "libc",
  "libloading",
  "log 0.4.34",
  "rdma-display-codec",
@@ -2602,10 +2600,10 @@ dependencies = [
  "rdma-display-auth",
  "rdma-display-capture",
  "rdma-display-codec",
- "rdma-display-codec-gpu",
  "rdma-display-egl",
  "rdma-display-proto",
  "rdma-display-rdma",
+ "rdma-display-vkcodec",
  "rdma-display-vkcore",
  "serde_json",
 ]

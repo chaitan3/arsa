@@ -14,10 +14,6 @@ portal = ["rdma-display-capture/portal"]
 name = "arsa-server"
 path = "src/main.rs"
 
-[[bin]]
-name = "reinit-bench"
-path = "src/bin/reinit_bench.rs"
-
 [dependencies]
 rdma-display-proto.workspace = true
 rdma-display-rdma = { path = "../rdma" }
@@ -25,7 +21,7 @@ rdma-display-rdma = { path = "../rdma" }
 # `--no-default-features` must not pull PipeWire in through capture's default.
 rdma-display-capture = { path = "../capture", default-features = false }
 rdma-display-codec = { path = "../codec" }
-rdma-display-codec-gpu = { path = "../codec-gpu" }
+rdma-display-vkcodec = { path = "../vkcodec" }
 rdma-display-vkcore = { path = "../vkcore" }
 rdma-display-audio = { path = "../audio" }
 rdma-display-auth = { path = "../auth" }
