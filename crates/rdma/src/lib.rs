@@ -290,6 +290,27 @@ impl StagingSlot {
     }
 }
 
+/// What a frame fill produced. `source` is an optional local MR to post instead
+/// of the staging slot (RDMA only): a dma-buf-registered scanout (raw) or a
+/// GPU coded buffer (lossless). Its length must equal `post_len`.
+pub struct FrameFill {
+    pub changed: bool,
+    pub post_len: usize,
+    pub mat_times: proto::MatTimes,
+    pub source: Option<LocalMemorySlice>,
+}
+
+impl FrameFill {
+    pub fn host(changed: bool, post_len: usize, mat_times: proto::MatTimes) -> Self {
+        Self {
+            changed,
+            post_len,
+            mat_times,
+            source: None,
+        }
+    }
+}
+
 enum Tx {
     Rdma {
         qp: QueuePair<Rc>,
@@ -1042,7 +1063,7 @@ impl ServerLink {
             |_slot, out| {
                 let n = out.len();
                 fill(out);
-                Ok((true, n, proto::MatTimes::ZERO))
+                Ok(FrameFill::host(true, n, proto::MatTimes::ZERO))
             },
             t0_unix_us,
             t0_unix_us,
@@ -1062,7 +1083,7 @@ impl ServerLink {
     /// staging-slot credit wait; neither absorbs the per-frame prepare.
     pub fn send_frame_checked(
         &mut self,
-        fill: impl FnOnce(usize, &mut [u8]) -> anyhow::Result<(bool, usize, proto::MatTimes)>,
+        fill: impl FnOnce(usize, &mut [u8]) -> anyhow::Result<FrameFill>,
         t0_unix_us: u64,
         t0d_unix_us: u64,
         t0p_unix_us: u64,
@@ -1075,7 +1096,7 @@ impl ServerLink {
 
     fn send_frame_rdma(
         &mut self,
-        fill: impl FnOnce(usize, &mut [u8]) -> anyhow::Result<(bool, usize, proto::MatTimes)>,
+        fill: impl FnOnce(usize, &mut [u8]) -> anyhow::Result<FrameFill>,
         t0_unix_us: u64,
         t0d: u64,
         t0p: u64,
@@ -1090,14 +1111,14 @@ impl ServerLink {
                 slot_wait_us / 1000
             );
         }
-        let (changed, post_len, mat_times, frame_bytes) = {
+        let (filled, frame_bytes) = {
             let Tx::Rdma { slots, .. } = &mut self.tx else {
                 unreachable!()
             };
             let frame_bytes = slots[slot].len();
-            let (changed, post_len, mat_times) = fill(slot, slots[slot].as_mut_bytes(frame_bytes))?;
+            let filled = fill(slot, slots[slot].as_mut_bytes(frame_bytes))?;
             #[cfg(feature = "frame-checksums")]
-            {
+            if filled.source.is_none() {
                 let out = slots[slot].as_mut_bytes(frame_bytes);
                 let sum: u32 = out.iter().map(|b| *b as u32).sum();
                 let nonzero = out.iter().filter(|b| **b != 0).count();
@@ -1106,13 +1127,16 @@ impl ServerLink {
                     slot, sum, nonzero, frame_bytes
                 );
             }
-            (changed, post_len, mat_times, frame_bytes)
+            (filled, frame_bytes)
         };
-        if !changed {
+        if !filled.changed {
             // unchanged frame: return the slot, don't send
             self.release_slot(slot);
             return Ok(None);
         }
+        let post_len = filled.post_len;
+        let mat_times = filled.mat_times;
+        let source = filled.source;
         anyhow::ensure!(post_len <= frame_bytes, "post_len {post_len} > slot {frame_bytes}");
         let t1_unix_us = proto::unix_now_us(); // readback/materialize complete
         let seq = self.seq;
@@ -1129,12 +1153,17 @@ impl ServerLink {
             };
             let remote = remote[slot];
             let imm = imm_encode(seq, slot);
+            let local = match source {
+                Some(s) => s,
+                None => slots[slot].post_slice(post_len),
+            };
+            anyhow::ensure!(
+                local.len() == post_len,
+                "local source {} != post_len {post_len}",
+                local.len()
+            );
             let mut batch = qp.start_send();
-            batch
-                .op()
-                .signaled()
-                .imm(imm)
-                .write(seq, &[slots[slot].post_slice(post_len)], remote);
+            batch.op().signaled().imm(imm).write(seq, &[local], remote);
             unsafe { batch.submit() }.context("post RDMA WRITE")?;
             let t2 = proto::unix_now_us(); // WRITE posted to the NIC
             // drain completions so the signaled WRITE is confirmed before we
@@ -1163,7 +1192,7 @@ impl ServerLink {
 
     fn send_frame_tcp(
         &mut self,
-        fill: impl FnOnce(usize, &mut [u8]) -> anyhow::Result<(bool, usize, proto::MatTimes)>,
+        fill: impl FnOnce(usize, &mut [u8]) -> anyhow::Result<FrameFill>,
         t0_unix_us: u64,
         t0d: u64,
         t0p: u64,
@@ -1177,20 +1206,26 @@ impl ServerLink {
         // slots to gate on, unlike RDMA.
         self.wait_for_window()?;
         let t1s = t0d; // TCP has no staging-slot credit wait of its own
-        let (changed, post_len, mat_times, capacity) = {
+        let (filled, capacity) = {
             let Tx::Tcp { slot_len, buf, .. } = &mut self.tx else {
                 unreachable!()
             };
             // The fill may use the payload slots only; the trailing 16 bytes
             // are reserved for the in-place AES-GCM tag.
             let capacity = (*slot_len).min(buf.len());
-            let (changed, post_len, mat_times) = fill(0, &mut buf.as_mut_slice()[..capacity])?;
-            (changed, post_len, mat_times, capacity)
+            let filled = fill(0, &mut buf.as_mut_slice()[..capacity])?;
+            (filled, capacity)
         };
-        if !changed {
+        if !filled.changed {
             return Ok(None);
         }
+        let post_len = filled.post_len;
+        let mat_times = filled.mat_times;
         anyhow::ensure!(post_len <= capacity, "post_len {post_len} > slot {capacity}");
+        anyhow::ensure!(
+            filled.source.is_none(),
+            "a local source MR is only valid on RDMA"
+        );
         let t1_unix_us = proto::unix_now_us();
         let seq = self.seq;
         let mut seal = self.video_seal.take();

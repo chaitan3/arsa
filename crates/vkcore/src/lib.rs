@@ -344,6 +344,88 @@ pub struct HostBuffer {
     pub size: u64,
 }
 
+/// A device-local VkBuffer whose memory can be exported as a dma-buf. The
+/// server registers the fd with `ibv_reg_dmabuf_mr`, so the NIC reads coded
+/// GPU memory directly. Destroy with the device when no registration or GPU
+/// work references it.
+pub struct GpuBuffer {
+    pub buffer: vk::Buffer,
+    pub memory: vk::DeviceMemory,
+    pub size: u64,
+}
+
+impl VkCore {
+    /// A device-local buffer whose memory is exportable as a dma-buf. This is
+    /// the coded-output side of the RDMA zero-copy path (lossless compute
+    /// writes it, the NIC reads it).
+    pub fn create_exportable_buffer(
+        &self,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+    ) -> Result<GpuBuffer> {
+        if size == 0 {
+            bail!("zero-sized exportable buffer");
+        }
+        if !self.has_device_ext("VK_EXT_external_memory_dma_buf") {
+            bail!("device lacks VK_EXT_external_memory_dma_buf: cannot export a GPU buffer");
+        }
+        unsafe {
+            let mut ext = vk::ExternalMemoryBufferCreateInfo {
+                handle_types: vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                ..Default::default()
+            };
+            let ci = vk::BufferCreateInfo {
+                p_next: &mut ext as *mut _ as *mut std::ffi::c_void,
+                size,
+                usage,
+                sharing_mode: vk::SharingMode::EXCLUSIVE,
+                ..Default::default()
+            };
+            let buffer = self.device.create_buffer(&ci, None)?;
+            let req = self.device.get_buffer_memory_requirements(buffer);
+            let mt = match self
+                .find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            {
+                Ok(mt) => mt,
+                Err(e) => {
+                    self.device.destroy_buffer(buffer, None);
+                    return Err(e);
+                }
+            };
+            let dedicated = vk::MemoryDedicatedAllocateInfo {
+                buffer,
+                ..Default::default()
+            };
+            let mut exp = vk::ExportMemoryAllocateInfo {
+                handle_types: vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                p_next: &dedicated as *const _ as *mut std::ffi::c_void,
+                ..Default::default()
+            };
+            let memory = match self.device.allocate_memory(
+                &vk::MemoryAllocateInfo {
+                    allocation_size: req.size,
+                    memory_type_index: mt,
+                    p_next: &mut exp as *mut _ as *mut std::ffi::c_void,
+                    ..Default::default()
+                },
+                None,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.device.destroy_buffer(buffer, None);
+                    return Err(e.into());
+                }
+            };
+            if let Err(e) = self.device.bind_buffer_memory(buffer, memory, 0) {
+                self.device.free_memory(memory, None);
+                self.device.destroy_buffer(buffer, None);
+                return Err(e.into());
+            }
+            Ok(GpuBuffer { buffer, memory, size })
+        }
+    }
+}
+
 /// A VkImage plus its backing memory (device-local or imported).
 pub struct Image {
     pub image: vk::Image,
@@ -846,5 +928,29 @@ impl Drop for HostBuffer {
     fn drop(&mut self) {
         // leak on drop intentionally: the RDMA MR may outlive a borrowed view;
         // process-lifetime allocation keeps this simple
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::{ash::vk, VkCore};
+
+    /// Probe the GPU zero-copy building block: a device-local buffer whose
+    /// memory exports as a dma-buf. A failure here means the server will use
+    /// its host staging fallback (expected on some drivers).
+    #[test]
+    #[ignore = "requires a Vulkan device and dma-buf buffer export support"]
+    fn exportable_buffer_exports_a_dmabuf() {
+        let core = VkCore::new().expect("vulkan core");
+        let b = core
+            .create_exportable_buffer(1 << 20, vk::BufferUsageFlags::STORAGE_BUFFER)
+            .expect("exportable buffer");
+        let fd = core.export_dmabuf(b.memory).expect("export dma-buf");
+        assert!(fd >= 0);
+        unsafe { libc::close(fd) };
+        unsafe {
+            core.device.destroy_buffer(b.buffer, None);
+            core.device.free_memory(b.memory, None);
+        }
     }
 }

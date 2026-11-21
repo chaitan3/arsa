@@ -156,11 +156,14 @@ The materializer turns a source frame into the linear wire bytes. `--materialize
 selects:
 
 - **`vk`** (default): imports the scanout dma-buf into a Vulkan `VkImage` (with
-  its DRM format modifier) and uses host-visible staging buffers that are also
-  the RDMA staging slots (or the TCP video buffer). Raw copies the scanout there
-  on the GPU; lossless encodes directly into it; lossy packetizes directly into
-  it. The import is cached per buffer (`buf_id`, format, stride, offset,
-  modifier) and shared by the raw, lossless and lossy paths.
+  its DRM format modifier). On RDMA the preferred staging is registered with
+  `ibv_reg_dmabuf_mr`: lossless writes into a device-local exportable
+  `VkBuffer`, and raw posts a linear XRGB scanout dma-buf directly. If export
+  or registration fails, it falls back to host-visible staging buffers that are
+  also the RDMA slots (or the TCP video buffer): raw copies the scanout there
+  on the GPU, lossless encodes into it, lossy packetizes into it. The import is
+  cached per buffer (`buf_id`, format, stride, offset, modifier) and shared by
+  the raw, lossless and lossy paths.
 - **`plain`**: for scanouts that are already host-linear (`qemu gl=off`); no GPU.
 
 The wire format is always `XR24`/BGRX bytes, top-first. When lossless is active
@@ -238,18 +241,26 @@ One RC QP per session; RDMA WRITE with immediate; the completion loop busy-polls
 is required on the QP (MR flags alone do not permit inbound writes), and
 `RLIMIT_MEMLOCK` must cover the pinned pages.
 
-The original goal was to register the source dmabuf directly as an MR
-(`ibv_reg_dmabuf_mr`) so the NIC DMA-reads out of GPU memory. On the tested
-NVIDIA stack this fails: `nvidia-drm` exports scanouts through the *static*
-PRIME path (no pin/unpin ops), and peer-DMA mapping of VRAM returns `ENOMEM`.
-The **copy path is therefore the default**: import → encode/copy into a pinned
-host MR → WRITE (one GPU→host transfer per frame; the coded output is written
-directly into that MR, not into a scratch buffer). A future true-zero-copy
-**option** would export the coded `VkBuffer` and register it with
-`ibv_reg_dmabuf_mr` (or hand the scanout/GPU buffer to the NIC) so the write
-reads GPU memory; that is not implemented here — it needs a cooperative
-exporter and a Vulkan external-memory export/mapping path. The client-side
-GBM/dma-buf MR probes are in
+The preferred server data path registers memory with `ibv_reg_dmabuf_mr`, so
+the NIC reads GPU/scanout memory directly:
+
+- **lossless**: the coded output lives in a **device-local exportable
+  `VkBuffer`** (`VK_EXT_external_memory_dma_buf` + `VK_KHR_external_memory_fd`),
+  exported per staging slot and registered with verbs. The Vulkan compute
+  writes the coded stream there; no GPU→host transfer.
+- **raw**: a **linear, top-first XRGB8888** scanout plane is registered as-is
+  (modifier 0, exact stride, stable `buf_id`); the NIC reads the compositor's
+  buffer. Tiled/other formats use the fallback copy.
+
+If export or registration fails, the server **falls back to the host Vulkan
+staging path**: the coded output is written into a host-visible `VkBuffer`
+(registered with `ibv_reg_mr`) and the NIC reads that (one GPU→host transfer).
+This is the same fallback used for TCP. On the tested NVIDIA stack the
+compositor's scanout dma-buf registration previously failed with `ENOMEM`
+(`nvidia-drm` exports through the static PRIME path with no pin/unpin ops); the
+per-session/per-buffer fallback keeps that configuration working. Lossy still
+packetizes on the CPU into the staging slot, so it has no GPU dma-buf MR path
+yet. The client-side GBM/dma-buf MR probes are in
 [`DEBUG.md`](DEBUG.md#5-client-zero-copy-c0-findings).
 
 ### 5.4 Frame pacing (`--pace`)
@@ -377,23 +388,27 @@ present (it presents only the newest). Skipping one desyncs the chain and trips
 the CRC.
 
 **Encoding cost.** The server imports the scanout into a Vulkan `VkImage` (with
-its DRM format modifier) and runs the tile-delta compute there; the coded
-delta is written **directly into the staging slot's host-visible `VkBuffer`**
-(the same memory registered as the RDMA slot / TCP buffer), so there is no CPU
-copy. The import is **cached per buffer**
-(`buf_id`, format, stride, offset, modifier) — a compositor swaps a handful of
-buffers, so steady state pays only the encode. The sampled image is `(R,G,B,A)`;
-the coded word is memory-order `(B,G,R,A)`, so the image shader applies `.bgra`.
-The client decodes the coded stream with the GLES decoder in `codec-gpu`.
-Measured numbers are in [`DEBUG.md`](DEBUG.md#3-performance).
+its DRM format modifier) and runs the tile-delta compute there. On RDMA the
+coded delta is written into a **device-local exportable `VkBuffer` registered
+with `ibv_reg_dmabuf_mr`**; if that export/registration is unavailable it falls
+back to the staging slot's host-visible `VkBuffer` (registered as the RDMA slot
+/ TCP buffer). Either way there is no CPU copy. The import is **cached per
+buffer** (`buf_id`, format, stride, offset, modifier) — a compositor swaps a
+handful of buffers, so steady state pays only the encode. The sampled image is
+`(R,G,B,A)`; the coded word is memory-order `(B,G,R,A)`, so the image shader
+applies `.bgra`. The client decodes the coded stream with the GLES decoder in
+`codec-gpu`. Measured numbers are in [`DEBUG.md`](DEBUG.md#3-performance).
 
 ### Lossy (PyroWave)
 
 Intra-only GPU codec. The server imports the scanout dmabuf into a Vulkan image
 and runs PyroWave's `encode_gpu_scaled_synchronous` (RGB → YCbCr + scale), then
-packetizes the bitstream **directly into the staging slot** at the final header
-offset — no GL, no full-frame readback, no temporary packet buffer. The client
-decodes on the GPU into Y/U/V planes and converts to BGRA. Because
+packetizes the bitstream **directly into the host staging slot** at the final
+header offset — no GL, no full-frame readback, no temporary packet buffer. The
+packetizer consumes a CPU output pointer, so lossy stays on the host-MR path
+(no `ibv_reg_dmabuf_mr`); a GPU bitstream output would be a future PyroWave
+API. The client decodes on the GPU into Y/U/V planes and converts to BGRA.
+Because
 it is intra-only there is no reference-chain invariant and no CRC.
 `--lossy-bitrate MBPS` sets the bitstream budget in Mbit/s, which the server
 converts to PyroWave's per-frame byte cap at a nominal 60 fps
@@ -564,11 +579,13 @@ RDMA video stays plaintext, and `--no-encrypt` disables it.
 
 ## 12. Design decisions and limits
 
-- **Copy path is the default**: one GPU→host transfer per frame into a pinned
-  host MR (raw copy, lossless coded output, or lossy packetize); the slot is
-  written directly, not via a scratch buffer. True GPU zero-copy (NIC reads a
-  registered GPU dmabuf via `ibv_reg_dmabuf_mr`) is a future option, viable only
-  with a cooperative exporter (see §5.3).
+- **Zero copy is preferred on RDMA**: lossless registers the device-local coded
+  `VkBuffer` and raw registers a linear top-first XRGB scanout dma-buf with
+  `ibv_reg_dmabuf_mr`; the NIC reads GPU/scanout memory directly. On export or
+  registration failure the server falls back per session/buffer to the host
+  Vulkan staging buffer (`ibv_reg_mr`), one GPU→host transfer per frame. Lossy
+  packetizes on the CPU into the host staging slot, so it remains on the host-MR
+  path (see §5.3).
 - **TCP has no extra copy**: the same Vulkan host staging buffer is the TCP send
   buffer, and AES-256-GCM seals it in place (16-byte tailroom), so the ciphertext
   is written straight to the socket.

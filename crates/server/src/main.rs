@@ -29,6 +29,7 @@ use rdma_display_capture::{
     InputSink, QemuDbusInput, QemuDbusSource, ScreenSize,
 };
 
+mod direct;
 mod display;
 mod gpu;
 mod gpu_power;
@@ -223,7 +224,7 @@ capture: --source qemu|drm (qemu = QEMU dbus-display, the guest; drm = KMS captu
   --input qemu|uinput (default auto: qemu↔qemu-dbus, drm↔uinput, portal↔uinput)\n  \
   qemu: [--dbus-socket /path/dbus.sock] [--console 0]   drm: [--drm-card /dev/dri/cardN] (default: first card0..card8 with an active scanout)\n  \
   [--materialize vk|plain] [--input-test]\n  \
-  --materialize vk (default) imports the dmabuf into Vulkan and copies it to host staging for raw; lossless encodes straight from the imported image. plain = D-Bus host-memory scanouts (qemu gl=off).\n  \
+  --materialize vk (default) imports the dmabuf into Vulkan; RDMA prefers dma-buf MRs (lossless coded GPU buffer, raw linear scanout) and falls back to host staging, where raw copies and lossless encodes. plain = D-Bus host-memory scanouts (qemu gl=off).\n  \
   --capture-sync auto|settle[:ms]|fence  (drm) when to capture, on top of the 1 ms poll that emits only when the plane's fb changes: auto (default) and fence read the current frame when the compositor's per-frame completion fence signals (tracefs; ~1 ms, tear-free, needs root), falling back to settle:2ms while the watch calibrates or if tracefs is unavailable; settle[:ms] = emit the current fb ms after its commit (default 2 ms; usually complete, but frames whose render outlasts the window tear)\n  \
   --pace auto|latency|smooth  frame pacing: the server's flow-control window — how many frames it keeps in flight ahead of the client's display. The client credits one frame per present, which paces both TCP and RDMA. auto (default) sizes the window from the measured link (ceil(turnaround / source frame period): keeps the pipe full without queueing); latency = 1 (present-paced, lowest latency, may stall if the link is slower than the display); smooth = the transport maximum (smoothest cadence, highest latency).\n  \
   --codec auto|raw|lossless|lossy  frame coding for the whole session (default auto = honour the client's Hello preference, else lossless). raw = unchanged wire; lossless = v2 tile-delta against the previous frame (desktop-friendly); lossy = PyroWave intra-only GPU codec (needs libpyrowave-shared.so). A non-auto value forces the codec. Build server and client together (lossless v2 is a wire-format version).\n  \
@@ -1099,6 +1100,9 @@ fn run_capture(
     listener.set_nonblocking(true)?;
 
     let mut session: Option<rdma_display_rdma::ServerLink> = None;
+    // per-session true-zero-copy staging (None = host Vulkan staging fallback)
+    let mut gpu_direct = None;
+    let mut raw_direct = None;
     // when the current session's control connection was accepted, for
     // measuring connect -> first-frame latency
     let mut session_connected_at: Option<std::time::Instant> = None;
@@ -1204,6 +1208,9 @@ fn run_capture(
         if session.is_none() {
             if let Some(w) = workers.take() {
                 w.stop();
+                fc.clear_gpu_staging();
+                gpu_direct = None;
+                raw_direct = None;
                 mat.release();
                 // an idle server must not hold the per-session staging buffers
                 // (lossy sessions don't bind them, so clear even then)
@@ -1767,6 +1774,9 @@ fn run_capture(
                     // PBO staging: bind the materializer's persistent-mapped
                     // PBOs as the staging slots; None = fall back to
                     // verbs-allocated slots.
+                    // RDMA registration domain (also used by true-zero-copy
+                    // dma-buf staging below).
+                    let pd = rdma.map(|(_, p)| p);
                     let external = if rdma.is_some()
                         && transport != rdma_display_rdma::TransportPref::Tcp
                         && session_codec != rdma_display_codec::Codec::Lossy
@@ -1831,6 +1841,50 @@ fn run_capture(
                                 meta.frame_bytes as usize,
                             )?;
                             frame_dirty = true;
+                            // True RDMA zero-copy, preferred over the host
+                            // staging buffers: lossless coded output in an
+                            // exported GPU dma-buf; raw reads a linear XRGB
+                            // scanout dma-buf directly. Both fall back to the
+                            // host path on registration failure.
+                            gpu_direct = None;
+                            raw_direct = None;
+                            fc.clear_gpu_staging();
+                            if link.transport() == rdma_display_rdma::Transport::Rdma
+                                && materialize == "vk"
+                            {
+                                if let Some(pd) = pd {
+                                    match session_codec {
+                                        rdma_display_codec::Codec::Lossless => {
+                                            match direct::GpuDirect::new(
+                                                gpu.core.clone(),
+                                                pd,
+                                                slots,
+                                                slot_len,
+                                            ) {
+                                                Ok(g) => {
+                                                    log::info!(
+                                                        "[server] lossless dma-buf staging: {slots} coded buffers registered with ibv_reg_dmabuf_mr"
+                                                    );
+                                                    gpu_direct = Some(g);
+                                                }
+                                                Err(e) => log::warn!(
+                                                    "[server] lossless dma-buf staging unavailable ({e:#}); using host Vulkan staging"
+                                                ),
+                                            }
+                                        }
+                                        rdma_display_codec::Codec::Raw => {
+                                            log::info!(
+                                                "[server] raw source: trying scanout dma-buf MRs (host copy fallback)"
+                                            );
+                                            raw_direct = Some(direct::RawDirect::new(pd));
+                                        }
+                                        rdma_display_codec::Codec::Lossy => {}
+                                    }
+                                }
+                            }
+                            if let Some(g) = gpu_direct.as_ref() {
+                                fc.set_gpu_staging(&g.buffers(), slot_len);
+                            }
                             // TCP with the Vulkan materializer: send GPU output
                             // straight from a host staging buffer (the same one
                             // the encoder writes), sealed in place.
@@ -1861,6 +1915,9 @@ fn run_capture(
                         }
                         Err(e) => {
                             log::warn!("[server] session setup failed: {e:#}");
+                            gpu_direct = None;
+                            raw_direct = None;
+                            fc.clear_gpu_staging();
                             session_nonce.store(0, std::sync::atomic::Ordering::SeqCst);
                 *session_secret.lock().unwrap() = None;
                         }
@@ -1889,6 +1946,8 @@ fn run_capture(
                 (*send_pickup.get_or_insert_with(rdma_display_proto::unix_now_us)).max(t0_unix_us);
             let link = session.as_mut().unwrap();
             let slot_bytes = link.frame_bytes();
+            // Per-frame raw source MR (RDMA dma-buf direct), if available.
+            let mut raw_src = None;
             // Materialize the newest pending capture now — only now do we know
             // it will actually be sent. Everything superseded while a slot was
             // busy was already dropped by the latest-wins mailbox.
@@ -1975,6 +2034,25 @@ fn run_capture(
                                 }
                             }
                         }
+                        // Raw RDMA: try to post the compositor's scanout
+                        // dma-buf directly (linear XRGB only). If this returns
+                        // None the host staging copy below is used.
+                        if have_frame && session_codec == rdma_display_codec::Codec::Raw {
+                            if let Some(cache) = raw_direct.as_mut() {
+                                raw_src = cache.source(&d, &fmt, slot_bytes);
+                            }
+                            if raw_src.is_some() {
+                                if issued.is_empty() {
+                                    // no GPU work in flight: take the direct
+                                    // source path for this and later frames
+                                    pipelined = false;
+                                } else {
+                                    // cannot switch away from pipelining with
+                                    // staged copies in flight; use the host path
+                                    raw_src = None;
+                                }
+                            }
+                        }
                     }
                 }
                 // a client connected before the first capture: wait for one
@@ -2034,20 +2112,58 @@ fn run_capture(
             } else {
                 match link.send_frame_checked(
                     |slot, out| {
+                        // Raw dma-buf direct: the scanout MR already holds the
+                        // frame; post it without touching host memory.
+                        if let Some(src) = raw_src.take() {
+                            let n = src.len();
+                            return Ok(rdma_display_rdma::FrameFill {
+                                changed: true,
+                                post_len: n,
+                                mat_times: rdma_display_proto::MatTimes::ZERO,
+                                source: Some(src),
+                            });
+                        }
                         if fc.uses_scanout() {
                             // lossless texture-direct: encode from the imported
-                            // dmabuf, write the coded delta into the slot
-                            return fc.encode_scanout(slot, out);
+                            // dmabuf. Prefer the dma-buf-registered GPU output;
+                            // otherwise write into the host staging slot.
+                            if gpu_direct.is_some() {
+                                let (changed, n, t) = fc.encode_scanout_gpu(slot)?;
+                                let source = if changed {
+                                    Some(
+                                        gpu_direct
+                                            .as_ref()
+                                            .unwrap()
+                                            .source(slot, n)
+                                            .context("lossless GPU staging source")?,
+                                    )
+                                } else {
+                                    None
+                                };
+                                return Ok(rdma_display_rdma::FrameFill {
+                                    changed,
+                                    post_len: n,
+                                    mat_times: t,
+                                    source,
+                                });
+                            }
+                            let (changed, n, t) = fc.encode_scanout(slot, out)?;
+                            return Ok(rdma_display_rdma::FrameFill {
+                                changed,
+                                post_len: n,
+                                mat_times: t,
+                                source: None,
+                            });
                         }
                         let (changed, t) = mat.copy_frame(out)?;
                         if !changed {
-                            return Ok((false, 0, t));
+                            return Ok(rdma_display_rdma::FrameFill::host(false, 0, t));
                         }
                         let n = match mat.coded_len() {
                             Some(n) => n,
                             None => fc.encode_in_place(slot, out)?,
                         };
-                        Ok((true, n, t))
+                        Ok(rdma_display_rdma::FrameFill::host(true, n, t))
                     },
                     t0_unix_us,
                     t0d,
@@ -2189,6 +2305,9 @@ struct FrameCodec {
     scanout_warned: bool,
     /// shared per-slot Vulkan staging buffers (raw/lossless direct output)
     staging: gpu::SharedStaging,
+    /// optional dma-buf-registered coded buffers (lossless RDMA zero-copy)
+    gpu_buffers: Vec<rdma_display_vkcore::ash::vk::Buffer>,
+    gpu_len: usize,
 }
 
 impl FrameCodec {
@@ -2203,6 +2322,8 @@ impl FrameCodec {
             scanout: false,
             scanout_warned: false,
             staging: Arc::new(std::sync::Mutex::new(None)),
+            gpu_buffers: Vec::new(),
+            gpu_len: 0,
         }
     }
 
@@ -2353,13 +2474,33 @@ impl FrameCodec {
         slot_idx: usize,
         out: &mut [u8],
     ) -> Result<(bool, usize, rdma_display_proto::MatTimes)> {
-        let full = self.first;
         let staging = self.staging.lock().unwrap().clone();
         let target = staging.as_ref().and_then(|s| {
             s.buffer_for(slot_idx, out.as_ptr() as *mut u8)
                 .map(|b| (b, s.len + 16))
         });
-        let direct = target.is_some();
+        self.encode_scanout_target(target, Some(out))
+    }
+
+    /// Lossless encode straight into the dma-buf-registered GPU coded buffer
+    /// for `slot_idx`. No host bytes are produced or copied.
+    fn encode_scanout_gpu(
+        &mut self,
+        slot_idx: usize,
+    ) -> Result<(bool, usize, rdma_display_proto::MatTimes)> {
+        let buffer = *self
+            .gpu_buffers
+            .get(slot_idx)
+            .context("no dma-buf lossless staging slot")?;
+        self.encode_scanout_target(Some((buffer, self.gpu_len)), None)
+    }
+
+    fn encode_scanout_target(
+        &mut self,
+        target: Option<(rdma_display_vkcore::ash::vk::Buffer, usize)>,
+        out: Option<&mut [u8]>,
+    ) -> Result<(bool, usize, rdma_display_proto::MatTimes)> {
+        let full = self.first;
         let Some(vk) = self.vk.as_mut() else {
             anyhow::bail!("no Vulkan encoder");
         };
@@ -2374,13 +2515,19 @@ impl FrameCodec {
         if changed {
             self.first = false;
         }
-        anyhow::ensure!(
-            n <= out.len(),
-            "coded frame {n} exceeds staging slot {}",
-            out.len()
-        );
+        if let Some((_, cap)) = target {
+            ensure!(n <= cap, "coded frame {n} exceeds output buffer {cap}");
+        }
+        if let Some(out) = out.as_deref() {
+            ensure!(
+                n <= out.len(),
+                "coded frame {n} exceeds staging slot {}",
+                out.len()
+            );
+        }
         let t = std::time::Instant::now();
-        if !direct {
+        if target.is_none() {
+            let out = out.context("lossless output buffer")?;
             out[..n].copy_from_slice(&vk.coded()[..n]);
         }
         let copy = t.elapsed();
@@ -2392,6 +2539,18 @@ impl FrameCodec {
                 [0, 0, enc.as_micros() as u64, 0, copy.as_micros() as u64, 0],
             ),
         ))
+    }
+
+    /// Install the per-slot dma-buf coded buffers for this session.
+    fn set_gpu_staging(&mut self, buffers: &[rdma_display_vkcore::ash::vk::Buffer], len: usize) {
+        self.gpu_buffers.clear();
+        self.gpu_buffers.extend_from_slice(buffers);
+        self.gpu_len = len;
+    }
+
+    fn clear_gpu_staging(&mut self) {
+        self.gpu_buffers.clear();
+        self.gpu_len = 0;
     }
 }
 

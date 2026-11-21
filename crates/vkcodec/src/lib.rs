@@ -416,6 +416,22 @@ impl Encoder {
                 std::slice::from_raw_parts(hpc.as_ptr() as *const u8, hpc.len() * 4),
             );
             dev.cmd_dispatch(cb, 1, 1, 1);
+            // Make the coded writes visible to an external consumer (the NIC
+            // reading the exported dma-buf). For host staging this is a no-op.
+            dev.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier {
+                    src_access_mask: vk::AccessFlags::SHADER_WRITE,
+                    dst_access_mask: vk::AccessFlags::MEMORY_READ
+                        | vk::AccessFlags::MEMORY_WRITE,
+                    ..Default::default()
+                }],
+                &[],
+                &[],
+            );
         })?;
 
         let c = self.counter.as_slice();
