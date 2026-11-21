@@ -247,20 +247,23 @@ the NIC reads GPU/scanout memory directly:
 - **lossless**: the coded output lives in a **device-local exportable
   `VkBuffer`** (`VK_EXT_external_memory_dma_buf` + `VK_KHR_external_memory_fd`),
   exported per staging slot and registered with verbs. The Vulkan compute
-  writes the coded stream there; no GPU→host transfer.
+  writes the coded stream there; no GPU→host transfer. The same GPU MRs are
+  the link's local staging slots, so a successful GPU preflight allocates no
+  host staging and needs no pinned host pages.
 - **raw**: a **linear, top-first XRGB8888** scanout plane is registered as-is
   (modifier 0, exact stride, stable `buf_id`); the NIC reads the compositor's
   buffer. Tiled/other formats use the fallback copy.
 
-If export or registration fails, the server **falls back to the host Vulkan
-staging path**: the coded output is written into a host-visible `VkBuffer`
-(registered with `ibv_reg_mr`) and the NIC reads that (one GPU→host transfer).
-This is the same fallback used for TCP. On the tested NVIDIA stack the
-compositor's scanout dma-buf registration previously failed with `ENOMEM`
-(`nvidia-drm` exports through the static PRIME path with no pin/unpin ops); the
-per-session/per-buffer fallback keeps that configuration working. Lossy still
-packetizes on the CPU into the staging slot, so it has no GPU dma-buf MR path
-yet. The client-side GBM/dma-buf MR probes are in
+The GPU staging is attempted at session setup, before any host staging. If
+export, buffer allocation, or `ibv_reg_dmabuf_mr` fails, the server **falls
+back to the host Vulkan staging path**: the coded output is written into a
+host-visible `VkBuffer` (registered with `ibv_reg_mr`) and that buffer is the
+link's staging slot (one GPU→host transfer). This is the same fallback used for
+TCP. On the tested NVIDIA stack the compositor's scanout dma-buf registration
+previously failed with `ENOMEM` (`nvidia-drm` exports through the static PRIME
+path with no pin/unpin ops); the per-session/per-buffer fallback keeps that
+configuration working. Lossy still packetizes on the CPU into the staging slot,
+so it has no GPU dma-buf MR path yet. The client-side GBM/dma-buf MR probes are in
 [`DEBUG.md`](DEBUG.md#5-client-zero-copy-c0-findings).
 
 ### 5.4 Frame pacing (`--pace`)
