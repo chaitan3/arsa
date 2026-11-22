@@ -1654,7 +1654,7 @@ fn run_capture(
                 // client's preference, before sizing slots / building the encoder
                 session_codec = resolve_codec(codec_auto, codec, client_codec_pref);
                 // the materializer must match the session codec: raw/lossless
-                // share the EGL/plain one, lossy needs its own (rebuild on change)
+                // share the Vulkan/plain one, lossy needs its own (rebuild on change)
                 let want_lossy = session_codec == rdma_display_codec::Codec::Lossy;
                 // the client's Hello preference overrides the server default
                 let eff_mbps = if client_lossy_mbps > 0 {

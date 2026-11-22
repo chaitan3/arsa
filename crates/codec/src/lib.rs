@@ -7,12 +7,12 @@
 //!
 //! ## Why a crate
 //!
-//! The production encoder runs on the GPU (a GLES 3.1 compute pass in the
-//! capture materializer) — but the *format* and the decoder are ordinary CPU
-//! code. Keeping both in one crate makes the format the single source of
-//! truth and lets the round trip be unit-tested without a GPU. The GPU
-//! encoder is required to produce exactly this byte layout; the CPU encoder
-//! here is the reference implementation and the arbiter of correctness.
+//! The production encoder is Vulkan compute (`crates/vkcodec`); the format,
+//! header, geometry and CPU reference encoder/decoder live here. Keeping them
+//! in one crate makes the format the single source of truth and lets the round
+//! trip be tested without a GPU. The Vulkan encoder is required to produce
+//! exactly this byte layout; the CPU encoder here is the reference
+//! implementation and the arbiter of correctness.
 //!
 //! ## Lossless format (`CODEC_LOSSLESS`, version 2)
 //!
@@ -800,8 +800,8 @@ mod tests {
     }
 
     /// Compare only the visible pixel region: row padding (stride - width*4)
-    /// is never displayed and is left unspecified by both the raw path
-    /// (`glReadPixels` does not write it) and this codec.
+    /// is never displayed and is left unspecified by the raw paths and this
+    /// codec.
     fn assert_pixels_eq(g: &Geometry, got: &[u8], want: &[u8], what: &str) {
         let n = g.width as usize * 4;
         for row in 0..g.height as usize {

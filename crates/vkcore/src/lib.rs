@@ -966,9 +966,9 @@ impl VkCore {
     }
 
     /// A **linear** image whose memory is exportable as a dma-buf, for
-    /// cross-API sharing: the client has PyroWave (Vulkan) decode into these,
-    /// then imports the fd into GL and does the YUV->RGB conversion on the GPU.
-    /// Returns the image, the exported fd, and the row pitch EGL needs.
+    /// cross-API/dma-buf sharing. Returns the image, the exported fd, and the
+    /// row pitch. The current client samples its own Vulkan planes directly;
+    /// this helper is used by diagnostics/benchmarks and server-side imports.
     pub fn create_exportable_image(
         &self,
         format: vk::Format,
@@ -978,8 +978,8 @@ impl VkCore {
     ) -> Result<(Image, std::os::fd::RawFd, u32)> {
         // A device that does not advertise VK_EXT_external_memory_dma_buf may
         // still accept vkGetMemoryFdKHR(DMA_BUF_EXT) but hand back an opaque
-        // handle whose bytes EGL then reads as garbage/zero (the classic
-        // "green" frame). Refuse up front so callers can fall back cleanly.
+        // handle whose bytes an importer then reads as garbage/zero (the
+        // classic "green" frame). Refuse up front so callers can fall back.
         if !self.has_device_ext("VK_EXT_external_memory_dma_buf") {
             bail!(
                 "device lacks VK_EXT_external_memory_dma_buf: \

@@ -105,29 +105,6 @@ user-facing lines — init, connection/disconnect, and feature-disabling failure
 
 ## 3. Performance
 
-### Lossless codec (4K, RTX 2080 Ti, `codecbench` synthetic desktop)
-
-| | v1 (raw tiles) | v2 (ref/dpcm runs) |
-| --- | --- | --- |
-| 10-frame coded total | 34.7 MiB (9.1x) | **7.9 MiB (40.3x)** |
-| steady delta | 325 KB/frame (102x) | **46 KB/frame (719x)** |
-| full first frame | 31.9 MiB (1.0x) | **7.8 MiB (4.2x)** |
-| GPU encode (steady) | 0.18 ms | 0.20 ms |
-| GPU decode (steady) | 0.07 ms | 0.04 ms |
-
-Per-frame compute: `cpu 6.6 / gpu 0.2 ms` for a delta, `cpu 9.3 / gpu 8.1 ms`
-for a full frame. On high-motion content that compresses poorly, `raw` is still
-cheaper.
-
-**The import path dominates.** The scanout import (Vulkan `VkImage` with its
-DRM modifier) costs far more than the encode, so it is cached per buffer
-(`buf_id`, format, stride, offset, modifier) and shared by raw/lossless/lossy.
-Steady state then pays only the encode.
-
-`codecbench` benchmarks all variants (`[texture]`, `[external]`, `[fetch]`,
-`[import]`) and requires them byte-identical to the SSBO encode and
-CPU-decodable.
-
 ### Raw client: direct host sampling vs copy-to-image
 
 `cargo run --release -p rdma-display-client --bin raw_host_bench` compares two
@@ -264,9 +241,9 @@ exports). On the test client (RTX-class NVIDIA, open module 615.71, KWin
   has since been removed; the client always uses host slots.)
 - **dma-heap route** (`/dev/dma_heap/system`): system RAM that is a dma-buf from
   birth — the NIC registers it as plain host DMA (no GDR gate), and the same fd
-  is EGL-importable/presentable. This is the route that kept the zero-copy
-  structure while abandoning VRAM landing; in the end the production path is
-  simply pinned host slots.
+  was cross-API importable. This is the route that kept the zero-copy structure
+  while abandoning VRAM landing; in the end the production path is simply
+  pinned host slots.
 
 **Retrying the GBM→MR route (client and server directions).** `cargo test -p
 rdma-display-rdma --test gbm_dmabuf_mr -- --ignored --nocapture` allocates a

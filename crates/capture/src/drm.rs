@@ -15,7 +15,7 @@
 //! NOT call drmSetMaster (it would fight the running compositor).
 //!
 //! Requires kernel ≥ 5.8 (GETFB2); no libdrm dependency — hand-rolled ioctl
-//! wrappers, same style as the verbs/EGL code.
+//! wrappers, same style as the verbs/Vulkan code.
 //!
 //! Polling: we re-read `plane.fb_id` every 1 ms and emit a scanout only when it
 //! changes — a flip is noticed within ~1 ms and the capture stays silent while
@@ -315,8 +315,8 @@ const fn iowr_sync(nr: u16, size: usize) -> u64 {
 }
 const SYNC_IOC_FILE_INFO: u64 = iowr_sync(4, std::mem::size_of::<SyncFileInfo>());
 
-// DRM_FORMAT_MOD_INVALID = fourcc_mod_code(NONE, 0x00ffffff...); EGL refuses
-// it, and it means "driver gave no real modifier" — treat as linear.
+// DRM_FORMAT_MOD_INVALID = fourcc_mod_code(NONE, 0x00ffffff...); Vulkan import
+// refuses it, and it means "driver gave no real modifier" — treat as linear.
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
 pub struct DrmKmsSource {
@@ -714,7 +714,7 @@ fn import_fb(card: &OwnedFd, fb_id: u32) -> Result<DmabufScanout> {
 
     let mut modifier = fb.modifier[0];
     if modifier == DRM_FORMAT_MOD_INVALID {
-        // driver gave no real modifier: EGL refuses INVALID, linear import works
+        // driver gave no real modifier: Vulkan import refuses INVALID, linear works
         modifier = 0;
     }
     let format = FrameFormat {

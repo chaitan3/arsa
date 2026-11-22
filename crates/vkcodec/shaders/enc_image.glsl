@@ -21,7 +21,7 @@ layout(set = 0, binding = 0) uniform sampler2D u_src;
 uint word(uint x, uint y) {
     vec2 uv = (vec2(float(x), float(y)) + 0.5) / vec2(float(u_width), float(u_height));
     // The sampled vec4 is (R,G,B,A); the wire word is the memory-order
-    // (B,G,R,A), matching the GLES external-sampler path's `.bgra`.
+    // (B,G,R,A), matching the client image path's `.bgra`.
     return packUnorm4x8(texture(u_src, uv).bgra);
 }
 

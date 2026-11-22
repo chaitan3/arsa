@@ -63,9 +63,7 @@ arsa/
 │   ├── proto/        # wire structs, framing, MsgType, fourcc, InputEvent, keymap
 │   ├── capture/      # CaptureSource trait; drm + qemu impls; InputSink; materializers
 │   ├── codec/        # codec ids + the CPU reference (lossless format lives here)
-│   ├── codec-gpu/    # legacy GLES lossless decoder/benchmark (not in client)
 │   ├── vkcodec/      # server Vulkan compute lossless encoder
-│   ├── egl/          # legacy EGL/GLES helper (not in client/server binaries)
 │   ├── rdma/         # verbs setup, QP bring-up, slot MRs, WRITE loop, slots
 │   ├── audio/        # PipeWire/Pulse monitor capture + client playback, wire format
 │   ├── lifecycle/    # lazy per-session bring-up/teardown helpers
@@ -333,7 +331,7 @@ subsampled — the window is new there. Beyond the window, frames are dropped
 **latest-wins** at both the server's capture mailbox and the client's drain, so
 nothing queues and no GPU work is spent on a frame that will not be shown.
 
-## 6. Codecs (`crates/codec`, `crates/vkcodec`, `crates/codec-gpu`)
+## 6. Codecs (`crates/codec`, `crates/vkcodec`)
 
 Selected with the server's `--codec auto|raw|lossless|lossy` (default `auto`).
 The client sends its preference in `Hello.codec_pref` (`CODEC_ANY` = none); the
@@ -400,8 +398,8 @@ buffer** (`buf_id`, format, stride, offset, modifier) — a compositor swaps a
 handful of buffers, so steady state pays only the encode. The sampled image is
 `(R,G,B,A)`; the coded word is memory-order `(B,G,R,A)`, so the image shader
 applies `.bgra`. The client decodes the coded stream with its Vulkan compute
-decoder (`crates/client/src/vklossless.rs`); the legacy GLES decoder in
-`codec-gpu` is no longer in the client path. Measured numbers are in
+decoder (`crates/client/src/vklossless.rs`). The CPU reference and round-trip
+tests live in `crates/codec`; performance notes are in
 [`DEBUG.md`](DEBUG.md#3-performance).
 
 ### Lossy (PyroWave)
@@ -723,6 +721,6 @@ RDMA video stays plaintext, and `--no-encrypt` disables it.
 - **The Vulkan presenter does not import dmabufs**: raw and lossless frames
   enter through host-visible Vulkan buffers/images; lossy uses PyroWave's
   client-side Vulkan planes. This avoids the KWin 6.7.5 + NVIDIA foreign
-  system-dmabuf import failure and the old EGL/GL path entirely.
+  system-dmabuf import failure and the legacy GL path entirely.
 - **Client receive slots are host memory**; the GBM/dma-buf MR probes are in
   [`DEBUG.md`](DEBUG.md#5-client-zero-copy-c0-findings).

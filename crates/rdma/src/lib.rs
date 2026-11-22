@@ -279,11 +279,10 @@ impl StagingSlot {
             StagingSlot::Ext(m) => m.remote().len,
         }
     }
-    /// Mutable view of the registered memory. For `Ext` the memory is the
-    /// GL-owned PBO map: `glReadPixels(GL_BGRA)` writes it; `fill` only
-    /// recognizes the pointer and drives the GL side. Aliasing with the
-    /// materializer's map is intentional and safe while the MR is alive
-    /// (the backing memory is pinned and never moved).
+    /// Mutable view of the registered memory. For `Ext` the memory is owned
+    /// by the external staging provider (for example a Vulkan host staging
+    /// map). Aliasing with that map is intentional and safe while the MR is
+    /// alive (the backing memory is pinned and never moved).
     fn as_mut_bytes(&mut self, len: usize) -> &mut [u8] {
         match self {
             StagingSlot::Owned(m) => &mut m.bytes_mut()[..len],

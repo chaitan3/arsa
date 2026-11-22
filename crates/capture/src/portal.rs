@@ -54,7 +54,7 @@ const DRM_FORMAT_MOD_INVALID: i64 = 0x00ff_ffff_ffff_ffff;
 /// `DRM_FORMAT_MOD_LINEAR`.
 const DRM_FORMAT_MOD_LINEAR: i64 = 0;
 /// `DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D` (the modifier nvidia-drm hands out;
-/// the materializer's EGL import already handles it).
+/// the materializer's Vulkan import already handles it).
 const DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D: i64 = 0x0300_0000_0060_6014;
 
 use crate::{CaptureEvent, CaptureSource, DmabufScanout, FrameFormat, Running, Stop};
@@ -354,7 +354,7 @@ fn enum_format_pod() -> Vec<u8> {
         // the modifier property is what lets the producer allocate *dmabuf*
         // buffers; without it XDPH defaults to MemFd. Accept any modifier the
         // producer might use: MOD_INVALID (a MemFd buffer), LINEAR, and the
-        // NVIDIA block-linear modifier the materializer's EGL import handles.
+        // NVIDIA block-linear modifier the materializer's Vulkan import handles.
         spa::pod::Property {
             key: FormatProperties::VideoModifier.as_raw(),
             flags: spa::pod::PropertyFlags::MANDATORY

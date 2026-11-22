@@ -15,7 +15,7 @@
 //!   stereo packets. No codec: the LAN link eats 3.07 Mbit/s without
 //!   noticing, and a codec dependency would only add latency and vendoring
 //!   pain. Revisit Opus only if WAN use ever appears.
-//! - Native libs are dlopened (house style, mirrors eglwin.rs): we speak
+//! - Native libs are dlopened (house style): we speak
 //!   pulse-simple against `libpulse-simple`, which the pipewire-pulse
 //!   compat layer services. Native PipeWire streams (pipewire-rs) would
 //!   buy a little latency control and is a known follow-up lever.

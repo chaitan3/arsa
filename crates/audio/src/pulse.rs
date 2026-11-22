@@ -1,5 +1,5 @@
 //! dlopen wrapper for libpulse-simple (house style: no build-time native
-//! linkage, mirrors eglwin.rs). We speak the pulse-simple API against the
+//! linkage). We speak the pulse-simple API against the
 //! host's pipewire-pulse compat socket, so both the capture (server) and
 //! playout (client) sides work on PipeWire desktops without linking
 //! libpipewire. Signature sources: pulse/simple.h (API frozen since 0.9).

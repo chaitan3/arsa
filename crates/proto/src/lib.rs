@@ -126,9 +126,11 @@ pub const MAT_STAGES: usize = 6;
 pub enum MatKind {
     /// No breakdown (plain host-memory / QEMU materializer).
     None = 0,
-    /// EGL dmabuf materializer (`raw`): shader blit → glReadPixels → sync.
+    /// Raw materializer labels (legacy stage names retained for protocol
+    /// compatibility; the current Vulkan materializer reports zero here).
     Raw = 1,
-    /// GPU lossless (codec-gpu): texture-direct, or readback + encode.
+    /// GPU lossless: `encode` is the Vulkan compute cycle; the other labels
+    /// are retained for older/fallback materializers.
     Lossless = 2,
     /// PyroWave lossy materializer.
     Lossy = 3,
@@ -158,18 +160,12 @@ impl MatKind {
     pub fn labels(self) -> [&'static str; MAT_STAGES] {
         match self {
             MatKind::None => ["", "", "", "", "", ""],
-            // blit = shader blit (detile + channel normalize); readback =
-            // glReadPixels into the staging PBO; sync = EGL fence / glFinish.
-            // NB with a single reused FBO the draw can block on the previous
-            // frame's readback, in which case that backpressure lands here.
+            // Legacy raw-materializer stage names (blit/readback/sync); the
+            // current Vulkan path reports zero here.
             MatKind::Raw => ["blit", "readback", "sync", "", "", ""],
-            // texture-direct GPU lossless: activate = make the codec's EGL
-            // context current; blit = optional source blit (0 on the
-            // external-sampler path); encode = dispatch + glFinish (reads the
-            // scanout, XORs tiles, codes changes, and advances the reference
-            // in-pass); ref = legacy separate reference pass (now ~0); copy =
-            // coded bytes into the slot; restore = make the materializer's
-            // context current again.
+            // GPU lossless: encode = the Vulkan compute encode; activate,
+            // blit, ref, copy and restore are retained for older/fallback
+            // materializers and are normally zero.
             MatKind::Lossless => ["activate", "blit", "encode", "ref", "copy", "restore"],
             // encode = PyroWave GPU encode; packetize = packet framing + copy
             // into the slot. (The Vulkan dmabuf import happens in prepare,

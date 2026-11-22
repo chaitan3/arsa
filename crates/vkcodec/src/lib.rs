@@ -1,7 +1,7 @@
 //! Vulkan compute lossless encoder for the server.
 //!
-//! The tile-delta algorithm is shared with the client's GLES decoder
-//! (`codec-gpu`); the shader body lives once in
+//! The tile-delta algorithm is shared with the client's Vulkan decoder
+//! (`crates/client/src/vklossless.rs`); the shader body lives once in
 //! `shaders/enc_common.glsl` and is concatenated into the SSBO-input and
 //! scanout-image variants at build time. The coded header is written by a
 //! second one-invocation dispatch, so the CPU never touches the payload.

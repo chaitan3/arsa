@@ -2543,26 +2543,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rdma-display-codec-gpu"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "libloading",
- "log 0.4.34",
- "rdma-display-codec",
- "rdma-display-egl",
-]
-
-[[package]]
-name = "rdma-display-egl"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "libloading",
- "log 0.4.34",
-]
-
-[[package]]
 name = "rdma-display-lifecycle"
 version = "0.1.0"
 
