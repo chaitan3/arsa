@@ -301,6 +301,19 @@ impl LossyDecoder {
 impl Drop for LossyDecoder {
     fn drop(&mut self) {
         unsafe {
+            // No decode/draw may still touch the planes or decoder while we
+            // tear down the PyroWave decoder and its shared device.
+            let _ = self.vk.device.device_wait_idle();
+            if let Some(sync) = self.pending_sync.take() {
+                let _ = (self.pw.sync_object_cpu_wait)(sync, 1, 1_000_000_000);
+                self.pw.sync_destroy(sync);
+            }
+            if let Some(sync) = self.in_flight_sync.take() {
+                self.pw.sync_destroy(sync);
+            }
+            // The decoder references the plane views; destroy it first, then
+            // the images it decoded into, then the PyroWave device itself.
+            (self.pw.decoder_destroy)(self.dec);
             for v in self.views {
                 if v != vk::ImageView::null() {
                     self.vk.device.destroy_image_view(v, None);
@@ -309,13 +322,7 @@ impl Drop for LossyDecoder {
             for im in self.planes.drain(..) {
                 self.vk.destroy_image(im);
             }
-            if let Some(sync) = self.pending_sync.take() {
-                let _ = (self.pw.sync_object_cpu_wait)(sync, 1, 1_000_000_000);
-                self.pw.sync_destroy(sync);
-            }
-            if let Some(sync) = self.in_flight_sync.take() {
-                self.pw.sync_destroy(sync);
-            }
+            (self.pw.device_destroy)(self.dev);
             if let Some(rb) = self.readback.take() {
                 for b in [&rb.ybuf, &rb.ubuf, &rb.vbuf] {
                     self.vk.device.unmap_memory(b.memory);
