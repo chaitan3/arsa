@@ -293,6 +293,9 @@ fn main() -> Result<()> {
         "vk" => {
             let p = wayland::Presenter::new(link.meta.width, link.meta.height, input_tx, fullscreen, grab)?;
             let (swap_w, swap_h) = p.buffer_size();
+            // Keep the Renderer first in the tuple: its Drop destroys the
+            // swapchain/surface, and NVIDIA's Wayland WSI needs the Presenter's
+            // wl_display/wl_surface to still be alive at that point.
             let renderer = vkpresent::Renderer::new(
                 p.wl_display_ptr(),
                 p.wl_surface_ptr(),
@@ -306,12 +309,12 @@ fn main() -> Result<()> {
                 metrics_on,
                 scale_filter,
             )?;
-            Some((p, renderer))
+            Some((renderer, p))
         }
         other => bail!("--output must be none|vk, got {other:?}"),
     };
     log::info!("[client] presenter ready t={} ms", t0.elapsed().as_millis());
-    if let Some((_, renderer)) = presenter.as_mut() {
+    if let Some((renderer, _)) = presenter.as_mut() {
         renderer.attach_host_pool(link.host_slots().clone())?;
     }
 
@@ -337,7 +340,7 @@ fn main() -> Result<()> {
     let mut metrics = metrics_on.then(|| metrics::Metrics::new());
     // tell the overlay whether the compositor can report the true on-screen
     // time (wp_presentation), so `display` reads a number instead of n/a
-    if let (Some((p, _)), Some(m)) = (presenter.as_ref(), metrics.as_mut()) {
+    if let (Some((_, p)), Some(m)) = (presenter.as_ref(), metrics.as_mut()) {
         m.set_onscreen(p.has_presentation());
     }
     if let Some(m) = metrics.as_mut() {
@@ -397,7 +400,7 @@ fn main() -> Result<()> {
                 break;
             }
         }
-        if let Some((p, renderer)) = presenter.as_mut() {
+        if let Some((renderer, p)) = presenter.as_mut() {
             // Dispatch Wayland events (input callbacks, configure) BEFORE the
             // blocking present, so a keystroke is handed to the input thread
             // without waiting for a swap; the input thread does the socket send.
