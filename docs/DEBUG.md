@@ -99,7 +99,6 @@ user-facing lines — init, connection/disconnect, and feature-disabling failure
 - **`--idle-metrics N`** (server): log RSS/CPU/threads every N seconds.
 - **`--input-test`** (server): synthesize a test input sequence.
 - Lossy decode planes are sampled directly on the client Vulkan device; the old dma-buf import diagnostics and CPU fallback switch no longer apply.
-- `ARSA_CLIENT_DISABLE_HOST_IMPORT=1`: skip `VK_EXT_external_memory_host` import of the client receive pool and use the safe host-staging fallback (diagnostic/workaround for a driver that returns device lost on host import).
 - Capture-sync logs (`[capture-drm] …`) report when the fence watch is
   unavailable and the mode falls back to `settle`.
 

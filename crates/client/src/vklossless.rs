@@ -162,11 +162,6 @@ impl VulkanLossless {
         self.record(cb, coded, Some((buffer, offset, range)))
     }
 
-    /// Record a decode from the private fallback buffer.
-    pub fn record_decode(&mut self, cb: vk::CommandBuffer, coded: &[u8]) -> Result<()> {
-        self.record(cb, coded, None)
-    }
-
     fn decode_source(
         &mut self,
         coded: &[u8],

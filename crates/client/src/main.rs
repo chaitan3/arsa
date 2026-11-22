@@ -439,8 +439,7 @@ fn main() -> Result<()> {
                 // buffer; the decoder reads the imported slot directly.
                 // Lossy is intra-only; raw is staged at present time.
                 if link.codec == rdma_display_codec::Codec::Lossless {
-                    let coded = link.slot_bytes(slot);
-                    renderer.decode_lossless(slot, coded)?;
+                    renderer.decode_lossless(slot)?;
                 }
                 if let Some((_, old, _)) = newest.replace((seq, slot, t3)) {
                     if link.codec == rdma_display_codec::Codec::Lossless {
@@ -490,7 +489,7 @@ fn main() -> Result<()> {
                 };
                 // Decode/upload the newest frame immediately before present:
                 // lossy is intra-only; raw stages one GPU copy from the
-                // imported slot (or the fallback host buffer).
+                // imported receive-pool slot.
                 match link.codec {
                     rdma_display_codec::Codec::Lossy => {
                         renderer.decode_lossy(link.slot_bytes(slot))?;

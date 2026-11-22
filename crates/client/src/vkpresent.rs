@@ -27,8 +27,6 @@ const OVERLAY_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/overla
 struct RawTarget {
     image: Image,
     view: vk::ImageView,
-    /// fallback when host import is unavailable
-    host: Option<HostBuffer>,
     /// source buffer/offset staged for the next present command buffer
     pending: Option<(vk::Buffer, u64)>,
     layout: vk::ImageLayout,
@@ -250,7 +248,6 @@ impl Renderer {
                 self.raw = Some(RawTarget {
                     image,
                     view,
-                    host: None,
                     pending: None,
                     layout: vk::ImageLayout::UNDEFINED,
                 });
@@ -316,34 +313,28 @@ impl Renderer {
         Ok(())
     }
 
-    /// Import the single stable receive pool once. The raw path then copies
-    /// each slot region straight from the imported host VkBuffer; a failed
-    /// import falls back to the persistent host-staging copy.
+    /// Import the single stable receive pool once. Raw and lossless consume
+    /// slot regions directly from this host-visible VkBuffer; a failure is
+    /// fatal instead of silently adding a CPU copy to the hot path.
     pub fn attach_host_pool(&mut self, pool: Arc<ClientSlotMemory>) -> Result<()> {
         self.slot_pool = Some(pool.clone());
         if self.raw.is_some() || self.lossless.is_some() {
-            if std::env::var_os("ARSA_CLIENT_DISABLE_HOST_IMPORT").is_some() {
-                log::info!("[vk] host pool import disabled by ARSA_CLIENT_DISABLE_HOST_IMPORT");
-                return Ok(());
-            }
-            match self
+            let imp = self
                 .core
                 .import_host_buffer(pool.base_ptr(), pool.total_len())
-            {
-                Ok(imp) => {
-                    self.host_import = Some(imp);
-                    log::info!(
-                        "[vk] host receive pool imported once: {} slots x {} bytes",
-                        pool.slots(),
-                        pool.slot_len()
-                    );
-                }
-                Err(e) => {
-                    log::warn!(
-                        "[vk] host pool import unavailable ({e:#}); raw/lossless fall back to host copies"
-                    );
-                }
-            }
+                .with_context(|| {
+                    format!(
+                        "import client receive pool ({} bytes, {} slots);                          raw/lossless require VK_EXT_external_memory_host",
+                        pool.total_len(),
+                        pool.slots()
+                    )
+                })?;
+            self.host_import = Some(imp);
+            log::info!(
+                "[vk] host receive pool imported once: {} slots x {} bytes",
+                pool.slots(),
+                pool.slot_len()
+            );
         }
         Ok(())
     }
@@ -351,17 +342,10 @@ impl Renderer {
     /// Queue a received lossless delta. The actual compute dispatch is
     /// recorded into the next present command buffer, so all deltas received
     /// in one drain share a single GPU submission instead of one CPU wait each.
-    pub fn decode_lossless(&mut self, slot: usize, coded: &[u8]) -> Result<()> {
-        if self.host_import.is_none() {
-            // Without the imported pool region we only have one private coded
-            // buffer; decode synchronously so batched dispatches cannot all
-            // read the same overwritten bytes.
-            self.lossless
-                .as_mut()
-                .context("lossless decoder not active")?
-                .decode(coded)?;
-            return Ok(());
-        }
+    pub fn decode_lossless(&mut self, slot: usize) -> Result<()> {
+        self.host_import
+            .as_ref()
+            .context("lossless requires the imported receive pool")?;
         self.pending_lossless.push(slot);
         Ok(())
     }
@@ -376,24 +360,24 @@ impl Renderer {
             .as_ref()
             .context("lossless slot pool missing")?
             .clone();
+        let imp = self
+            .host_import
+            .as_ref()
+            .context("lossless requires the imported receive pool")?;
         let dec = self
             .lossless
             .as_mut()
             .context("lossless decoder not active")?;
         for slot in slots {
             let coded = pool.slot(slot);
-            if let Some(imp) = self.host_import.as_ref() {
-                let offset = imp.base_offset + (slot * pool.slot_capacity()) as u64;
-                dec.record_decode_from_pool(
-                    cb,
-                    coded,
-                    imp.buffer,
-                    offset,
-                    pool.slot_capacity() as u64,
-                )?;
-            } else {
-                dec.record_decode(cb, coded)?;
-            }
+            let offset = imp.base_offset + (slot * pool.slot_capacity()) as u64;
+            dec.record_decode_from_pool(
+                cb,
+                coded,
+                imp.buffer,
+                offset,
+                pool.slot_capacity() as u64,
+            )?;
         }
         Ok(())
     }
@@ -409,29 +393,24 @@ impl Renderer {
         Ok(())
     }
 
-    /// Stage the newest raw slot for the next present command buffer. When the
-    /// receive pool was imported, the GPU reads the slot region directly; the
-    /// fallback copies it into the persistent host buffer now. No GPU work or
-    /// fence wait happens here.
+    /// Stage the newest raw slot for the next present command buffer. The GPU
+    /// reads the slot region directly from the imported receive pool.
     pub fn upload_raw(&mut self, slot: usize, bytes: &[u8]) -> Result<()> {
         let raw = self.raw.as_mut().context("raw target not active")?;
         let n = (self.frame_stride as usize) * (self.frame_h as usize);
         if bytes.len() < n {
             bail!("raw frame {} < expected {n}", bytes.len());
         }
-        let pool = self.slot_pool.clone();
-        let (src, src_offset) = if let (Some(imp), Some(pool)) = (self.host_import.as_ref(), pool.as_ref()) {
-            let off = imp.base_offset + (slot * pool.slot_capacity()) as u64;
-            (imp.buffer, off)
-        } else {
-            if raw.host.is_none() {
-                raw.host = Some(self.core.host_buffer(n as u64)?);
-            }
-            let host = raw.host.as_mut().unwrap();
-            host.as_mut_slice()[..n].copy_from_slice(&bytes[..n]);
-            (host.buffer, 0)
-        };
-        raw.pending = Some((src, src_offset));
+        let imp = self
+            .host_import
+            .as_ref()
+            .context("raw requires the imported receive pool")?;
+        let pool = self
+            .slot_pool
+            .as_ref()
+            .context("raw requires the receive slot pool")?;
+        let off = imp.base_offset + (slot * pool.slot_capacity()) as u64;
+        raw.pending = Some((imp.buffer, off));
         Ok(())
     }
 
@@ -942,11 +921,6 @@ impl Drop for Renderer {
             let _ = self.core.device.device_wait_idle();
             if let Some(r) = self.raw.take() {
                 self.core.device.destroy_image_view(r.view, None);
-                if let Some(h) = r.host {
-                    self.core.device.unmap_memory(h.memory);
-                    self.core.device.destroy_buffer(h.buffer, None);
-                    self.core.device.free_memory(h.memory, None);
-                }
                 self.core.destroy_image(r.image);
             }
             if let Some(o) = self.overlay.take() {

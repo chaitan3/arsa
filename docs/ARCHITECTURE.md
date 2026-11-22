@@ -429,10 +429,11 @@ The client allocates one contiguous host pool with N slot regions. RDMA
 registers each region with ordinary `ibv_reg_mr` (not `ibv_reg_dmabuf_mr`); the
 TCP reader writes directly into the same regions. The whole pool is imported
 once with `VK_EXT_external_memory_host` as one host-visible `VkBuffer`, so raw
-and lossless address a slot by byte offset with no CPU copy. If import fails,
-raw falls back to one persistent staging buffer and lossless to a private
-coded-buffer copy. Lossy PyroWave decode planes stay on the client's Vulkan
-device. There is no EGL/GL context and no dma-buf import/export on the client.
+and lossless address a slot by byte offset with no CPU copy. Pool import is
+required for raw/lossless: if the device cannot import it, the client reports
+the capability error instead of adding a CPU copy fallback. Lossy PyroWave
+decode planes stay on the client's Vulkan device. There is no EGL/GL context
+and no dma-buf import/export on the client.
 
 ### 7.2 Vulkan presenter (`--output vk`)
 
@@ -503,11 +504,10 @@ lossless paths address slot regions with a byte offset into that buffer.
 | lossy | RDMA | **3** R8 decode planes + **S** swapchain images (+ PyroWave internals) | **P** packet pushes into PyroWave; GPU decode writes planes | YUV→RGB in fragment shader→swapchain | **0** full-frame copies |
 | lossy | TCP | same **3** R8 planes + **S** swapchain images | **P** packet pushes; GPU decode writes planes | YUV→RGB in fragment shader→swapchain | **0** full-frame copies |
 
-Fallback:
+Notes:
 
-- If `VK_EXT_external_memory_host` import of the pool fails, raw uses **1**
-  persistent host staging `VkBuffer` and adds **1 CPU** copy per frame; lossless
-  keeps a private coded `VkBuffer` and adds **1 CPU** coded copy per frame.
+- `VK_EXT_external_memory_host` is required for raw/lossless; a failed pool
+  import is fatal (no host-staging CPU-copy fallback). Lossy does not need it.
 - PyroWave packet pushes are library-owned bitstream copies; there is no
   dma-buf export/import, no GL import, and no CPU YUV→RGB conversion in the
   window path.
