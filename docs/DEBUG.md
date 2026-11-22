@@ -22,9 +22,9 @@ Server stamps (`crates/proto`, `FrameStamp`):
 | `t2` | RDMA WRITE posted |
 | `t2c` | send CQ reported the WRITE fully written on the client |
 
-Client stamps: `t3` = frame received (drain), `t4` = `glTexImage2D`/decode
-returned, `t5` = `eglSwapBuffers` returned, `tp` = compositor on-screen time
-(`wp_presentation`).
+Client stamps: `t3` = frame received (drain), `t4` = Vulkan decode/upload and
+render submission started, `t5` = `vkQueuePresentKHR` returned, `tp` =
+compositor on-screen time (`wp_presentation`).
 
 Derived stages:
 
@@ -98,8 +98,8 @@ user-facing lines — init, connection/disconnect, and feature-disabling failure
   plus the audio e2e split (xfer/ring/sink) and A/V offset.
 - **`--idle-metrics N`** (server): log RSS/CPU/threads every N seconds.
 - **`--input-test`** (server): synthesize a test input sequence.
-- `RDMA_DISPLAY_LOSSY_DEBUG=1`: verbose lossy dma-buf import diagnostics.
-- `RDMA_DISPLAY_LOSSY_CPU=1`: force the lossy CPU download/upload path.
+- Lossy decode planes are sampled directly on the client Vulkan device; the old dma-buf import diagnostics and CPU fallback switch no longer apply.
+- `ARSA_CLIENT_DISABLE_HOST_IMPORT=1`: skip `VK_EXT_external_memory_host` import of the client receive pool and use the safe host-staging fallback (diagnostic/workaround for a driver that returns device lost on host import).
 - Capture-sync logs (`[capture-drm] …`) report when the fence watch is
   unavailable and the mode falls back to `settle`.
 
@@ -127,6 +127,29 @@ Steady state then pays only the encode.
 `codecbench` benchmarks all variants (`[texture]`, `[external]`, `[fetch]`,
 `[import]`) and requires them byte-identical to the SSBO encode and
 CPU-decodable.
+
+### Raw client: direct host sampling vs copy-to-image
+
+`cargo run --release -p rdma-display-client --bin raw_host_bench` compares two
+4K offscreen compute paths on the client GPU with timestamp queries:
+
+- **direct**: read the imported host-visible receive `VkBuffer` in the shader.
+- **copy**: copy the slot to a VRAM image, then sample that image.
+
+On the test NVIDIA GPU (30 timed runs, 5 warmups, 3840×2160, same output image):
+
+| path | min | median | mean |
+| --- | ---: | ---: | ---: |
+| direct host-buffer read | 4.971 ms | 4.977 ms | 4.977 ms |
+| copy → VRAM image → sample | 5.079 ms | 5.087 ms | 5.089 ms |
+
+Direct host sampling was only about **2% faster** in this isolated compute
+test (0.11 ms/frame at 4K). The production raw pipeline still copies into the
+sampled image because that path also supports letterbox/scaling and the metrics
+overlay; switching the final raw shader to read the host buffer directly would
+save the copy but make filtering and future direct-scanout work harder. The
+benchmark is intentionally compute-only and does not include compositor
+presentation.
 
 ## 4. Capture sync / handover investigation
 
@@ -287,9 +310,8 @@ refresh it is quantized to vblanks and inflated by the compositor's render loop
 and triple buffering: expect ~1–2 frames (8–16 ms at 120 Hz). To reduce it:
 
 - Mark the surface **fully opaque** (`wl_surface.set_opaque_region`, updated on
-  every size change), use an **alpha-free (XRGB)** EGL config, and run
-  **`--fullscreen`** — that makes the buffer eligible for direct scanout, which
-  removes the compositing stage.
+  every size change) and run **`--fullscreen`** — that makes the Vulkan WSI
+  buffer eligible for direct scanout, which removes the compositing stage.
 - **VRR** removes the fixed-vblank quantization (the compositor flips on
   demand); without it, `display` is bounded by the compositor's scheduling, not
   by our pipeline.

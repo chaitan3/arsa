@@ -107,19 +107,27 @@ impl Open {
     /// Open in place: `buf` is `ciphertext || tag`; on success it is truncated
     /// to the plaintext. No allocation (this is the video/audio hot path).
     pub fn open_in_place(&mut self, buf: &mut Vec<u8>) -> Result<()> {
-        let n = buf.len();
-        if n < 16 {
+        let len = buf.len();
+        let n = self.open_in_place_slice(buf, len)?;
+        buf.truncate(n);
+        Ok(())
+    }
+
+    /// Slice variant used when the plaintext lands directly in a fixed receive
+    /// slot. Returns the plaintext length; bytes after that are untouched.
+    pub fn open_in_place_slice(&mut self, buf: &mut [u8], len: usize) -> Result<usize> {
+        anyhow::ensure!(len <= buf.len(), "ciphertext longer than receive slot");
+        if len < 16 {
             anyhow::bail!("short ciphertext");
         }
-        let ct_len = n - 16;
-        let (ct, tag) = buf.split_at_mut(ct_len);
+        let ct_len = len - 16;
+        let (ct, tag) = buf[..len].split_at_mut(ct_len);
         let tag = GenericArray::from_slice(tag);
         self.cipher
             .decrypt_in_place_detached(&nonce(self.counter), b"", ct, tag)
             .map_err(|_| anyhow::anyhow!("stream decrypt failed (tamper or key mismatch)"))?;
         self.counter = self.counter.wrapping_add(1);
-        buf.truncate(ct_len);
-        Ok(())
+        Ok(ct_len)
     }
 }
 

@@ -44,6 +44,246 @@ fn has_ext(props: &[vk::ExtensionProperties], name: &str) -> bool {
 }
 
 impl VkCore {
+    /// Create the client-side Vulkan device with a Wayland surface and the
+    /// swapchain extension. The returned surface is owned by the caller.
+    /// PyroWave, the lossless decoder and the swapchain all share this device.
+    pub fn new_client(
+        wl_display: *mut c_void,
+        wl_surface: *mut c_void,
+    ) -> Result<(Self, vk::SurfaceKHR)> {
+        unsafe {
+            let entry = ash::Entry::load().context("load libvulkan (libvulkan.so.1)")?;
+
+            let app_name = leak_cstr("arsa");
+            let app_info: &'static vk::ApplicationInfo = Box::leak(Box::new(vk::ApplicationInfo {
+                p_application_name: app_name.as_ptr(),
+                application_version: 1,
+                api_version: vk::make_api_version(0, 1, 3, 0),
+                ..Default::default()
+            }));
+            let instance_ext_names = [
+                leak_cstr("VK_KHR_surface"),
+                leak_cstr("VK_KHR_wayland_surface"),
+            ];
+            let instance_ext_ptrs: &'static [*const c_char] = Box::leak(
+                instance_ext_names
+                    .iter()
+                    .map(|c| c.as_ptr())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            );
+            let instance_ci: &'static vk::InstanceCreateInfo =
+                Box::leak(Box::new(vk::InstanceCreateInfo {
+                    p_application_info: app_info,
+                    enabled_extension_count: instance_ext_ptrs.len() as u32,
+                    pp_enabled_extension_names: instance_ext_ptrs.as_ptr(),
+                    ..Default::default()
+                }));
+            let instance = entry
+                .create_instance(instance_ci, None)
+                .context("vkCreateInstance")?;
+            let wayland_loader = ash::khr::wayland_surface::Instance::new(&entry, &instance);
+            let surface = wayland_loader.create_wayland_surface(
+                &vk::WaylandSurfaceCreateInfoKHR {
+                    display: wl_display,
+                    surface: wl_surface,
+                    ..Default::default()
+                },
+                None,
+            )?;
+            let surface_loader = ash::khr::surface::Instance::new(&entry, &instance);
+
+            let pds = instance.enumerate_physical_devices()?;
+            if pds.is_empty() {
+                bail!("no Vulkan physical devices");
+            }
+            let required = [
+                "VK_KHR_external_memory_fd",
+                "VK_KHR_external_semaphore_fd",
+                "VK_EXT_external_memory_dma_buf",
+                "VK_EXT_image_drm_format_modifier",
+                "VK_KHR_dedicated_allocation",
+                "VK_KHR_get_memory_requirements2",
+                "VK_KHR_bind_memory2",
+                "VK_KHR_swapchain",
+            ];
+            let mut chosen: Option<(vk::PhysicalDevice, u32)> = None;
+            for pd in &pds {
+                let exts = instance.enumerate_device_extension_properties(*pd)?;
+                let missing: Vec<&str> = required
+                    .iter()
+                    .copied()
+                    .filter(|n| !has_ext(&exts, n))
+                    .collect();
+                if !missing.is_empty() {
+                    let props = instance.get_physical_device_properties(*pd);
+                    let name = std::ffi::CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy();
+                    log::info!("[vkcore] skip {name}: missing {missing:?}");
+                    continue;
+                }
+                let qfams = instance.get_physical_device_queue_family_properties(*pd);
+                let qfam = qfams.iter().position(|q| {
+                    q.queue_flags
+                        .contains(vk::QueueFlags::COMPUTE | vk::QueueFlags::GRAPHICS)
+                });
+                let qfam = match qfam {
+                    Some(q) => q,
+                    None => continue,
+                };
+                let present = surface_loader.get_physical_device_surface_support(
+                    *pd,
+                    qfam as u32,
+                    surface,
+                )?;
+                if !present {
+                    continue;
+                }
+                chosen = Some((*pd, qfam as u32));
+                break;
+            }
+            let (physical_device, queue_family) =
+                chosen.context("no device with interop + swapchain + a present queue")?;
+
+            let props = instance.get_physical_device_properties(physical_device);
+            let api_version = props.api_version;
+            let dev_name = std::ffi::CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy();
+            log::info!(
+                "[vkcore] client device: {dev_name} (api {}.{}.{})",
+                vk::api_version_major(api_version),
+                vk::api_version_minor(api_version),
+                vk::api_version_patch(api_version),
+            );
+
+            let feat11: &'static mut vk::PhysicalDeviceVulkan11Features =
+                Box::leak(Box::new(vk::PhysicalDeviceVulkan11Features::default()));
+            let feat12: &'static mut vk::PhysicalDeviceVulkan12Features =
+                Box::leak(Box::new(vk::PhysicalDeviceVulkan12Features {
+                    storage_buffer8_bit_access: vk::TRUE,
+                    shader_float16: vk::TRUE,
+                    timeline_semaphore: vk::TRUE,
+                    scalar_block_layout: vk::TRUE,
+                    uniform_buffer_standard_layout: vk::TRUE,
+                    ..Default::default()
+                }));
+            let feat13: &'static mut vk::PhysicalDeviceVulkan13Features =
+                Box::leak(Box::new(vk::PhysicalDeviceVulkan13Features {
+                    subgroup_size_control: vk::TRUE,
+                    compute_full_subgroups: vk::TRUE,
+                    synchronization2: vk::TRUE,
+                    dynamic_rendering: vk::TRUE,
+                    ..Default::default()
+                }));
+            let feat2: &'static mut vk::PhysicalDeviceFeatures2 =
+                Box::leak(Box::new(vk::PhysicalDeviceFeatures2 {
+                    features: vk::PhysicalDeviceFeatures {
+                        shader_int16: vk::TRUE,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }));
+            feat13.p_next = feat12 as *mut _ as *mut c_void;
+            feat12.p_next = feat11 as *mut _ as *mut c_void;
+            feat2.p_next = feat13 as *mut _ as *mut c_void;
+
+            let mut probe = vk::PhysicalDeviceFeatures2::default();
+            let mut probe13 = vk::PhysicalDeviceVulkan13Features::default();
+            let mut probe12 = vk::PhysicalDeviceVulkan12Features::default();
+            probe.p_next = &mut probe13 as *mut _ as *mut c_void;
+            probe13.p_next = &mut probe12 as *mut _ as *mut c_void;
+            instance.get_physical_device_features2(physical_device, &mut probe);
+            log::info!(
+                "[vkcore] features: shaderInt16={} subgroupSizeControl={} storageBuffer8BitAccess={} shaderFloat16={} dynamicRendering={}",
+                probe.features.shader_int16 == vk::TRUE,
+                probe13.subgroup_size_control == vk::TRUE,
+                probe12.storage_buffer8_bit_access == vk::TRUE,
+                probe12.shader_float16 == vk::TRUE,
+                probe13.dynamic_rendering == vk::TRUE,
+            );
+            if probe.features.shader_int16 != vk::TRUE
+                || probe13.subgroup_size_control != vk::TRUE
+                || probe13.dynamic_rendering != vk::TRUE
+            {
+                bail!("device lacks PyroWave/presenter required features (shaderInt16, subgroupSizeControl, dynamicRendering)");
+            }
+
+            let dev_exts = instance.enumerate_device_extension_properties(physical_device)?;
+            let want_exts = [
+                "VK_KHR_external_memory_fd",
+                "VK_KHR_external_semaphore_fd",
+                "VK_KHR_external_fence_fd",
+                "VK_EXT_image_drm_format_modifier",
+                "VK_EXT_external_memory_dma_buf",
+                "VK_EXT_external_memory_host",
+                "VK_KHR_dedicated_allocation",
+                "VK_KHR_get_memory_requirements2",
+                "VK_KHR_bind_memory2",
+                "VK_KHR_swapchain",
+            ];
+            let mut ext_names: Vec<&'static CString> = Vec::new();
+            for n in want_exts {
+                if has_ext(&dev_exts, n) {
+                    ext_names.push(leak_cstr(n));
+                }
+            }
+            let ext_ptrs: &'static [*const c_char] = Box::leak(
+                ext_names
+                    .iter()
+                    .map(|c| c.as_ptr())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            );
+
+            let priorities: &'static [f32] = Box::leak(Box::new([1.0f32]));
+            let queue_ci: &'static vk::DeviceQueueCreateInfo =
+                Box::leak(Box::new(vk::DeviceQueueCreateInfo {
+                    queue_family_index: queue_family,
+                    queue_count: 1,
+                    p_queue_priorities: priorities.as_ptr(),
+                    ..Default::default()
+                }));
+            let device_ci: &'static vk::DeviceCreateInfo = Box::leak(Box::new(vk::DeviceCreateInfo {
+                p_next: feat2 as *mut _ as *mut c_void,
+                queue_create_info_count: 1,
+                p_queue_create_infos: queue_ci,
+                enabled_extension_count: ext_ptrs.len() as u32,
+                pp_enabled_extension_names: ext_ptrs.as_ptr(),
+                p_enabled_features: std::ptr::null(),
+                ..Default::default()
+            }));
+            let device = instance
+                .create_device(physical_device, device_ci, None)
+                .context("vkCreateDevice")?;
+            let queue = device.get_device_queue(queue_family, 0);
+            let command_pool = device.create_command_pool(
+                &vk::CommandPoolCreateInfo {
+                    flags: vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+                    queue_family_index: queue_family,
+                    ..Default::default()
+                },
+                None,
+            )?;
+            log::info!(
+                "[vkcore] client queue family {queue_family}; {} extensions enabled",
+                ext_ptrs.len()
+            );
+            Ok((
+                VkCore {
+                    entry,
+                    instance,
+                    physical_device,
+                    device,
+                    queue,
+                    queue_family,
+                    command_pool,
+                    api_version,
+                    instance_ci,
+                    device_ci,
+                },
+                surface,
+            ))
+        }
+    }
+
     pub fn new() -> Result<Self> {
         unsafe {
             let entry = ash::Entry::load().context("load libvulkan (libvulkan.so.1)")?;
@@ -250,6 +490,18 @@ impl VkCore {
 
     /// Run `record` on the compute queue and wait for it to complete.
     pub fn one_shot<F: FnOnce(vk::CommandBuffer)>(&self, record: F) -> Result<()> {
+        self.one_shot_result(|cb| {
+            record(cb);
+            Ok(())
+        })
+    }
+
+    /// Fallible variant of [`one_shot`](Self::one_shot), used by the lossless
+    /// decoder to record a compute dispatch that may reject a malformed header.
+    pub fn one_shot_result<F: FnOnce(vk::CommandBuffer) -> Result<()>>(
+        &self,
+        record: F,
+    ) -> Result<()> {
         unsafe {
             let cb = self.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo {
                 command_pool: self.command_pool,
@@ -264,7 +516,10 @@ impl VkCore {
                     ..Default::default()
                 },
             )?;
-            record(cb);
+            if let Err(e) = record(cb) {
+                self.device.free_command_buffers(self.command_pool, &[cb]);
+                return Err(e);
+            }
             self.device.end_command_buffer(cb)?;
             let fence = self.device.create_fence(&vk::FenceCreateInfo::default(), None)?;
             let cbs = [cb];
@@ -341,6 +596,17 @@ pub struct HostBuffer {
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
     pub ptr: *mut u8,
+    pub size: u64,
+}
+
+/// A VkBuffer over externally-owned host memory imported with
+/// `VK_EXT_external_memory_host`. The RDMA receive slots use this on the client
+/// raw path so the GPU copy reads the slot directly (no host memcpy).
+pub struct ImportedHostBuffer {
+    pub buffer: vk::Buffer,
+    pub memory: vk::DeviceMemory,
+    /// Offset of the caller's pointer inside the page-aligned imported range.
+    pub base_offset: u64,
     pub size: u64,
 }
 
@@ -422,6 +688,106 @@ impl VkCore {
                 return Err(e.into());
             }
             Ok(GpuBuffer { buffer, memory, size })
+        }
+    }
+}
+
+impl VkCore {
+    /// Import an existing host allocation as a `TRANSFER_SRC` VkBuffer. The
+    /// caller retains ownership of the host memory; the returned buffer and
+    /// its imported VkDeviceMemory must be destroyed while the host range is
+    /// still alive. The pointer is aligned down to the driver's required
+    /// alignment; `base_offset` is the byte offset of the original pointer.
+    pub fn import_host_buffer(&self, ptr: *mut u8, len: usize) -> Result<ImportedHostBuffer> {
+        if ptr.is_null() || len == 0 {
+            bail!("import_host_buffer: null/empty range");
+        }
+        if !self.has_device_ext("VK_EXT_external_memory_host") {
+            bail!("device lacks VK_EXT_external_memory_host");
+        }
+        unsafe {
+            let mut host_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+            let mut pd_props = vk::PhysicalDeviceProperties2 {
+                p_next: &mut host_props as *mut _ as *mut c_void,
+                ..Default::default()
+            };
+            self.instance
+                .get_physical_device_properties2(self.physical_device, &mut pd_props);
+            let align = host_props.min_imported_host_pointer_alignment.max(1);
+            let base = (ptr as usize) & !((align - 1) as usize);
+            let base_offset = (ptr as usize - base) as u64;
+            let total = (base_offset as usize)
+                .checked_add(len)
+                .context("import_host_buffer: size overflow")?;
+
+            let buffer = self.device.create_buffer(
+                &vk::BufferCreateInfo {
+                    size: total as u64,
+                    usage: vk::BufferUsageFlags::TRANSFER_SRC,
+                    sharing_mode: vk::SharingMode::EXCLUSIVE,
+                    ..Default::default()
+                },
+                None,
+            )?;
+            let req = self.device.get_buffer_memory_requirements(buffer);
+            if req.size > total as u64 {
+                self.device.destroy_buffer(buffer, None);
+                bail!(
+                    "host import needs {} bytes of Vulkan memory but the host range is {}",
+                    req.size,
+                    total
+                );
+            }
+            let ext = ash::ext::external_memory_host::Device::new(&self.instance, &self.device);
+            let mut host = vk::MemoryHostPointerPropertiesEXT::default();
+            let get_props = ext.fp().get_memory_host_pointer_properties_ext;
+            let r = get_props(
+                self.device.handle(),
+                vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+                base as *const c_void,
+                &mut host,
+            );
+            if r != vk::Result::SUCCESS {
+                self.device.destroy_buffer(buffer, None);
+                bail!("vkGetMemoryHostPointerPropertiesEXT: {r:?}");
+            }
+            let mt = self
+                .find_memory_type(
+                    host.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )
+                .or_else(|_| self.find_memory_type(host.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE))?;
+            let mut import = vk::ImportMemoryHostPointerInfoEXT {
+                handle_type: vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+                p_host_pointer: base as *mut c_void,
+                ..Default::default()
+            };
+            let memory = match self.device.allocate_memory(
+                &vk::MemoryAllocateInfo {
+                    allocation_size: req.size,
+                    memory_type_index: mt,
+                    p_next: &mut import as *mut _ as *mut c_void,
+                    ..Default::default()
+                },
+                None,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.device.destroy_buffer(buffer, None);
+                    return Err(e.into());
+                }
+            };
+            if let Err(e) = self.device.bind_buffer_memory(buffer, memory, 0) {
+                self.device.free_memory(memory, None);
+                self.device.destroy_buffer(buffer, None);
+                return Err(e.into());
+            }
+            Ok(ImportedHostBuffer {
+                buffer,
+                memory,
+                base_offset,
+                size: total as u64,
+            })
         }
     }
 }
@@ -813,6 +1179,19 @@ impl VkCore {
         height: u32,
         old: vk::ImageLayout,
     ) -> Result<()> {
+        self.download_image(image, host, width, height, old)
+    }
+
+    /// Read a single-plane image back into `host`. The image format can be
+    /// R8 or RGBA8; the host buffer must be large enough for the dense extent.
+    pub fn download_image(
+        &self,
+        image: vk::Image,
+        host: &HostBuffer,
+        width: u32,
+        height: u32,
+        old: vk::ImageLayout,
+    ) -> Result<()> {
         self.one_shot(|cb| unsafe {
             let to_src = vk::ImageMemoryBarrier {
                 old_layout: old,
@@ -827,13 +1206,15 @@ impl VkCore {
                     base_array_layer: 0,
                     layer_count: 1,
                 },
-                src_access_mask: vk::AccessFlags::SHADER_WRITE,
+                src_access_mask: vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::TRANSFER_READ,
                 dst_access_mask: vk::AccessFlags::TRANSFER_READ,
                 ..Default::default()
             };
             self.device.cmd_pipeline_barrier(
                 cb,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -938,6 +1319,54 @@ mod export_tests {
     /// Probe the GPU zero-copy building block: a device-local buffer whose
     /// memory exports as a dma-buf. A failure here means the server will use
     /// its host staging fallback (expected on some drivers).
+    #[test]
+    #[ignore = "requires a Vulkan device and VK_EXT_external_memory_host"]
+    fn imported_host_buffer_reads_the_original_memory() {
+        let core = VkCore::new().expect("vulkan core");
+        let len = 1usize << 20;
+        unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert_ne!(p, libc::MAP_FAILED, "mmap: {}", std::io::Error::last_os_error());
+            let src = std::slice::from_raw_parts_mut(p as *mut u8, len);
+            for (i, b) in src.iter_mut().enumerate() {
+                *b = (i * 31 + 7) as u8;
+            }
+            let imp = core
+                .import_host_buffer((p as *mut u8).add(123), len - 123)
+                .expect("host import");
+            let dst = core.host_buffer(len as u64).expect("dst");
+            core.one_shot(|cb| {
+                core.device.cmd_copy_buffer(
+                    cb,
+                    imp.buffer,
+                    dst.buffer,
+                    &[vk::BufferCopy {
+                        src_offset: imp.base_offset,
+                        dst_offset: 0,
+                        size: (len - 123) as u64,
+                    }],
+                );
+            })
+            .expect("copy");
+            assert_eq!(&dst.as_slice()[..len - 123], &src[123..]);
+            unsafe {
+                core.device.unmap_memory(dst.memory);
+                core.device.destroy_buffer(dst.buffer, None);
+                core.device.free_memory(dst.memory, None);
+                core.device.destroy_buffer(imp.buffer, None);
+                core.device.free_memory(imp.memory, None);
+                libc::munmap(p, len);
+            }
+        }
+    }
+
     #[test]
     #[ignore = "requires a Vulkan device and dma-buf buffer export support"]
     fn exportable_buffer_exports_a_dmabuf() {

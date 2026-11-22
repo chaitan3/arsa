@@ -14,13 +14,14 @@ rdma-display-rdma = { path = "../rdma" }
 rdma-display-auth = { path = "../auth" }
 rdma-display-vkcore = { path = "../vkcore" }
 rdma-display-codec = { path = "../codec" }
-rdma-display-codec-gpu = { path = "../codec-gpu" }
 rdma-display-audio = { path = "../audio" }
 anyhow.workspace = true
-libloading = "0.8"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 wayland-backend = { version = "0.3", features = ["client_system"] }
 libc = "0.2"
 log.workspace = true
 env_logger.workspace = true
+
+[dev-dependencies]
+rdma-display-vkcodec = { path = "../vkcodec" }

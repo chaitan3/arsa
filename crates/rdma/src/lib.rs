@@ -1598,18 +1598,118 @@ fn spawn_control_reader(
     rx
 }
 
+/// Client-side receive slot memory. One contiguous host allocation holds all
+/// N slots; RDMA registers each slot range with `ibv_reg_mr`, and the TCP
+/// reader writes each frame into its slot region. Keeping the allocation
+/// stable lets the Vulkan client import the whole pool once as one
+/// host-visible `VkBuffer` (raw/lossless paths).
+pub struct ClientSlotMemory {
+    ptr: *mut u8,
+    len: usize,
+    layout: std::alloc::Layout,
+    slot_len: usize,
+    slot_stride: usize,
+    slots: usize,
+}
+
+// The pool is shared between the receive path and the TCP video-reader
+// thread. Slot ownership is enforced by the reader's free list / recycle
+// channel; the allocation itself never moves.
+unsafe impl Send for ClientSlotMemory {}
+unsafe impl Sync for ClientSlotMemory {}
+
+impl ClientSlotMemory {
+    pub fn new(slot_len: usize, slots: usize, headroom: usize) -> Result<Self> {
+        anyhow::ensure!(slot_len > 0 && slots > 0, "empty client slot pool");
+        let stride = slot_len
+            .checked_add(headroom)
+            .and_then(|n| n.checked_add(15))
+            .map(|n| n & !15)
+            .ok_or_else(|| anyhow!("client slot size overflow"))?;
+        let used = stride
+            .checked_mul(slots)
+            .ok_or_else(|| anyhow!("client slot pool size overflow"))?;
+        // Page/64K alignment matters for two consumers: ibv_reg_mr and
+        // VK_EXT_external_memory_host. A plain Vec is only 16-byte aligned;
+        // importing a range whose aligned base is outside the allocation (or
+        // smaller than the Vulkan memory-requirements size) makes some
+        // drivers, notably Intel, lose the device. Allocate a 64K-aligned,
+        // 64K-rounded pool and zero it.
+        const ALIGN: usize = 64 * 1024;
+        let total = used
+            .checked_add(ALIGN - 1)
+            .map(|n| n & !(ALIGN - 1))
+            .ok_or_else(|| anyhow!("client slot pool size overflow"))?;
+        let layout = std::alloc::Layout::from_size_align(total, ALIGN)
+            .context("client slot pool layout")?;
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            anyhow::bail!("allocate {total} byte client slot pool");
+        }
+        Ok(Self {
+            ptr,
+            len: total,
+            layout,
+            slot_len,
+            slot_stride: stride,
+            slots,
+        })
+    }
+
+    pub fn slots(&self) -> usize {
+        self.slots
+    }
+
+    pub fn slot_len(&self) -> usize {
+        self.slot_len
+    }
+
+    pub fn slot_capacity(&self) -> usize {
+        self.slot_stride
+    }
+
+    pub fn total_len(&self) -> usize {
+        self.len
+    }
+
+    pub fn base_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    pub fn slot_ptr(&self, slot: usize) -> *mut u8 {
+        assert!(slot < self.slots);
+        unsafe { self.base_ptr().add(slot * self.slot_stride) }
+    }
+
+    pub fn slot(&self, slot: usize) -> &[u8] {
+        assert!(slot < self.slots);
+        unsafe { std::slice::from_raw_parts(self.slot_ptr(slot), self.slot_len) }
+    }
+
+    /// Mutable view for the TCP reader. The caller must own the slot (the
+    /// reader's free list), and no other thread may touch it until the frame
+    /// is credited back.
+    pub unsafe fn slot_mut(&self, slot: usize) -> &mut [u8] {
+        assert!(slot < self.slots);
+        std::slice::from_raw_parts_mut(self.slot_ptr(slot), self.slot_stride)
+    }
+}
+
+impl Drop for ClientSlotMemory {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) };
+    }
+}
+
 enum Rx {
     Rdma {
         qp: QueuePair<Rc>,
         recv_cq: CompletionQueue,
-        slots: Vec<MemoryRegion<Box<[u8]>>>,
+        slots: Vec<MemoryRegion<()>>,
     },
     Tcp {
-        frame_rx: mpsc::Receiver<(u64, Vec<u8>)>,
-        recycle_tx: mpsc::Sender<Vec<u8>>,
-        slots: Vec<Vec<u8>>,
-        slot_free: Vec<bool>,
-        pending: Option<(u64, Vec<u8>)>,
+        frame_rx: mpsc::Receiver<(u64, usize, usize)>,
+        recycle_tx: mpsc::Sender<usize>,
         _reader: std::thread::JoinHandle<()>,
     },
 }
@@ -1624,14 +1724,14 @@ pub struct ClientLink {
     /// bytes per receive slot: the raw frame, the lossless worst case, or the
     /// lossy downlink budget
     slot_len: usize,
-    /// decode state for codec != Raw (kept here so the presenter just calls
-    /// [`ClientLink::frame`])
-    decoder: Option<rdma_display_codec::Decoder>,
     /// session nonce the server assigned; presented on the input connection
     pub session_nonce: u64,
     /// server's answer to this session's pre-handshake display-mode request
     pub mode_reply: proto::ModeReply,
     rx: Rx,
+    /// One contiguous host pool used by both RDMA and TCP; stable pointers
+    /// let the Vulkan client import it once.
+    host_slots: std::sync::Arc<ClientSlotMemory>,
     /// server→client control events (Stamps, Pongs) from the reader thread
     ctrl_rx: mpsc::Receiver<ControlEvent>,
     transport: Transport,
@@ -1718,10 +1818,9 @@ impl VideoReaderStats {
 /// out the reader blocks on `recycle_rx` rather than growing latency.
 fn spawn_video_reader(
     mut stream: TcpStream,
-    slot_len: usize,
-    slots: usize,
-    frame_tx: mpsc::Sender<(u64, Vec<u8>)>,
-    recycle_rx: mpsc::Receiver<Vec<u8>>,
+    pool: std::sync::Arc<ClientSlotMemory>,
+    frame_tx: mpsc::Sender<(u64, usize, usize)>,
+    recycle_rx: mpsc::Receiver<usize>,
     stats: std::sync::Arc<VideoReaderStats>,
     metrics: bool,
     mut open: Option<rdma_display_auth::Open>,
@@ -1729,19 +1828,18 @@ fn spawn_video_reader(
     std::thread::Builder::new()
         .name("video-reader".into())
         .spawn(move || {
-            let mut free: Vec<Vec<u8>> =
-                (0..slots).map(|_| Vec::with_capacity(slot_len)).collect();
+            let mut free: Vec<usize> = (0..pool.slots()).rev().collect();
             loop {
                 let stalled;
-                let mut buf = match free.pop() {
-                    Some(b) => {
+                let slot = match free.pop() {
+                    Some(s) => {
                         stalled = false;
-                        b
+                        s
                     }
                     None => {
                         stalled = true;
                         match recycle_rx.recv() {
-                            Ok(b) => b,
+                            Ok(s) => s,
                             Err(_) => break, // presenter gone
                         }
                     }
@@ -1752,29 +1850,36 @@ fn spawn_video_reader(
                 }
                 let len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
                 let seq = u64::from_le_bytes(hdr[4..12].try_into().unwrap());
-                // encrypted frames carry a 16-byte tag on top of the plaintext
-                let headroom = if open.is_some() { 16 } else { 0 };
-                if len > slot_len + headroom {
-                    log::debug!("[tcp] video frame {len} > slot {slot_len}");
+                if len > pool.slot_capacity() {
+                    log::debug!(
+                        "[tcp] video frame {len} > slot capacity {}",
+                        pool.slot_capacity()
+                    );
                     break;
                 }
-                buf.clear();
-                buf.resize(len, 0);
-                if std::io::Read::read_exact(&mut stream, &mut buf).is_err() {
+                // SAFETY: `slot` is in this reader's free list, so the main
+                // thread cannot touch it until we send it below.
+                let dst = unsafe { &mut pool.slot_mut(slot)[..len] };
+                if std::io::Read::read_exact(&mut stream, dst).is_err() {
                     break;
                 }
-                if let Some(o) = open.as_mut() {
-                    if let Err(e) = o.open_in_place(&mut buf) {
-                        log::warn!("[tcp] video decrypt failed: {e:#}");
-                        break;
+                let plain_len = if let Some(o) = open.as_mut() {
+                    match o.open_in_place_slice(unsafe { pool.slot_mut(slot) }, len) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            log::warn!("[tcp] video decrypt failed: {e:#}");
+                            break;
+                        }
                     }
-                }
+                } else {
+                    len
+                };
                 // arrival stamped after the payload lands in memory (only when
                 // the client is collecting metrics — no per-frame work otherwise)
                 if metrics {
                     stats.observe(proto::unix_now_us(), stalled);
                 }
-                if frame_tx.send((seq, buf)).is_err() {
+                if frame_tx.send((seq, slot, plain_len)).is_err() {
                     break;
                 }
             }
@@ -1923,17 +2028,18 @@ impl ClientLink {
                 "nonsensical slot size {slot_len}"
             ),
         }
-        let geom = rdma_display_codec::Geometry::new(meta.width, meta.height, meta.stride);
-        let decoder = match codec {
-            rdma_display_codec::Codec::Lossless => Some(rdma_display_codec::Decoder::new(geom)?),
-            _ => None,
-        };
         log::info!(
             "[rdma] codec={} slot_len={} (frame_bytes={})",
             codec.name(),
             slot_len,
             meta.frame_bytes
         );
+
+        // One stable host pool for all receive slots. RDMA registers the
+        // individual slot ranges with ibv_reg_mr (no dma-buf); TCP reads
+        // directly into the same mapped regions.
+        let headroom = if transport == Transport::Tcp && encrypt { 16 } else { 0 };
+        let host_slots = std::sync::Arc::new(ClientSlotMemory::new(slot_len, slots, headroom)?);
 
         let video_reader = std::sync::Arc::new(VideoReaderStats::default());
         let video_open = if encrypt {
@@ -1950,11 +2056,18 @@ impl ClientLink {
             Transport::Rdma => {
                 let (qp, _send_cq, recv_cq) = endpoint.expect("rdma endpoint");
                 let pd = pd.expect("pd");
-                let mut slots_v: Vec<MemoryRegion<Box<[u8]>>> = Vec::with_capacity(slots);
-                for _ in 0..slots {
-                    let mr = pd
-                        .allocate(slot_len, AccessFlags::PERMISSIVE)
-                        .context("allocate recv slot")?;
+                let mut slots_v: Vec<MemoryRegion<()>> = Vec::with_capacity(slots);
+                for i in 0..slots {
+                    // Client uses ordinary ibv_reg_mr on the stable host pool;
+                    // ibv_reg_dmabuf_mr is deliberately not used here.
+                    let mr = unsafe {
+                        pd.register_from_raw(
+                            host_slots.slot_ptr(i),
+                            slot_len,
+                            AccessFlags::PERMISSIVE,
+                        )
+                    }
+                    .context("register recv slot")?;
                     slots_v.push(mr);
                 }
                 let descs: Vec<SlotDesc> = slots_v
@@ -1984,10 +2097,10 @@ impl ClientLink {
                     codec,
                     codec_chroma,
                     slot_len,
-                    decoder,
                     session_nonce,
                     mode_reply: mode_reply.clone(),
                     rx,
+                    host_slots: host_slots.clone(),
                     ctrl_rx: spawn_control_reader(reader_stream, ctrl_open),
                     transport,
                     last_rx_bytes: 0,
@@ -2006,14 +2119,18 @@ impl ClientLink {
                     .context("video: session proof")?;
                 let (frame_tx, frame_rx) = mpsc::channel();
                 let (recycle_tx, recycle_rx) = mpsc::channel();
-                let reader =
-                    spawn_video_reader(s, slot_len, slots, frame_tx, recycle_rx, video_reader.clone(), metrics, video_open);
+                let reader = spawn_video_reader(
+                    s,
+                    host_slots.clone(),
+                    frame_tx,
+                    recycle_rx,
+                    video_reader.clone(),
+                    metrics,
+                    video_open,
+                );
                 Rx::Tcp {
                     frame_rx,
                     recycle_tx,
-                    slots: vec![Vec::new(); slots],
-                    slot_free: vec![true; slots],
-                    pending: None,
                     _reader: reader,
                 }
             }
@@ -2025,10 +2142,10 @@ impl ClientLink {
             codec,
             codec_chroma,
             slot_len,
-            decoder,
             session_nonce,
             mode_reply,
             rx,
+            host_slots,
             ctrl_rx: spawn_control_reader(reader_stream, ctrl_open),
             transport,
             last_rx_bytes: 0,
@@ -2076,29 +2193,11 @@ impl ClientLink {
                 // the RDMA WRITE length: the actual bytes that crossed the wire
                 (frame_seq, slot, wc.len())
             }
-            Rx::Tcp {
-                frame_rx,
-                slots,
-                slot_free,
-                pending,
-                ..
-            } => {
-                let item = match pending.take() {
-                    Some(p) => Some(p),
-                    None => frame_rx.try_recv().ok(),
-                };
-                let Some((seq, buf)) = item else {
+            Rx::Tcp { frame_rx, .. } => {
+                let Some((seq, slot, nbytes)) = frame_rx.try_recv().ok() else {
                     return Ok(None);
                 };
-                let nbytes = buf.len();
-                if let Some(slot) = slot_free.iter().position(|f| *f) {
-                    slot_free[slot] = false;
-                    slots[slot] = buf;
-                    (seq, slot, nbytes)
-                } else {
-                    *pending = Some((seq, buf)); // no free slot: retry next call
-                    return Ok(None);
-                }
+                (seq, slot, nbytes)
             }
         };
         self.last_rx_bytes = nbytes;
@@ -2149,17 +2248,8 @@ impl ClientLink {
             Rx::Rdma { .. } => {
                 self.conn.send(&Message::Credit(slot as u32))?;
             }
-            Rx::Tcp {
-                recycle_tx,
-                slots,
-                slot_free,
-                ..
-            } => {
-                if slot < slots.len() {
-                    slot_free[slot] = true;
-                    let v = std::mem::take(&mut slots[slot]);
-                    let _ = recycle_tx.send(v);
-                }
+            Rx::Tcp { recycle_tx, .. } => {
+                let _ = recycle_tx.send(slot);
                 self.conn.send(&Message::Credit(slot as u32))?;
             }
         }
@@ -2192,46 +2282,30 @@ impl ClientLink {
     }
 
 
+    /// The stable host pool backing every receive slot. The Vulkan client
+    /// imports the whole pool once as one host-visible `VkBuffer`.
+    pub fn host_slots(&self) -> &std::sync::Arc<ClientSlotMemory> {
+        &self.host_slots
+    }
+
+    /// Stable host pointers for every receive slot (both RDMA and TCP).
+    pub fn slot_ptrs(&self) -> Vec<(*mut u8, usize)> {
+        (0..self.host_slots.slots())
+            .map(|i| (self.host_slots.slot_ptr(i), self.slot_len))
+            .collect()
+    }
+
     /// Read the bytes of slot `slot` (the coded frame when a codec is active);
     /// use [`frame`](Self::frame) for decoded pixels.
     pub fn slot_bytes(&self, slot: usize) -> &[u8] {
-        let n = self.slot_len;
-        match &self.rx {
-            Rx::Rdma { slots, .. } => &slots[slot].bytes()[..n],
-            Rx::Tcp { slots, .. } => &slots[slot][..],
-        }
+        self.host_slots.slot(slot)
     }
 
-    /// The full decoded frame for `slot` (stride × height pixels). `Raw` is a
-    /// borrow of the slot; a coded frame is decoded into the link's internal
-    /// buffer. Valid until the next `frame`/`decode` call (and, for `Raw`,
-    /// until the slot is credited).
+    /// The raw frame bytes for `slot` (stride × height pixels), valid until
+    /// the slot is credited. Coded codecs use the client renderer/decoders
+    /// directly; this host accessor is only the raw/headless path.
     pub fn frame(&mut self, slot: usize) -> Result<&[u8]> {
-        if self.decoder.is_none() {
-            return Ok(self.slot_bytes(slot));
-        }
-        // Inline the slot access so the borrow checker sees the slot storage
-        // and `decoder` as disjoint fields.
-        match &self.rx {
-            Rx::Rdma { slots, .. } => {
-                let coded: &[u8] = &slots[slot].bytes()[..self.slot_len];
-                let dec = self.decoder.as_mut().expect("decoder present");
-                dec.decode(coded)
-            }
-            Rx::Tcp { slots, .. } => {
-                let coded: &[u8] = &slots[slot][..];
-                let dec = self.decoder.as_mut().expect("decoder present");
-                dec.decode(coded)
-            }
-        }
-    }
-
-    /// The frame produced by the most recent [`frame`](Self::frame) call,
-    /// without decoding again. `None` when the link has no CPU decoder (raw).
-    /// The presenter uses this on the CPU lossless path, where the receive loop
-    /// has already decoded the newest frame in order.
-    pub fn decoded(&self) -> Option<&[u8]> {
-        self.decoder.as_ref().map(|d| d.frame())
+        Ok(self.slot_bytes(slot))
     }
 
 }
@@ -2239,6 +2313,42 @@ impl ClientLink {
 #[cfg(test)]
 mod tests {
     use super::ema;
+    use std::sync::mpsc;
+
+    #[test]
+    fn tcp_reader_fills_the_stable_host_pool() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = std::net::TcpStream::connect(addr).expect("connect");
+        let (mut server, _) = listener.accept().expect("accept");
+        let pool = std::sync::Arc::new(
+            super::ClientSlotMemory::new(64, 2, 0).expect("pool"),
+        );
+        let (tx, rx) = mpsc::channel();
+        let (recycle_tx, recycle_rx) = mpsc::channel();
+        let reader = super::spawn_video_reader(
+            client,
+            pool.clone(),
+            tx,
+            recycle_rx,
+            std::sync::Arc::new(super::VideoReaderStats::default()),
+            false,
+            None,
+        );
+        let payload = b"hello";
+        server.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
+        server.write_all(&7u64.to_le_bytes()).unwrap();
+        server.write_all(payload).unwrap();
+        let (seq, slot, len) = rx.recv_timeout(std::time::Duration::from_secs(1)).expect("frame");
+        assert_eq!((seq, len), (7, payload.len()));
+        assert_eq!(&pool.slot(slot)[..payload.len()], payload);
+        recycle_tx.send(slot).unwrap();
+        drop(server);
+        let _ = reader.join();
+    }
 
     #[test]
     fn ema_seeds_then_smooths() {

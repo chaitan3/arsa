@@ -24,8 +24,8 @@
 //!
 //! Client (all `unix_now_us` on the client; differences are exact):
 //!   t3  = recv CQ completion observed for the frame
-//!   t4  = glTexImage2D returned (upload queued)
-//!   t5  = eglSwapBuffers returned (frame submitted to the compositor)
+//!   t4  = Vulkan decode/upload done; render submission starting
+//!   t5  = vkQueuePresentKHR returned (frame submitted to the compositor)
 //!   tp  = compositor's on-screen timestamp (wp_presentation, client clock)
 //!
 //!   upload  = t4 - t3      upload call
@@ -1049,7 +1049,7 @@ mod tests {
         assert!(!t.contains("readback"), "raw label leaked into lossless:\n{t}");
     }
 
-    /// The raw (EGL) materializer keeps its blit/readback/sync split.
+    /// The raw materializer keeps its blit/readback/sync split.
     #[test]
     fn raw_breakdown_is_labeled() {
         let mut m = Metrics::new();

@@ -581,6 +581,26 @@ impl Pyrowave {
         dec: PyrowaveDecoder,
         buffers: &PyrowaveGpuBuffers,
     ) -> Result<()> {
+        let sync = self.decode_gpu_async(device, dec, buffers)?;
+        let r = unsafe { (self.sync_object_cpu_wait)(sync, 1, 1_000_000_000) };
+        unsafe { (self.sync_object_destroy)(sync) };
+        if r != PyrowaveResult::Success {
+            bail!("pyrowave_sync_object_cpu_wait: {r:?}");
+        }
+        Ok(())
+    }
+
+    /// Queue the GPU decode and return the PyroWave sync object. The object
+    /// owns a timeline semaphore that reaches value 1 when the decode is
+    /// complete; the caller can wait on it from a Vulkan submission instead of
+    /// blocking the CPU. Destroy it with `sync_object_destroy` only after that
+    /// GPU wait has completed.
+    pub fn decode_gpu_async(
+        &self,
+        device: PyrowaveDevice,
+        dec: PyrowaveDecoder,
+        buffers: &PyrowaveGpuBuffers,
+    ) -> Result<PyrowaveSyncObject> {
         let cinfo = PyrowaveSyncObjectCreateInfo {
             device,
             external_handle: usize::MAX,
@@ -609,12 +629,15 @@ impl Pyrowave {
             unsafe { (self.sync_object_destroy)(sync) };
             bail!("pyrowave_decode_gpu_buffer: {r:?}");
         }
-        let r = unsafe { (self.sync_object_cpu_wait)(sync, 1, 1_000_000_000) };
+        Ok(sync)
+    }
+
+    pub fn sync_semaphore(&self, sync: PyrowaveSyncObject) -> vk::Semaphore {
+        unsafe { (self.sync_object_get_semaphore)(sync) }
+    }
+
+    pub fn sync_destroy(&self, sync: PyrowaveSyncObject) {
         unsafe { (self.sync_object_destroy)(sync) };
-        if r != PyrowaveResult::Success {
-            bail!("pyrowave_sync_object_cpu_wait: {r:?}");
-        }
-        Ok(())
     }
 
     /// GPU decode into caller-provided plane views (compute path).

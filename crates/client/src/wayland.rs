@@ -1,12 +1,9 @@
-//! C1 Wayland window plumbing for the EGL-upload presenter: an xdg-toplevel
-//! that `eglwin::EglWindow` paints into via `eglSwapBuffers`.
+//! Wayland window plumbing for the Vulkan presenter: an xdg-toplevel
+//! that `vkpresent::Renderer` uses as a Vulkan Wayland surface.
 //!
-//! This module deliberately contains NO buffer management: with the
-//! dmabuf-attach presenter removed (KWin+NVIDIA refuses foreign system
-//! dmabuf imports — see docs/ARCHITECTURE.md), the compositor only ever
-//! sees EGL's own driver-native swapchain buffers. Credits are paced by the
-//! upload path in `main.rs`, so there is no release-to-credit machinery
-//! here either.
+//! This module deliberately contains NO buffer management: Vulkan WSI owns the
+//! swapchain wl_buffers (driver-native), and decoding/upload in the renderer
+//! paces credits. There is no release-to-credit machinery here.
 //!
 //! One non-obvious behavior encoded below: KWin 6.7.5 emits the initial
 //! xdg configure only after the surface's first commit. A client that
@@ -153,7 +150,7 @@ impl DmabufFeedback {
         }
         // KWin re-sends feedback as the surface's output/state changes (e.g.
         // after fullscreen); log only when the set actually changes, and only
-        // under -v (it is not used by the EGL-upload presenter).
+        // under -v (it is diagnostic only; the Vulkan presenter owns its swapchain).
         if s != self.last {
             log::debug!("{s}");
             self.last = s;
@@ -249,8 +246,8 @@ struct St {
     scale120: u32,
     logical_w: u32,
     logical_h: u32,
-    /// buffer size in device pixels (logical × scale) — what the EGL
-    /// window/GL must render at; letterboxed when aspect ≠ frame's
+    /// buffer size in device pixels (logical × scale) — what the Vulkan
+    /// swapchain must render at; letterboxed when aspect ≠ frame's
     dev_w: u32,
     dev_h: u32,
     /// compositor-driven fullscreen state (xdg_toplevel.configure states
@@ -261,8 +258,8 @@ struct St {
     /// toplevel configure that xdg_surface.ack_configure must precede:
     /// target logical size to apply at ack time
     pending_mode: Option<(u32, u32)>,
-    /// buffer size change waiting to be applied by the EGL window owner
-    /// (main loop calls Presenter::take_resize → EglWindow::resize)
+    /// buffer size change waiting to be applied by the Vulkan presenter
+    /// (main loop calls Presenter::take_resize → Renderer::resize)
     pending_resize: Option<(u32, u32)>,
     /// scale plumbing keep-alives
     #[allow(dead_code)]
@@ -461,7 +458,7 @@ impl Presenter {
         let presentation: Option<WpPresentation> = globals.bind(&qh, 1..=2, ()).ok();
         // linux-dmabuf feedback: which format+modifier pairs the compositor can
         // scan out directly (the `scanout` tranche). Diagnostic only — the
-        // presenter uses EGL's own swapchain buffers.
+        // presenter uses Vulkan WSI's own swapchain buffers.
         let dmabuf: Option<ZwpLinuxDmabufV1> = globals.bind(&qh, 1..=5, ()).ok();
         // viewporter + fractional-scale: buffer stays at the NATIVE guest
         // frame size; the compositor maps it 1:1 onto physical pixels at
@@ -694,13 +691,13 @@ impl Presenter {
         Ok(())
     }
 
-    /// Raw libwayland `struct wl_display *` for EGL interop
-    /// (`eglGetDisplay`).
+    /// Raw libwayland `struct wl_display *` for Vulkan WSI
+    /// (`VkWaylandSurfaceCreateInfoKHR.display`).
     pub fn wl_display_ptr(&self) -> *mut std::ffi::c_void {
         self.conn.display().id().as_ptr() as *mut std::ffi::c_void
     }
 
-    /// Raw libwayland `struct wl_surface *` for `wl_egl_window_create`.
+    /// Raw libwayland `struct wl_surface *` for Vulkan WSI.
     pub fn wl_surface_ptr(&self) -> *mut std::ffi::c_void {
         self.state.surface.id().as_ptr() as *mut std::ffi::c_void
     }
@@ -709,9 +706,16 @@ impl Presenter {
         self.state.closed
     }
 
-    /// Pop a queued EGL buffer resize (device pixels) produced by xdg
-    /// configure (fullscreen/restore) or a fractional-scale change. The
-    /// caller routes it to `EglWindow::resize`.
+    /// Current device-pixel buffer size, including fullscreen/scale changes
+    /// already applied by the configure path. Used to create the initial
+    /// Vulkan swapchain at the right size.
+    pub fn buffer_size(&self) -> (u32, u32) {
+        (self.state.dev_w.max(1), self.state.dev_h.max(1))
+    }
+
+    /// Pop a queued buffer resize (device pixels) produced by xdg configure
+    /// (fullscreen/restore) or a fractional-scale change. The caller routes it
+    /// to `Renderer::resize`.
     pub fn take_resize(&mut self) -> Option<(u32, u32)> {
         self.state.pending_resize.take()
     }
@@ -722,8 +726,8 @@ impl Presenter {
     }
 
     /// Request a presentation feedback for the NEXT commit of our surface.
-    /// MUST be called immediately before the commit that attaches the frame
-    /// (eglSwapBuffers). Returns the id to hand to `Metrics::record`; `None`
+    /// MUST be called immediately before the Vulkan present that attaches the
+    /// frame. Returns the id to hand to `Metrics::record`; `None`
     /// when wp_presentation is unavailable.
     pub fn request_present_feedback(&mut self) -> Option<u64> {
         let pres = self.state.presentation.clone()?;
@@ -898,7 +902,7 @@ impl St {
             // fullscreen: the logical size is configure-driven (output
             // size); a scale change only shifts the device-pixel buffer
             // size (e.g. output moved to a monitor with another scale)
-            self.queue_egl_resize();
+            self.queue_swapchain_resize();
             self.set_opaque(qh, self.logical_w, self.logical_h);
             return;
         }
@@ -928,8 +932,8 @@ impl St {
     }
 
     /// Apply a target logical size: viewport destination, window geometry,
-    /// min/max (windowed only), EGL buffer resize, commit. Called from the
-    /// xdg_surface.ack_configure path so the ack precedes our commit.
+    /// min/max (windowed only), Vulkan swapchain resize, commit. Called from
+    /// the xdg_surface.ack_configure path so the ack precedes our commit.
     fn apply_mode(&mut self, qh: &QueueHandle<St>, lw: u32, lh: u32) {
         self.logical_w = lw;
         self.logical_h = lh;
@@ -947,7 +951,7 @@ impl St {
             self.toplevel.set_min_size(lw as i32, lh as i32);
             self.toplevel.set_max_size(lw as i32, lh as i32);
         }
-        self.queue_egl_resize();
+        self.queue_swapchain_resize();
         log::debug!(
             "[wl] mode: {}scale {}/120, window {}x{} logical, buffer {}x{} device (frame {}x{})",
             if self.fullscreened { "fullscreen, " } else { "" },
@@ -976,9 +980,9 @@ impl St {
     }
 
     /// Recompute the device-pixel buffer size (logical × fractional scale)
-    /// and queue an EGL resize if it changed. No commit: the viewport
+    /// and queue a Vulkan resize if it changed. No commit: the viewport
     /// destination (logical) is unchanged, so compositor mapping is intact.
-    fn queue_egl_resize(&mut self) {
+    fn queue_swapchain_resize(&mut self) {
         let dw = ((self.logical_w as u64 * self.scale120 as u64 / 120) as u32).max(1);
         let dh = ((self.logical_h as u64 * self.scale120 as u64 / 120) as u32).max(1);
         if (dw, dh) != (self.dev_w, self.dev_h) {

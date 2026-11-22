@@ -1,38 +1,49 @@
 //! Client-side PyroWave decoder for `--codec lossy`.
 //!
 //! The server sends a framed frame: `[u32 n][u32 sizes...][packet bytes]`.
-//! We push each packet, decode on the GPU into Y/U/V plane images, and hand
-//! those planes to the presenter as **exported dma-bufs** — the GL presenter
-//! imports them and does the YUV->RGB conversion on the GPU (see
-//! `eglwin::import_yuv`/`present_yuv`). No full-frame readback, no CPU colour
-//! conversion on the streaming path.
+//! We push each packet and decode on the GPU into Y/U/V plane images on the
+//! client's shared Vulkan device. The Vulkan presenter samples those planes
+//! directly and does YUV->RGB in its fragment shader. There is no dma-buf
+//! export/import, no GL round trip and no full-frame readback on the streaming
+//! path.
 //!
 //! (`read_rgba` is the headless/`--dump` debug path: it downloads and converts
 //! on the CPU so the content can be inspected; it is never used when
 //! presenting.)
 
+use std::sync::Arc;
+
 use anyhow::{bail, Context, Result};
 use rdma_display_vkcore::ash::vk;
 use rdma_display_vkcore::pyrowave::{
     Chroma, Pyrowave, PyrowaveDecoder, PyrowaveDevice, PyrowaveGpuBuffers, PyrowaveImageView,
+    PyrowaveSyncObject,
 };
 use rdma_display_vkcore::{HostBuffer, Image, VkCore};
 
 pub struct LossyDecoder {
-    vk: VkCore,
+    vk: Arc<VkCore>,
     pw: Pyrowave,
     dev: PyrowaveDevice,
     dec: PyrowaveDecoder,
     w: u32,
     h: u32,
     chroma444: bool,
-    /// linear R8 decode planes, exported as dma-bufs for GL
+    /// R8 decode planes sampled by the Vulkan presenter
     planes: Vec<Image>,
-    plane_fds: [i32; 3],
-    plane_pitch: [u32; 3],
-    plane_w: [u32; 3],
-    plane_h: [u32; 3],
-    // headless/--dump debug readback
+    views: [vk::ImageView; 3],
+    /// current layout of the three decode planes
+    layout: vk::ImageLayout,
+    /// async decode waiting for the next present submission
+    pending_sync: Option<PyrowaveSyncObject>,
+    pending_semaphore: vk::Semaphore,
+    /// async decode already submitted to the GPU; released after its fence
+    in_flight_sync: Option<PyrowaveSyncObject>,
+    /// headless/--dump debug readback, allocated lazily on first use
+    readback: Option<LossyReadback>,
+}
+
+struct LossyReadback {
     ybuf: HostBuffer,
     ubuf: HostBuffer,
     vbuf: HostBuffer,
@@ -40,13 +51,11 @@ pub struct LossyDecoder {
 }
 
 impl LossyDecoder {
-    /// `export`: Vulkan exports the decode planes as dma-bufs for the GL
-    /// presenter (all-GPU). When false the planes are plain optimal images and
-    /// the caller uses the `read_rgba` download path (headless/`--dump`, and
-    /// the fallback on clients whose Vulkan cannot export dma-bufs).
-    pub fn new(w: u32, h: u32, chroma: u8, export: bool) -> Result<Self> {
+    /// Create the decoder on the client's shared Vulkan device. The R8 decode
+    /// planes stay on that device and are sampled directly by the presenter;
+    /// no dma-buf export/import or GL round trip.
+    pub fn new(vk: Arc<VkCore>, w: u32, h: u32, chroma: u8) -> Result<Self> {
         let chroma444 = chroma == 1;
-        let vk = VkCore::new().context("lossy client: Vulkan core")?;
         let pw = Pyrowave::load(std::env::var("PYROWAVE_LIB").ok().as_deref())?;
         let dev = pw.create_shared_device(&vk)?;
         let chroma = if chroma444 { Chroma::Subsampling444 } else { Chroma::Subsampling420 };
@@ -54,65 +63,36 @@ impl LossyDecoder {
 
         let (cw, ch) = if chroma444 { (w, h) } else { ((w + 1) / 2, (h + 1) / 2) };
         let dims = [(w, h), (cw, ch), (cw, ch)];
-        let mut planes = Vec::new();
-        let mut plane_fds = [0i32; 3];
-        let mut plane_pitch = [0u32; 3];
-        let mut plane_w = [0u32; 3];
-        let mut plane_h = [0u32; 3];
         let usage = vk::ImageUsageFlags::STORAGE
             | vk::ImageUsageFlags::SAMPLED
             | vk::ImageUsageFlags::TRANSFER_SRC;
-        for &(pw_, ph_) in &dims {
-            let i = planes.len();
-            if export {
-                let (im, fd, pitch) = vk
-                    .create_exportable_image(vk::Format::R8_UNORM, pw_, ph_, usage)
-                    .context("lossy: exportable decode plane (does this client's Vulkan export dma-bufs?)")?;
-                plane_fds[i] = fd;
-                plane_pitch[i] = pitch;
-                planes.push(im);
-            } else {
-                let im = vk
-                    .create_image(vk::Format::R8_UNORM, pw_, ph_, usage, vk::ImageTiling::OPTIMAL)
-                    .context("lossy: decode plane")?;
-                vk.transition(
-                    im.image,
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::GENERAL,
-                    vk::ImageAspectFlags::COLOR,
-                )?;
-                plane_fds[i] = -1;
-                plane_pitch[i] = 0;
-                planes.push(im);
-            }
-            plane_w[i] = pw_;
-            plane_h[i] = ph_;
+        let mut planes = Vec::new();
+        let mut views = [vk::ImageView::null(); 3];
+        for (i, &(pw_, ph_)) in dims.iter().enumerate() {
+            let im = vk
+                .create_image(vk::Format::R8_UNORM, pw_, ph_, usage, vk::ImageTiling::OPTIMAL)
+                .context("lossy: decode plane")?;
+            vk.transition(
+                im.image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::GENERAL,
+                vk::ImageAspectFlags::COLOR,
+            )?;
+            views[i] = vk.make_view(
+                im.image,
+                vk::Format::R8_UNORM,
+                vk::ImageAspectFlags::COLOR,
+                vk::ComponentSwizzle::IDENTITY,
+                vk::ImageLayout::GENERAL,
+            )?;
+            planes.push(im);
         }
-        let ybuf = vk.host_buffer((w as u64) * (h as u64))?;
-        let ubuf = vk.host_buffer((cw as u64) * (ch as u64))?;
-        let vbuf = vk.host_buffer((cw as u64) * (ch as u64))?;
         log::info!(
-            "[lossy] client decoder ready {}x{} chroma {} ({})",
+            "[lossy] client decoder ready {}x{} chroma {} (Vulkan planes, no dma-buf export)",
             w,
             h,
             if chroma444 { "4:4:4" } else { "4:2:0" },
-            if export {
-                "decode planes exported as dma-bufs for GPU YUV->RGB"
-            } else {
-                "CPU upload path (planes not exported)"
-            },
         );
-        if export {
-            log::info!(
-                "[lossy] plane exports: fd {} pitch {} | fd {} pitch {} | fd {} pitch {}",
-                plane_fds[0],
-                plane_pitch[0],
-                plane_fds[1],
-                plane_pitch[1],
-                plane_fds[2],
-                plane_pitch[2]
-            );
-        }
         Ok(Self {
             vk,
             pw,
@@ -122,14 +102,12 @@ impl LossyDecoder {
             h,
             chroma444,
             planes,
-            plane_fds,
-            plane_pitch,
-            plane_w,
-            plane_h,
-            ybuf,
-            ubuf,
-            vbuf,
-            bgra: vec![0u8; (w as usize) * (h as usize) * 4],
+            views,
+            layout: vk::ImageLayout::GENERAL,
+            pending_sync: None,
+            pending_semaphore: vk::Semaphore::null(),
+            in_flight_sync: None,
+            readback: None,
         })
     }
 
@@ -149,18 +127,60 @@ impl LossyDecoder {
         }
     }
 
-    /// The three decode planes as `(fd, width, height, row_pitch)` for the GL
-    /// presenter to import once (`eglwin::import_yuv`).
-    pub fn plane_descs(&self) -> [(i32, u32, u32, u32); 3] {
-        [
-            (self.plane_fds[0], self.plane_w[0], self.plane_h[0], self.plane_pitch[0]),
-            (self.plane_fds[1], self.plane_w[1], self.plane_h[1], self.plane_pitch[1]),
-            (self.plane_fds[2], self.plane_w[2], self.plane_h[2], self.plane_pitch[2]),
-        ]
+    /// The three R8 plane views for the Vulkan presenter's YUV pipeline.
+    pub fn plane_views(&self) -> [vk::ImageView; 3] {
+        self.views
     }
 
-    /// Decode on the GPU into the exported planes. No host round trip.
-    pub fn decode(&mut self, coded: &[u8]) -> Result<()> {
+    /// Record the barrier that makes PyroWave's GPU writes visible to the
+    /// presenter fragment shader. The planes stay in GENERAL, so this is not a
+    /// layout transition and does not need a separate queue submission.
+    pub fn record_sample_barrier(&self, cb: vk::CommandBuffer) {
+        let range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        for im in &self.planes {
+            let b = vk::ImageMemoryBarrier {
+                old_layout: vk::ImageLayout::GENERAL,
+                new_layout: vk::ImageLayout::GENERAL,
+                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                image: im.image,
+                subresource_range: range,
+                src_access_mask: vk::AccessFlags::SHADER_WRITE,
+                dst_access_mask: vk::AccessFlags::SHADER_READ,
+                ..Default::default()
+            };
+            unsafe {
+                self.vk.device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[b],
+                );
+            }
+        }
+    }
+
+    fn prepare_decode(&mut self, coded: &[u8]) -> Result<()> {
+        if self.layout != vk::ImageLayout::GENERAL {
+            for im in &self.planes {
+                self.vk.transition(
+                    im.image,
+                    self.layout,
+                    vk::ImageLayout::GENERAL,
+                    vk::ImageAspectFlags::COLOR,
+                )?;
+            }
+            self.layout = vk::ImageLayout::GENERAL;
+        }
         if coded.len() < 4 {
             bail!("lossy: short frame");
         }
@@ -178,18 +198,56 @@ impl LossyDecoder {
             self.pw.push(self.dec, &coded[off..off + sz])?;
             off += sz;
         }
+        Ok(())
+    }
+
+    /// Decode synchronously (headless stats/dump).
+    pub fn decode(&mut self, coded: &[u8]) -> Result<()> {
+        self.prepare_decode(coded)?;
         let bufs = PyrowaveGpuBuffers {
             planes: [self.plane_view(0), self.plane_view(1), self.plane_view(2)],
         };
-        // `decode_gpu_synced` creates a timeline-semaphore sync object and
-        // passes it as the release sync. That release is what flushes Granite's
-        // frame context (`pyrowave_decoder_decode_gpu_buffer` only *queues* the
-        // decode unless a sync object is signaled), so the CPU wait on it is a
-        // real completion wait. Do NOT replace this with `decode_gpu` +
-        // device_wait_idle: with no release sync the decode is never flushed,
-        // so the planes are read un-decoded (green first frame, one-frame lag).
         self.pw.decode_gpu_synced(self.dev, self.dec, &bufs)?;
         Ok(())
+    }
+
+    /// Queue a GPU decode and return without waiting. The presenter adds the
+    /// returned timeline semaphore to its own render submit, so the decode
+    /// pipeline and the YUV draw share one GPU wait instead of a CPU wait.
+    pub fn decode_async(&mut self, coded: &[u8]) -> Result<()> {
+        if self.pending_sync.is_some() {
+            bail!("lossy: previous async decode was not submitted");
+        }
+        self.prepare_decode(coded)?;
+        let bufs = PyrowaveGpuBuffers {
+            planes: [self.plane_view(0), self.plane_view(1), self.plane_view(2)],
+        };
+        let sync = self.pw.decode_gpu_async(self.dev, self.dec, &bufs)?;
+        self.pending_semaphore = self.pw.sync_semaphore(sync);
+        self.pending_sync = Some(sync);
+        Ok(())
+    }
+
+    pub fn pending_semaphore(&self) -> Option<vk::Semaphore> {
+        if self.pending_semaphore == vk::Semaphore::null() {
+            None
+        } else {
+            Some(self.pending_semaphore)
+        }
+    }
+
+    pub fn mark_submitted(&mut self) {
+        if let Some(sync) = self.pending_sync.take() {
+            self.in_flight_sync = Some(sync);
+            self.pending_semaphore = vk::Semaphore::null();
+        }
+    }
+
+    /// Called after the render fence that waited on the decode semaphore.
+    pub fn release_in_flight(&mut self) {
+        if let Some(sync) = self.in_flight_sync.take() {
+            self.pw.sync_destroy(sync);
+        }
     }
 
     /// Headless/`--dump` only: download the planes and convert to BGRA on the
@@ -201,16 +259,24 @@ impl LossyDecoder {
         } else {
             ((w + 1) / 2, (h + 1) / 2)
         };
-        self.vk
-            .download_r8(self.planes[0].image, &self.ybuf, self.w, self.h, vk::ImageLayout::GENERAL)?;
-        self.vk
-            .download_r8(self.planes[1].image, &self.ubuf, cw as u32, ch as u32, vk::ImageLayout::GENERAL)?;
-        self.vk
-            .download_r8(self.planes[2].image, &self.vbuf, cw as u32, ch as u32, vk::ImageLayout::GENERAL)?;
-        let yp = self.ybuf.as_slice();
-        let up = self.ubuf.as_slice();
-        let vp = self.vbuf.as_slice();
-        let out = &mut self.bgra;
+        if self.readback.is_none() {
+            self.readback = Some(LossyReadback {
+                ybuf: self.vk.host_buffer((w as u64) * (h as u64))?,
+                ubuf: self.vk.host_buffer((cw as u64) * (ch as u64))?,
+                vbuf: self.vk.host_buffer((cw as u64) * (ch as u64))?,
+                bgra: vec![0u8; w * h * 4],
+            });
+        }
+        let old = self.layout;
+        let rb = self.readback.as_mut().unwrap();
+        self.vk.download_r8(self.planes[0].image, &rb.ybuf, self.w, self.h, old)?;
+        self.vk.download_r8(self.planes[1].image, &rb.ubuf, cw as u32, ch as u32, old)?;
+        self.vk.download_r8(self.planes[2].image, &rb.vbuf, cw as u32, ch as u32, old)?;
+        self.layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+        let yp = rb.ybuf.as_slice();
+        let up = rb.ubuf.as_slice();
+        let vp = rb.vbuf.as_slice();
+        let out = &mut rb.bgra;
         for j in 0..h {
             for i in 0..w {
                 let y = yp[j * w + i] as f32;
@@ -229,5 +295,34 @@ impl LossyDecoder {
             }
         }
         Ok(out)
+    }
+}
+
+impl Drop for LossyDecoder {
+    fn drop(&mut self) {
+        unsafe {
+            for v in self.views {
+                if v != vk::ImageView::null() {
+                    self.vk.device.destroy_image_view(v, None);
+                }
+            }
+            for im in self.planes.drain(..) {
+                self.vk.destroy_image(im);
+            }
+            if let Some(sync) = self.pending_sync.take() {
+                let _ = (self.pw.sync_object_cpu_wait)(sync, 1, 1_000_000_000);
+                self.pw.sync_destroy(sync);
+            }
+            if let Some(sync) = self.in_flight_sync.take() {
+                self.pw.sync_destroy(sync);
+            }
+            if let Some(rb) = self.readback.take() {
+                for b in [&rb.ybuf, &rb.ubuf, &rb.vbuf] {
+                    self.vk.device.unmap_memory(b.memory);
+                    self.vk.device.destroy_buffer(b.buffer, None);
+                    self.vk.device.free_memory(b.memory, None);
+                }
+            }
+        }
     }
 }

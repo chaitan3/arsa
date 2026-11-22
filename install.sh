@@ -90,8 +90,7 @@ SERVER_CRATES=(crates/proto crates/capture crates/rdma crates/audio \
     crates/auth crates/codec crates/vkcore crates/vkcodec crates/lifecycle \
     crates/server)
 CLIENT_CRATES=(crates/proto crates/rdma crates/audio crates/auth \
-    crates/codec crates/codec-gpu crates/egl crates/vkcore crates/lifecycle \
-    crates/client)
+    crates/codec crates/vkcore crates/lifecycle crates/client)
 
 build_needed=1
 if [ "${SKIP_BUILD:-0}" = "1" ]; then

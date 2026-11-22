@@ -44,7 +44,7 @@ codec                     raw | lossless (GPU) | lossy (GPU)
 RDMA WRITE + immediate ────────────────────────────► recv slot
    (or TCP length-prefixed frame)                     │
                                                       ▼
-                                            presenter (EGL upload → window)
+                                            Vulkan presenter (decode/upload → swapchain)
                                                       │
    ◄────────────── credit (slot free) ────────────────┘
 ```
@@ -63,9 +63,9 @@ arsa/
 │   ├── proto/        # wire structs, framing, MsgType, fourcc, InputEvent, keymap
 │   ├── capture/      # CaptureSource trait; drm + qemu impls; InputSink; materializers
 │   ├── codec/        # codec ids + the CPU reference (lossless format lives here)
-│   ├── codec-gpu/    # client GLES lossless decoder (+ codecbench)
+│   ├── codec-gpu/    # legacy GLES lossless decoder/benchmark (not in client)
 │   ├── vkcodec/      # server Vulkan compute lossless encoder
-│   ├── egl/          # client EGL/Wayland presenter + GLES decoder context
+│   ├── egl/          # legacy EGL/GLES helper (not in client/server binaries)
 │   ├── rdma/         # verbs setup, QP bring-up, slot MRs, WRITE loop, slots
 │   ├── audio/        # PipeWire/Pulse monitor capture + client playback, wire format
 │   ├── lifecycle/    # lazy per-session bring-up/teardown helpers
@@ -399,8 +399,10 @@ back to the staging slot's host-visible `VkBuffer` (registered as the RDMA slot
 buffer** (`buf_id`, format, stride, offset, modifier) — a compositor swaps a
 handful of buffers, so steady state pays only the encode. The sampled image is
 `(R,G,B,A)`; the coded word is memory-order `(B,G,R,A)`, so the image shader
-applies `.bgra`. The client decodes the coded stream with the GLES decoder in
-`codec-gpu`. Measured numbers are in [`DEBUG.md`](DEBUG.md#3-performance).
+applies `.bgra`. The client decodes the coded stream with its Vulkan compute
+decoder (`crates/client/src/vklossless.rs`); the legacy GLES decoder in
+`codec-gpu` is no longer in the client path. Measured numbers are in
+[`DEBUG.md`](DEBUG.md#3-performance).
 
 ### Lossy (PyroWave)
 
@@ -425,42 +427,161 @@ the binaries (`$ORIGIN` rpath); build it against the lab's glibc with
 
 ### 7.1 Slot memory
 
-The client receives into pinned host slots, uploads the frame to the GPU with
-`glTexImage2D`, and draws it. The client-side GBM/dma-buf MR probes are in
-[`DEBUG.md`](DEBUG.md#5-client-zero-copy-c0-findings).
+The client allocates one contiguous host pool with N slot regions. RDMA
+registers each region with ordinary `ibv_reg_mr` (not `ibv_reg_dmabuf_mr`); the
+TCP reader writes directly into the same regions. The whole pool is imported
+once with `VK_EXT_external_memory_host` as one host-visible `VkBuffer`, so raw
+and lossless address a slot by byte offset with no CPU copy. If import fails,
+raw falls back to one persistent staging buffer and lossless to a private
+coded-buffer copy. Lossy PyroWave decode planes stay on the client's Vulkan
+device. There is no EGL/GL context and no dma-buf import/export on the client.
 
-### 7.2 EGL-upload presenter (`--output egl`)
+### 7.2 Vulkan presenter (`--output vk`)
 
-Raw wayland-client + wayland-protocols (no sctk/winit). An xdg_toplevel at the
-frame size; each frame is uploaded from the slot's CPU pointer with
-`glTexImage2D` (the GPU reads host RAM — no dma-buf import anywhere), a shader
-blit with a `.bgra` swizzle draws it letterboxed, and `eglSwapBuffers` presents
-it. Credits return immediately after the upload call (the client pointer is
-consumed per spec); `eglSwapInterval(1)` gives vsync pacing. `--output none`
-keeps the headless stats/dump path.
+Raw wayland-client + wayland-protocols (no sctk/winit) creates an xdg_toplevel.
+`VkCore::new_client` creates the `VK_KHR_wayland_surface`/`VK_KHR_swapchain`
+instance and device on the same `VkCore` used by PyroWave and the decoder.
+Presentation uses dynamic rendering into a `MAILBOX` swapchain when the
+compositor supports it (falling back to FIFO); the letterbox blit and metrics
+overlay are Vulkan fragment shaders. Raw/lossless slots are credited after the
+render fence that read them completes; only the newest frame is presented,
+while every lossless delta is decoded in order. `--output none` keeps the headless stats/dump path
+(lossless uses the Vulkan decoder and reads back only for stats/dump).
 
 Event integration stays on plain threads: `event_queue.prepare_read()` →
-`poll(fd)` → `read()` → `dispatch_pending`, interleaved with RDMA completions.
+`poll(fd)` → `read()` → `dispatch_pending`, interleaved with RDMA completions
+and Vulkan WSI/presentation feedback.
 
-**GPU lossless decode.** With `--codec lossless --output egl`, the client
-decodes deltas into a persistent `GL_RGBA8` texture and the presenter draws
-*that texture* — no per-frame full-frame upload. Every received frame is
-decoded in order (reference chain), only the newest is presented. On a `Meta`
-geometry change the frame is decoded with the CPU decoder and the stale texture
-is dropped.
+**GPU lossless decode.** With `--codec lossless`, the client decodes deltas in
+a Vulkan compute pass into one persistent `R8G8B8A8` image. The compute shader
+reads the slot region directly from the imported receive-pool `VkBuffer`, and
+the image is both the reference chain and the sampled video source, so there is
+no per-frame full-frame upload and no CPU coded copy on the normal path. The
+raw path copies the received BGRX slot region into one sampled image; the lossy
+path samples PyroWave's three Vulkan R8 planes through a YUV fragment shader.
 
-### 7.3 Direct scanout and presentation latency
+### 7.3 Presentation latency
 
-To let the compositor bypass composition, the client marks the surface fully
-opaque (`wl_surface.set_opaque_region`, updated on every size change), uses an
-alpha-free (XRGB) EGL window config, and runs `--fullscreen`. That makes the
-buffer eligible for **direct scanout** to the primary plane; otherwise the
-compositor composites and adds a buffered stage. `wp_presentation` feedback
-gives the true on-screen timestamp (`display = tp − t5`), which is the
-compositor's queue-to-scanout, not our work. See
+`wp_presentation` feedback gives the true on-screen timestamp
+(`display = tp − t5`), which is the compositor's queue-to-scanout, not our work.
+The Vulkan presenter marks the surface fully opaque and requests `MAILBOX`
+presentation when available, so a ready frame replaces the queued one instead
+of accumulating display-interval latency. See
 [`DEBUG.md`](DEBUG.md#6-presentation-latency).
 
-### 7.4 Input capture and grab
+### 7.4 Client buffer/transfer matrix
+
+Let **N** = `--frame-slots`, **S** = swapchain images (driver-chosen, typically
+2–3), and **P** = lossy packet count. "CPU copy" means an explicit host memcpy
+in client code; the transport receive copy is listed separately. "GPU copy"
+means an explicit Vulkan transfer command; sampling the final image/planes and
+scanout are not counted. PyroWave's internal decoder buffers and Vulkan
+command/fence objects are library/driver-owned and not listed.
+
+**Transport receive: one stable host pool**
+
+The client allocates one contiguous host allocation with **N** slot regions.
+RDMA registers each region with ordinary `ibv_reg_mr` (the client does **not**
+use `ibv_reg_dmabuf_mr`); TCP reads directly into the same regions. Slot
+pointers are stable for the whole session.
+
+| Transport | Receive storage | Inbound transfer | App CPU copy |
+| --- | --- | --- | --- |
+| RDMA | **N** regions of one host pool, registered with `ibv_reg_mr` | NIC RDMA WRITE straight into the slot region | **0** |
+| TCP | **N** regions of the same host pool | socket `read_exact` directly into the slot region | **1** kernel→user per frame (AES-GCM decrypts in place) |
+
+For RDMA and TCP window paths, the pool is imported **once** with
+`VK_EXT_external_memory_host` as **one host-visible `VkBuffer`**. The raw and
+lossless paths address slot regions with a byte offset into that buffer.
+
+**Window (`--output vk`)**
+
+| Codec | Transport | Persistent Vulkan buffers | GPU work before present | Present | App CPU copies/frame |
+| --- | --- | --- | --- | --- | --- |
+| raw | RDMA | **1** host-visible receive-pool `VkBuffer` + **1** sampled RGBA8 image + **S** swapchain images | **1** slot-region→sampled-image copy | sample image→swapchain | **0** |
+| raw | TCP | same receive-pool `VkBuffer` + **1** sampled RGBA8 image + **S** swapchain images | **1** slot-region→sampled-image copy | sample image→swapchain | **0** (network copy only) |
+| lossless | RDMA | **1** receive-pool `VkBuffer` + **1** persistent RGBA8 reference/sampled image + **S** swapchain images | compute reads the slot region directly and writes the reference image | sample image→swapchain | **0** |
+| lossless | TCP | same receive-pool `VkBuffer` + **1** RGBA8 image + **S** swapchain images | compute reads the slot region directly and writes the reference image | sample image→swapchain | **0** (network copy only) |
+| lossy | RDMA | **3** R8 decode planes + **S** swapchain images (+ PyroWave internals) | **P** packet pushes into PyroWave; GPU decode writes planes | YUV→RGB in fragment shader→swapchain | **0** full-frame copies |
+| lossy | TCP | same **3** R8 planes + **S** swapchain images | **P** packet pushes; GPU decode writes planes | YUV→RGB in fragment shader→swapchain | **0** full-frame copies |
+
+Fallback:
+
+- If `VK_EXT_external_memory_host` import of the pool fails, raw uses **1**
+  persistent host staging `VkBuffer` and adds **1 CPU** copy per frame; lossless
+  keeps a private coded `VkBuffer` and adds **1 CPU** coded copy per frame.
+- PyroWave packet pushes are library-owned bitstream copies; there is no
+  dma-buf export/import, no GL import, and no CPU YUV→RGB conversion in the
+  window path.
+- `--metrics` adds **1** small RGBA8 overlay image + **1** host-visible overlay
+  buffer; each refresh (~4 Hz) is **1 CPU + 1 GPU** copy.
+
+**Residency**
+
+| Resource | Resident in | GPU access |
+| --- | --- | --- |
+| Receive pool (N slots) | CPU RAM; RDMA-pinned, TCP reader-owned | NIC writes (RDMA) / reader writes (TCP); imported as one `VkBuffer` |
+| Imported receive-pool `VkBuffer` | CPU RAM; VkBuffer over the pool | GPU reads slot regions over PCIe |
+| Raw sampled RGBA8 image | GPU device-local memory | buffer→image copy then fragment sample |
+| Lossless reference/sampled RGBA8 image | GPU device-local memory | compute writes; fragment samples |
+| Lossy Y/U/V planes | GPU device-local memory | PyroWave decode writes; fragment samples |
+| Swapchain images | GPU/driver-managed memory | render target; compositor scans out |
+| Metrics overlay image | GPU device-local memory | small CPU upload; fragment samples |
+| Headless readback buffers | CPU RAM | GPU→CPU only for stats/dump |
+| PyroWave bitstream/decode state | library-owned (CPU control + GPU resources) | opaque; not counted |
+
+So the window mental model, with residency, is now:
+
+- **raw RDMA:** CPU pool slot → **GPU** sampled image → **GPU** swapchain.
+- **raw TCP:** kernel→CPU pool slot → **GPU** sampled image → **GPU** swapchain.
+- **lossless:** CPU pool slot → **GPU** compute reads the host slot and writes the **GPU** reference image → **GPU** swapchain.
+- **lossy:** CPU pool slot → PyroWave bitstream state → **GPU** YUV planes → **GPU** swapchain.
+- There is **no GPU→CPU transfer** on any window path.
+
+The swapchain is a render target, not a memcpy destination. The final step is a
+fragment-shader draw; `vkCmdCopyBufferToImage` is used only for the raw
+slot→image upload and the small overlay upload.
+
+**Current hot-path synchronization**
+
+The data model is now one receive `VkBuffer`, but not every CPU/GPU round trip
+has been removed yet:
+
+- raw slot→image copy is now recorded in the present command buffer; the raw
+  slot is credited only after the render fence completes (the next frame
+  boundary), so there is no `one_shot` wait on the raw hot path.
+- lossless deltas are recorded into the present command buffer when the host
+  pool import is available; all deltas received in one drain share one GPU
+  submission, and their slots are retired after the render fence. If the pool
+  import failed, the private coded buffer forces a synchronous one_shot decode
+  per delta so batched dispatches cannot overwrite each other.
+- lossy now queues PyroWave decode asynchronously and adds its release timeline
+  semaphore to the render submit. The CPU is not blocked on the window path;
+  the plane layout transition is a barrier in the present command buffer. The
+  old synchronous PyroWave wait remains only for the headless stats/dump path.
+  The render fence is no longer waited on before `vkQueuePresentKHR`.
+- Raw direct host-buffer sampling was benchmarked (`docs/DEBUG.md`,
+  `raw_host_bench`): at 4K it was only ~2% faster than the copy-to-image path,
+  so production raw keeps the copy/sampled-image path for scaling, overlay and
+  direct-scanout flexibility.
+
+**Headless (`--output none`)**
+
+| Codec | Transport | Persistent client buffers | Per-frame transfers | Stats/dump readback |
+| --- | --- | --- | --- | --- |
+| raw | RDMA | **N** receive-pool slots only (no Vulkan) | none | CPU stats; `--dump` copies the slot once |
+| raw | TCP | **N** receive-pool slots only (no Vulkan) | network receive only | CPU stats; `--dump` copies the slot once |
+| lossless | RDMA | receive pool + **1** coded `VkBuffer` + **1** RGBA8 image | **1 CPU** coded-slot→coded-buffer copy; compute decodes in place | every 60th frame: **1 GPU** image→host + **1 host** readback→Vec; `--dump` once |
+| lossless | TCP | same | **1 CPU** coded-slot→coded-buffer copy; compute decodes in place | every 60th frame: **1 GPU** image→host + **1 host** readback→Vec; `--dump` once |
+| lossy | RDMA | **3** R8 planes + lazy Y/U/V readback buffers + lazy BGRA buffer | **P** packet pushes; GPU decode writes planes | every 60th frame: **3 GPU** plane→host + **1 CPU** YUV→BGRA + **1 host** BGRA→Vec; `--dump` once |
+| lossy | TCP | same | **P** packet pushes; GPU decode writes planes | every 60th frame: **3 GPU** plane→host + **1 CPU** YUV→BGRA + **1 host** BGRA→Vec; `--dump` once |
+
+Headless stats are sampled every 60 frames; `--dump` reads back once. The
+lossy readback buffers are allocated lazily on the first stats/dump access.
+The headless lossless path still uses its private coded-buffer copy; moving it
+onto the imported receive pool is the same optimization as the window path.
+
+### 7.5 Input capture and grab
 
 Keyboard and pointer are read from the Wayland seat. Two pointer modes:
 
@@ -599,7 +720,9 @@ RDMA video stays plaintext, and `--no-encrypt` disables it.
   reconnect.
 - **Input injection needs privileges**: `uinput` needs `/dev/uinput`
   (root or the `input` group); `uinput` also creates real kernel devices.
-- **The presenter does not import dmabufs**: KWin 6.7.5 + NVIDIA refuses
-  foreign system dmabuf imports, so the client uploads from host RAM.
+- **The Vulkan presenter does not import dmabufs**: raw and lossless frames
+  enter through host-visible Vulkan buffers/images; lossy uses PyroWave's
+  client-side Vulkan planes. This avoids the KWin 6.7.5 + NVIDIA foreign
+  system-dmabuf import failure and the old EGL/GL path entirely.
 - **Client receive slots are host memory**; the GBM/dma-buf MR probes are in
   [`DEBUG.md`](DEBUG.md#5-client-zero-copy-c0-findings).

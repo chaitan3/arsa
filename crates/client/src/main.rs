@@ -1,11 +1,11 @@
 //! arsa client: connects to an arsa server over the control
 //! channel, receives frames via RDMA WRITE into registered slots, and either
-//! presents them on Wayland (`--output egl`, default: the slots themselves are
-//! wl_buffers, credits pace on compositor release) or runs headless
-//! (`--output none`: stats/checksums + optional PPM dump). `--audio` is on by
-//! default; `--no-audio` disables it.
+//! presents them in a Vulkan Wayland swapchain (`--output vk`) or runs headless
+//! (`--output none`: stats/checksums + optional PPM dump). The Vulkan device is
+//! shared by the swapchain, the lossless compute decoder, the raw upload and
+//! PyroWave; there is no EGL/GL path. `--audio` is on by default; `--no-audio`
+//! disables it.
 
-mod eglwin;
 mod gamepad;
 mod keymap;
 mod metrics;
@@ -18,6 +18,8 @@ use anyhow::{bail, Context, Result};
 use rdma_display_proto::Conn;
 
 mod lossy;
+mod vklossless;
+mod vkpresent;
 
 /// Default signaling port, used when `--server`/`-s` omits a port.
 const DEFAULT_PORT: u16 = 4791;
@@ -29,7 +31,7 @@ fn main() -> Result<()> {
     let mut slots: usize = 5;
     let mut dump: Option<String> = None;
     let mut seconds: Option<u64> = None;
-    let mut output: String = "egl".to_string();
+    let mut output: String = "vk".to_string();
     let mut metrics_on = false;
     let mut verbose = false;
     let mut fullscreen = false;
@@ -57,10 +59,6 @@ fn main() -> Result<()> {
     // lossy bitstream budget to request from the server, in Mbit/s
     // (0 = no preference; use the server's default)
     let mut lossy_mbps: u16 = 0;
-    // lossy: force the CPU download+upload path instead of the all-GPU
-    // Vulkan->GL dma-buf interop (also honours RDMA_DISPLAY_LOSSY_CPU=1)
-    let mut lossy_cpu = std::env::var_os("RDMA_DISPLAY_LOSSY_CPU").is_some();
-
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -118,7 +116,6 @@ fn main() -> Result<()> {
                     ),
                 };
             }
-            "--lossy-cpu" => lossy_cpu = true,
             "--lossy-bitrate" => {
                 lossy_mbps = args
                     .next()
@@ -142,7 +139,7 @@ fn main() -> Result<()> {
                 println!("  HOST[:PORT]           server address, given as the first positional argument (default host 127.0.0.1; :{DEFAULT_PORT} assumed when the port is omitted)");
                 println!("  -s, --server HOST[:PORT]  same as the positional HOST[:PORT] (either form may be used)");
                 println!("  --frame-slots N       receive slots, each holding one coded frame: sets the receive-buffer pool and the maximum flow-control window (default 5; --slots is accepted as an alias)");
-                println!("  --output egl|none     egl = present in a Wayland window (default); none = headless (e.g. with --dump)");
+                println!("  --output vk|none      vk = present in a Vulkan Wayland window (default); none = headless (e.g. with --dump)");
                 println!("  -f, --fullscreen      fullscreen on the current output; frame letterboxed/scaled to the screen with aspect kept (compositor's own fullscreen toggle also works)");
                 println!("  -g, --grab            start with the input grab on (keyboard+mouse for the guest; same as Ctrl+Alt+G); default off");
                 println!("  --audio | --no-audio  play the server's audio side-channel (default sink; server captures its own monitor source). Default on; --no-audio disables");
@@ -160,10 +157,8 @@ fn main() -> Result<()> {
                 println!("  --native              ask the server to set its output to this client's monitor mode (read from wl_output) before the session starts");
                 println!("  --set-mode WxH[@R]    ask the server to set its output to this size/refresh before the session starts (R in Hz; omitted = any)");
                 println!("  --codec auto|raw|lossless|lossy  codec to request from the server (honoured under the server's --codec auto). Default auto: the server picks");
-                println!("  --lossy-cpu           lossy: decode + download + upload on the CPU instead of the all-GPU Vulkan->GL dma-buf interop (default all-GPU, with an automatic fallback when the interop is unavailable)");
                 println!("  --lossy-bitrate MBPS  lossy: ask the server for this bitstream budget in Mbit/s (e.g. 100); 0 = use the server's default. The server converts it to a per-frame byte cap at a nominal 60 fps");
-                println!("  RDMA_DISPLAY_LOSSY_DEBUG=1  lossy: verbose dma-buf import diagnostics (extension strings, importable formats/modifiers, every import attempt)");
-                println!("  Ctrl+Alt+G            (--output egl) grab keyboard+mouse for the guest: the local compositor's");
+                println!("  Ctrl+Alt+G            (--output vk) grab keyboard+mouse for the guest: the local compositor's");
                 println!("                        own shortcuts (alt-f4, alt-tab, alt-f1, ...) reach the guest too; Ctrl+Alt+G again");
                 println!("                        is the ONLY way to give control back to the desktop");
                 return Ok(());
@@ -277,10 +272,9 @@ fn main() -> Result<()> {
     );
     log::info!("[client] handshake done t={} ms", t0.elapsed().as_millis());
 
-    // Wayland presentation: the EGL upload backend — the mirror of the
-    // server's copy path. Needs a CPU view of the slots (host memory):
-    // CUDA slots are GPU-only and cannot be uploaded from.
-    // user-input path: Wayland events -> this channel -> control TCP
+    // Wayland/Vulkan presentation: raw/lossless frames enter through a
+    // host-visible Vulkan buffer/image; lossy samples PyroWave's Vulkan planes.
+    // User-input path: Wayland events -> this channel -> control TCP.
     let (input_tx, input_rx) = std::sync::mpsc::channel();
 
     // controller: raw evdev capture (slot 0..n) + rumble player; rumble
@@ -291,50 +285,34 @@ fn main() -> Result<()> {
         None
     };
 
-    if grab && output != "egl" {
-        log::warn!("[client] --grab needs --output egl (no window to grab with --output {output})");
+    if grab && output != "vk" {
+        log::warn!("[client] --grab needs --output vk (no window to grab with --output {output})");
     }
     let mut presenter = match output.as_str() {
         "none" => None,
-        "egl" => {
+        "vk" => {
             let p = wayland::Presenter::new(link.meta.width, link.meta.height, input_tx, fullscreen, grab)?;
-            let mut win = eglwin::EglWindow::new(
+            let (swap_w, swap_h) = p.buffer_size();
+            let renderer = vkpresent::Renderer::new(
                 p.wl_display_ptr(),
                 p.wl_surface_ptr(),
+                link.codec,
                 link.meta.width,
                 link.meta.height,
+                link.meta.stride,
+                swap_w,
+                swap_h,
+                link.codec_chroma,
                 metrics_on,
+                scale_filter,
             )?;
-            win.set_scale_filter(scale_filter);
-            Some((p, win))
+            Some((p, renderer))
         }
-        other => bail!("--output must be none|egl, got {other:?}"),
+        other => bail!("--output must be none|vk, got {other:?}"),
     };
     log::info!("[client] presenter ready t={} ms", t0.elapsed().as_millis());
-
-    // GPU lossless decode: when presenting through eglwin's GL context and the
-    // session uses the lossless codec, decode the tiles straight into a texture
-    // in that context (the presenter draws it) instead of a full-frame CPU
-    // decode followed by a full-frame upload.
-    let mut gl_lossless: Option<(rdma_display_codec_gpu::GpuVideoDecoder, u32)> = None;
-    if link.codec == rdma_display_codec::Codec::Lossless && presenter.is_some() {
-        let geom = rdma_display_codec::Geometry::new(
-            link.meta.width,
-            link.meta.height,
-            link.meta.stride,
-        );
-        match rdma_display_codec_gpu::GpuVideoDecoder::attach_current(geom) {
-            Ok(dec) => match dec.create_texture(link.meta.width, link.meta.height) {
-                Ok(tex) => {
-                    log::info!("[client] lossless decode: GPU -> texture (no full-frame upload)");
-                    gl_lossless = Some((dec, tex));
-                }
-                Err(e) => {
-                    log::warn!("[client] lossless decode: GPU texture failed ({e:#}); using CPU")
-                }
-            },
-            Err(e) => log::warn!("[client] lossless decode: GPU unavailable ({e:#}); using CPU"),
-        }
+    if let Some((_, renderer)) = presenter.as_mut() {
+        renderer.attach_host_pool(link.host_slots().clone())?;
     }
 
     // input runs on its own thread + TCP connection (tagged `TAG_INPUT` plus
@@ -355,7 +333,7 @@ fn main() -> Result<()> {
         .then(|| std::sync::Arc::new(rdma_display_audio::stats::AudioStats::new()));
 
     // --metrics collector: consumes server Stamps + Pongs via the control
-    // reader, samples t3/t4/t5 around the GL calls, pings every PING_SECS
+    // reader, samples t3/t4/t5 around the Vulkan calls, pings every PING_SECS
     let mut metrics = metrics_on.then(|| metrics::Metrics::new());
     // tell the overlay whether the compositor can report the true on-screen
     // time (wp_presentation), so `display` reads a number instead of n/a
@@ -395,20 +373,23 @@ fn main() -> Result<()> {
 
     let started = Instant::now();
     let deadline = seconds.map(|s| started + std::time::Duration::from_secs(s));
+    // Headless lossy/dump path only; the window path owns its decoder inside
+    // `vkpresent::Renderer`.
     let mut lossy_dec: Option<lossy::LossyDecoder> = None;
-    // whether lossy_dec feeds the GL presenter through imported dma-buf planes
-    // (all-GPU) rather than the CPU download+upload path
-    let mut lossy_gpu = false;
+    let mut lossless_dec: Option<vklossless::VulkanLossless> = None;
     let mut frames: u64 = 0;
     let mut first_frame_logged = false;
     let mut last_seq = 0u64;
     let mut last_report = Instant::now();
     let mut dumped = false;
     // judder diagnostics: how long after a frame's completion the client holds
-    // it before crediting (credit is sent right after present), and the reader
-    // frame counter for the receive-rate delta
+    // it before crediting (raw/lossless retire at the next render fence) and
+    // the reader frame counter for the receive-rate delta
     let mut credit_lags: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
     let mut last_reader_frames: u64 = 0;
+    // Slots whose data is consumed by the present command buffer cannot be
+    // credited until that command buffer's fence completes.
+    let mut pending_credits: Vec<usize> = Vec::new();
 
     loop {
         if let Some(d) = deadline {
@@ -416,7 +397,7 @@ fn main() -> Result<()> {
                 break;
             }
         }
-        if let Some((p, win)) = presenter.as_mut() {
+        if let Some((p, renderer)) = presenter.as_mut() {
             // Dispatch Wayland events (input callbacks, configure) BEFORE the
             // blocking present, so a keystroke is handed to the input thread
             // without waiting for a swap; the input thread does the socket send.
@@ -424,17 +405,22 @@ fn main() -> Result<()> {
             // apply compositor-driven buffer resizes (fullscreen toggles,
             // fractional-scale changes) before the next frame is drawn
             if let Some((w, h)) = p.take_resize() {
-                win.resize(w, h);
+                renderer.resize(w, h)?;
             }
-            // presenter mode: drain RDMA completions, upload+present, drain
-            // the compositor. Bytes are never CPU-touched: the NIC wrote the
-            // slot, the GPU reads it through the upload pointer. Credits
-            // fire at upload time (glTexImage2D consumed the pointer).
+            if !pending_credits.is_empty() {
+                renderer.wait_frame()?;
+                for slot in pending_credits.drain(..) {
+                    link.credit_slot(slot)?;
+                }
+            }
+            // presenter mode: drain RDMA completions, decode/upload + present,
+            // then drain the compositor. The receive pool is imported once;
+            // raw and lossless read the slot region directly in the present
+            // command buffer. Credits fire after the render fence when the GPU
+            // still needs the slot, and immediately for unused/superseded ones.
             // Drain every ready frame but present only the NEWEST: the display
             // should show the latest content, not replay a backlog (a FIFO
             // present adds one display interval of latency per queued frame).
-            // Superseded frames are re-armed and credited immediately without
-            // uploading them.
             let mut newest: Option<(u64, usize, u64)> = None;
             while let Some((seq, slot)) = link.try_next_frame()? {
                 // t3: the instant THIS completion was observed. Stamped before
@@ -449,43 +435,20 @@ fn main() -> Result<()> {
                 link.rearm_slot(slot)?;
                 // Lossless deltas reference the previous frame, so every
                 // received frame must be decoded in order (skipping one
-                // desyncs the chain): on the GPU into the shared texture when
-                // available, otherwise the CPU decoder. Lossy is intra-only.
-                if let Some((dec, tex)) = gl_lossless.as_ref() {
-                    let g = dec.geometry();
-                    if g.width == link.meta.width
-                        && g.height == link.meta.height
-                        && g.stride == link.meta.stride
-                    {
-                        let coded = link.slot_bytes(slot);
-                        match rdma_display_codec::Header::parse(coded) {
-                            Ok(h) => {
-                                let n = rdma_display_codec::HEADER_LEN
-                                    + g.tile_count() * rdma_display_codec::INDEX_WORDS * 4
-                                    + h.payload_words as usize * 4;
-                                if n <= coded.len() {
-                                    dec.upload(&coded[..n])?;
-                                    dec.decode_to_image(*tex, h.count as usize)?;
-                                } else {
-                                    log::debug!(
-                                        "[client] lossless: coded {n} > slot {}",
-                                        coded.len()
-                                    );
-                                }
-                            }
-                            Err(e) => log::debug!("[client] lossless: header parse failed: {e:#}"),
-                        }
-                    } else {
-                        // geometry changed (Meta resize): the server resets the
-                        // reference on the next frame (full), so the CPU
-                        // decoder resyncs; stop using the stale GPU texture.
-                        link.frame(slot)?;
-                    }
-                } else if link.codec != rdma_display_codec::Codec::Lossy {
-                    link.frame(slot)?;
+                // desyncs the chain). Queue it for the next present command
+                // buffer; the decoder reads the imported slot directly.
+                // Lossy is intra-only; raw is staged at present time.
+                if link.codec == rdma_display_codec::Codec::Lossless {
+                    let coded = link.slot_bytes(slot);
+                    renderer.decode_lossless(slot, coded)?;
                 }
                 if let Some((_, old, _)) = newest.replace((seq, slot, t3)) {
-                    link.credit_slot(old)?; // superseded: never presented
+                    if link.codec == rdma_display_codec::Codec::Lossless {
+                        // Decoded in the next present command buffer.
+                        pending_credits.push(old);
+                    } else {
+                        link.credit_slot(old)?; // superseded: never uploaded
+                    }
                 }
             }
             if let Some((seq, slot, t3)) = newest {
@@ -525,68 +488,31 @@ fn main() -> Result<()> {
                 } else {
                     None
                 };
-                let (t4, t5) = if let Some((_, tex)) = gl_lossless.as_ref() {
-                    win.present_texture(
-                        *tex,
-                        overlay.as_ref().map(|(r, w, h)| (&r[..], *w, *h)),
-                    )?
-                } else if link.codec == rdma_display_codec::Codec::Lossy {
-                    if lossy_dec.is_none() {
-                        let (w, h, c) =
-                            (link.meta.width, link.meta.height, link.codec_chroma);
-                        // Prefer the all-GPU path: Vulkan decodes into exported
-                        // dma-buf planes, GL samples them (no CPU work). If this
-                        // client's Vulkan cannot export them or GL cannot import
-                        // them, fall back to the download+upload path instead of
-                        // failing — lossy still works, with a host round trip.
-                        if lossy_cpu {
-                            lossy_dec = Some(lossy::LossyDecoder::new(w, h, c, false)?);
-                        } else {
-                            match lossy::LossyDecoder::new(w, h, c, true).and_then(|dec| {
-                                win.import_yuv(dec.plane_descs())?;
-                                Ok(dec)
-                            }) {
-                                Ok(dec) => {
-                                    lossy_gpu = true;
-                                    lossy_dec = Some(dec);
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "[lossy] GPU YUV interop unavailable ({e:#}); \
-                                         falling back to the CPU upload path"
-                                    );
-                                    lossy_dec = Some(lossy::LossyDecoder::new(w, h, c, false)?);
-                                }
-                            }
-                        }
+                // Decode/upload the newest frame immediately before present:
+                // lossy is intra-only; raw stages one GPU copy from the
+                // imported slot (or the fallback host buffer).
+                match link.codec {
+                    rdma_display_codec::Codec::Lossy => {
+                        renderer.decode_lossy(link.slot_bytes(slot))?;
                     }
-                    let d = lossy_dec.as_mut().unwrap();
-                    let coded = link.slot_bytes(slot);
-                    d.decode(coded)?;
-                    let ov = overlay.as_ref().map(|(r, w, h)| (&r[..], *w, *h));
-                    if lossy_gpu {
-                        win.present_yuv(ov)?
-                    } else {
-                        win.present(d.read_rgba()?, ov)?
+                    rdma_display_codec::Codec::Raw => {
+                        renderer.upload_raw(slot, link.slot_bytes(slot))?;
                     }
-                } else if let Some(frame) = link.decoded() {
-                    // The receive loop already decoded every frame in order to
-                    // advance the delta chain, so the newest is the decoder's
-                    // current frame. Decoding it again here would apply the
-                    // same delta twice and corrupt the reference (a permanent
-                    // trail on the CPU lossless path).
-                    win.present(
-                        frame,
-                        overlay.as_ref().map(|(r, w, h)| (&r[..], *w, *h)),
-                    )?
-                } else {
-                    let frame = link.frame(slot)?;
-                    win.present(
-                        frame,
-                        overlay.as_ref().map(|(r, w, h)| (&r[..], *w, *h)),
-                    )?
-                };
-                link.credit_slot(slot)?; // upload consumed the pointer
+                    rdma_display_codec::Codec::Lossless => {}
+                }
+                let ov = overlay.as_ref().map(|(r, w, h)| (&r[..], *w, *h));
+                let (t4, t5) = renderer.present(ov)?;
+                match link.codec {
+                    rdma_display_codec::Codec::Raw
+                    | rdma_display_codec::Codec::Lossless => {
+                        // The GPU reads this slot in the command buffer we just
+                        // submitted; retire it at the next loop boundary.
+                        pending_credits.push(slot);
+                    }
+                    rdma_display_codec::Codec::Lossy => {
+                        link.credit_slot(slot)?;
+                    }
+                }
                 if metrics_on {
                     let lag = rdma_display_proto::unix_now_us().saturating_sub(t3);
                     credit_lags.push_back(lag);
@@ -636,11 +562,12 @@ fn main() -> Result<()> {
                 break;
             }
         } else {
-            // headless mode: today's blocking stats/dump path
+            // headless mode: blocking stats/dump path (Vulkan lossless/lossy;
+            // no presenter/swapchain)
             let (seq, slot) = link.next_frame()?;
             let t3 = rdma_display_proto::unix_now_us();
             if let Some(m) = metrics.as_mut() {
-                // no GL and no compositor here: t4=t5=t3 and no presentation
+                // no swapchain/compositor here: t4=t5=t3 and no presentation
                 // feedback (upload/present/display rows read 0.00 / n/a)
                 m.record(seq, t3, t3, t3, None);
             }
@@ -649,12 +576,15 @@ fn main() -> Result<()> {
             let mut frame_owned: Option<Vec<u8>> = None;
             if link.codec == rdma_display_codec::Codec::Lossy {
                 if lossy_dec.is_none() {
-                    // headless has no GL context: never export dma-bufs
+                    let core = std::sync::Arc::new(
+                        rdma_display_vkcore::VkCore::new()
+                            .context("headless lossy: Vulkan core")?,
+                    );
                     lossy_dec = Some(lossy::LossyDecoder::new(
+                        core,
                         link.meta.width,
                         link.meta.height,
                         link.codec_chroma,
-                        false,
                     )?);
                 }
                 let coded = link.slot_bytes(slot);
@@ -673,6 +603,35 @@ fn main() -> Result<()> {
                     }
                     if want_dump {
                         frame_owned = Some(dec);
+                    }
+                }
+            } else if link.codec == rdma_display_codec::Codec::Lossless {
+                if lossless_dec.is_none() {
+                    let core = std::sync::Arc::new(
+                        rdma_display_vkcore::VkCore::new()
+                            .context("headless lossless: Vulkan core")?,
+                    );
+                    let geom = rdma_display_codec::Geometry::new(
+                        link.meta.width,
+                        link.meta.height,
+                        link.meta.stride,
+                    );
+                    lossless_dec = Some(vklossless::VulkanLossless::new(core, geom)?);
+                }
+                let dec = lossless_dec.as_mut().unwrap();
+                dec.decode(link.slot_bytes(slot))?;
+                if want_stats || want_dump {
+                    let frame = dec.read_rgba()?;
+                    if want_stats {
+                        let sum: u32 = frame.iter().map(|b| *b as u32).sum();
+                        let nonzero = frame.iter().filter(|b| **b != 0).count();
+                        log::debug!(
+                            "[client-check] seq={} slot={} sum={} nonzero={}/{}",
+                            seq, slot, sum, nonzero, frame.len()
+                        );
+                    }
+                    if want_dump {
+                        frame_owned = Some(frame);
                     }
                 }
             } else if want_dump {
@@ -936,7 +895,12 @@ fn dump_ppm(path: &str, meta: &rdma_display_proto::DisplayMeta, bytes: &[u8]) ->
     // XRGB8888 -> binary PPM (P6), dropping the alpha/upper byte
     let width = meta.width as usize;
     let height = meta.height as usize;
-    let stride = meta.stride as usize;
+    // CPU raw/lossless frames carry the wire stride; Vulkan readback is tight.
+    let stride = if bytes.len() >= meta.stride as usize * height {
+        meta.stride as usize
+    } else {
+        width * 4
+    };
     let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
     for y in 0..height {
         for x in 0..width {

@@ -3,7 +3,7 @@
 A low-latency remote display system for Linux. A **server** captures a
 display (either the host's own KMS scanout or a QEMU guest's D-Bus display),
 codes each frame, and ships it to a **client** over RDMA (RoCE) or TCP. The
-client presents it in a Wayland window (EGL) or dumps it headless, and sends
+client presents it in a Vulkan Wayland window or dumps it headless, and sends
 keyboard/mouse/gamepad input back to the server, which injects it via
 `uinput` (host) or the QEMU D-Bus console (guest).
 
@@ -15,11 +15,11 @@ boxes on a fast link, not a browser-streaming service.
  server                                            client
  ┌───────────────────────────┐                    ┌──────────────────────────┐
  │ capture: drm (KMS) or qemu │                    │ receive slot             │
- │   → Vulkan import / copy   │                    │   → EGL upload           │
+ │   → Vulkan import / copy   │                    │   → Vulkan decode/upload │
  │   → codec (raw/lossless/   │   RDMA WRITE+imm   │   → letterboxed draw     │
- │     lossy) into a slot MR  │ ─────────────────► │   → eglSwapBuffers       │
+ │     lossy) into a slot MR  │ ─────────────────► │   → vkQueuePresentKHR    │
  │   → RDMA WRITE / TCP       │                    │                          │
- │                            │ ◄─── credit ───────│ wl_buffer released        │
+ │                            │ ◄─── credit ───────│ present completes        │
  │ input sink: uinput / qemu  │ ◄─── input ────────│ wl_keyboard / wl_pointer  │
  │ audio: PipeWire monitor    │ ──► audio ────────►│ PulseAudio/PipeWire sink  │
  └───────────────────────────┘                    └──────────────────────────┘
@@ -35,8 +35,9 @@ boxes on a fast link, not a browser-streaming service.
   exist) or TCP; negotiated per session, `--transport auto|rdma|tcp`.
 - **Three codecs**: `raw`, `lossless` (tile-delta, GPU-encoded), `lossy`
   (PyroWave intra-only GPU codec).
-- **Wayland/EGL client presenter** with fullscreen, letterbox scaling,
+- **Vulkan Wayland client presenter** with fullscreen, letterbox scaling,
   compositor-direct-scanout hints, and a live latency overlay (`--metrics`).
+  Raw, lossless and lossy decode/upload paths share one Vulkan device; no EGL/GL.
 - **Input forwarding**: keyboard, absolute + relative pointer, and gamepads
   (rumble back-channel). A `Ctrl+Alt+G` grab (or `-g`) hands the desktop's own
   shortcuts to the remote side.
@@ -53,7 +54,7 @@ boxes on a fast link, not a browser-streaming service.
 - Linux on both ends. Kernel ≥ 5.8 for KMS capture (`GETFB2`), plus
   `CAP_SYS_ADMIN` on the server (or run it as root).
 - Rust 1.85+ and a C toolchain to build.
-- **Client**: a Wayland compositor (for `--output egl`); EGL/GLES.
+- **Client**: a Wayland compositor (for `--output vk`); Vulkan 1.3 with `VK_KHR_wayland_surface` and `VK_KHR_swapchain`. No EGL/GLES.
 - **Server, KMS capture**: an active DRM scanout. NVIDIA was the primary test
   platform; a `plain` materializer covers host-linear scanouts.
 - **RDMA (optional)**: an RDMA NIC with RoCE configured (a routable GID) on
@@ -224,7 +225,7 @@ both ends.
 | Option | Meaning |
 | --- | --- |
 | `HOST[:PORT]` / `-s HOST` | Server address (default `127.0.0.1:4791`). |
-| `--output egl\|none` | Present in a Wayland window (default) or headless. |
+| `--output vk\|none` | Present in a Vulkan Wayland window (default) or headless. |
 | `-f`/`--fullscreen` | Fullscreen on the current output (letterboxed, aspect kept). |
 | `-g`/`--grab` | Start with the input grab on (same as `Ctrl+Alt+G`). |
 | `--native` / `--set-mode WxH[@R]` | Ask the server to change its output resolution. |
@@ -275,11 +276,11 @@ forwarded too. `Ctrl+Alt+G` again is the only way to give control back.
 
 | Server capture | Server input | Client | Notes |
 | --- | --- | --- | --- |
-| `--source drm` (host KMS) | `--input uinput` | `--output egl` (Wayland) | The main configuration. Needs `CAP_SYS_ADMIN`. |
+| `--source drm` (host KMS) | `--input uinput` | `--output vk` (Wayland) | The main configuration. Needs `CAP_SYS_ADMIN`. |
 | `--source drm` | `--input uinput` | `--output none --dump` | Headless/debug. |
-| `--source qemu` | `--input qemu` | `--output egl` | Guest over QEMU's D-Bus display. |
+| `--source qemu` | `--input qemu` | `--output vk` | Guest over QEMU's D-Bus display. |
 | `--source qemu` | `--input qemu` | `--output none` | Guest, headless. |
-| `--source portal` | `--input uinput` | `--output egl` | Compositor capture (no root). |
+| `--source portal` | `--input uinput` | `--output vk` | Compositor capture (no root). |
 
 Transport, codec, and presenter are independent axes:
 
@@ -287,14 +288,15 @@ Transport, codec, and presenter are independent axes:
   ends; `tcp` works anywhere; `auto` picks RDMA when both sides advertise it.
 - **Codec** — any client works with `raw` and `lossless`; `lossy` additionally
   needs `libpyrowave-shared.so` on both ends.
-- **Presenter** — `egl` needs a Wayland compositor; `none` is headless.
+- **Presenter** — `vk` needs a Wayland compositor with Vulkan; `none` is headless.
 - **Resolution control** — the server's compositor must be **Hyprland**
   (`hyprctl`) or **KDE/KWin** (`kscreen-doctor`) for `--native`/`--set-mode`
   to do anything; otherwise the request is reported as failed and the session
   runs at the server's current resolution.
 - **GPUs** — the server capture path was developed and tested on NVIDIA
   (KMS + Vulkan dmabuf import); a `plain` materializer handles host-linear
-  scanouts. The client presenter is GPU-agnostic (EGL upload from host RAM).
+  scanouts. The client presenter uses Vulkan (host-buffer upload for raw/lossless,
+  PyroWave Vulkan planes for lossy); EGL/GL is not used.
 
 ## Documentation
 
