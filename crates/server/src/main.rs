@@ -1220,6 +1220,9 @@ fn run_capture(
                 // (lossy sessions don't bind them, so clear even then)
                 *staging.lock().unwrap() = None;
                 fc.teardown();
+                if let Err(e) = gpu.clear_cache() {
+                    log::warn!("[server] clear scanout cache: {e:#}");
+                }
                 // audio is per-session too: stop it (and the helper) while idle
                 if let Some(mut a) = audio_capture.take() {
                     a.stop();
@@ -1943,6 +1946,8 @@ fn run_capture(
                             let _ = gpu_direct.take();
                             let _ = raw_direct.take();
                             fc.clear_gpu_staging();
+                            mat.release();
+                            let _ = gpu.clear_cache();
                             session_nonce.store(0, std::sync::atomic::Ordering::SeqCst);
                 *session_secret.lock().unwrap() = None;
                         }

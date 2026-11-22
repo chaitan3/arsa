@@ -71,6 +71,15 @@ impl Gpu {
         }))
     }
 
+    /// Drop all imported scanout images. Called when a session ends so an
+    /// idle server does not retain a compositor's 4K scanout buffers (up to
+    /// eight full-frame images in the cache).
+    pub fn clear_cache(&self) -> Result<()> {
+        unsafe { self.core.device.device_wait_idle()? };
+        self.cache.lock().unwrap().clear();
+        Ok(())
+    }
+
     /// Import (or look up) the scanout dma-buf. `buf_id == 0` (no stable
     /// identity, e.g. QEMU) bypasses the cache.
     pub fn import(&self, d: &DmabufScanout) -> Result<Arc<CachedImage>> {

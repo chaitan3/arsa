@@ -97,9 +97,29 @@ impl LossyMaterializer {
 
 }
 
+impl Drop for LossyMaterializer {
+    fn drop(&mut self) {
+        self.cur = None;
+        if let Some(e) = self.enc.take() {
+            unsafe { (self.pw.encoder_destroy)(e) };
+        }
+        unsafe { (self.pw.device_destroy)(self.dev) };
+    }
+}
+
 impl FrameMaterializer for LossyMaterializer {
     fn name(&self) -> &'static str {
         "lossy-pyrowave"
+    }
+
+    fn release(&mut self) {
+        self.cur = None;
+        if let Some(e) = self.enc.take() {
+            unsafe { (self.pw.encoder_destroy)(e) };
+        }
+        self.enc_geom = None;
+        self.fmt = None;
+        self.dirty = false;
     }
 
     fn mark_dirty(&mut self) {
